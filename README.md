@@ -1,0 +1,290 @@
+# NZBLab-Agent
+
+Kleiner Dienst auf dem NAS, der rund um die Uhr misst und die Werte der NZBLab-App liefert:
+Temperaturen aller Sensoren, CPU-Last (gesamt und pro Kern), Grafikchip (Grafik- und Medien-Einheit, die Medien-Einheit
+rechnet Videos für Plex um), Arbeitsspeicher, Plattenzugriffe (wann eine Platte nach einer Pause anläuft) und welche
+Programme die meiste CPU brauchen. 8 Tage volle Auflösung (alle 30 s), 2 Jahre Stundenwerte.
+
+**Nur lesen.** Der Agent ändert nichts am NAS. Alle Host-Pfade sind nur lesend eingebunden, schreibbar ist nur `/config`.
+
+## Installieren (für alle, ab Agent 1.10.0)
+
+Fertiges Image: **`ghcr.io/tuxxler/nzblab-agent:latest`** (amd64 und arm64, gebaut von `.github/workflows/agent-image.yml`,
+Grundlage `python:3.12-alpine3.22`, nur Python-Standardbibliothek). Kostenlos, Quellcode öffentlich einsehbar:
+<https://github.com/Tuxxler/nzblab-agent> (Lizenz siehe unten).
+Gleiche Anleitung in der App (Einstellungen › Server-Verbindungen › NZBLab-Agent › «Agent installieren») und auf der
+Website <https://tuxxler.github.io/nzblab/agent.html>.
+
+| System | Datei | Kurz |
+|---|---|---|
+| Unraid | `unraid/nzblab-agent.xml` | Apps › «NZBLab-Agent» › Install; bis zur Aufnahme in CA: Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent` |
+| TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = eigener Pool |
+| Synology DSM 7.2+ | `compose/synology.yml` | Ordner `docker/nzblab-agent` anlegen; Container Manager › Projekt › Erstellen |
+| Docker allgemein | `docker-compose.yml` | `docker compose up -d` |
+
+**Token:** Beim ersten Start erzeugt der Agent einen zufälligen Token (`/config/token.txt`, Rechte 600) und schreibt ihn
+**genau einmal** ins Container-Log:
+
+```
+================================================================
+NZBLab-Agent Token: …
+In der App eintragen: Einstellungen › Server-Verbindungen › NZBLab-Agent.
+================================================================
+```
+
+Danach steht er nur noch in der Datei. Wer das Container-Log lesen kann, ist ohnehin Admin des NAS. Bewusst **keine**
+Setup-Seite, die den Token im Browser zeigt: sonst könnte ihn jedes Gerät im Heimnetz abholen. Neuer Token: `token.txt`
+löschen und Container neu starten. Eigener Token: Variable `NZBLAB_AGENT_TOKEN` (dann nichts im Log, sie hat Vorrang).
+
+**Pfad `/config` ist Pflicht:** Hier speichert der Agent Token und Verlauf. Ohne eigenen Pfad liegt beides nur im
+Container und ist nach jedem Update weg: Dann gibt es jedes Mal einen neuen Token, die App verbindet sich nicht mehr. Unraid:
+Docker › nzblab-agent › Bearbeiten › Pfad `/config` → `/mnt/user/appdata/nzblab-agent` (Lesen/Schreiben) › Übernehmen.
+Compose: `- ./nzblab-agent:/config` (bzw. der Pfad in den Vorlagen).
+
+Ab 1.13.0 sichert der Agent das ab:
+
+- Ein neuer Token entsteht **nur**, wenn `token.txt` fehlt. Ist die Datei leer, beschädigt oder nicht lesbar (Rechte),
+  überschreibt er sie nie: Fehlermeldung im Log, und alle Anfragen mit Token antworten `503` mit dem genauen Grund
+  (`{"error": …, "token_error": …}`). Lösung: alten Token in die Datei schreiben, Datei löschen (dann neuer Token) oder
+  `NZBLAB_AGENT_TOKEN` setzen.
+- Beim Start prüft er in `/proc/self/mountinfo`, ob `/config` (oder ein Ordner darüber, ausser `/`) ein eigener Mount ist.
+  Nicht bleibend sind: nur das Dateisystem des Containers, tmpfs, ein anonymer Docker-Volume (`VOLUME /config` im Image
+  ohne eigenen Pfad, wird beim Neuerstellen ersetzt) und ein nur lesender Mount. Dann: laute Warnung mit Lösung im Log
+  (Deutsch und Englisch), `config_persistent: false` in `/api/ping` und `/api/info` (dort dazu `warnings`) und ein Hinweis
+  auf der Browser-Seite.
+- Ist `settings.json` beschädigt (kein gültiges JSON), hebt er sie vor dem nächsten Speichern als
+  `settings.json.broken-<Zeit>` auf und meldet das im Log, statt sie still zu überschreiben.
+
+**Ohne root:** Das Image setzt `PUID=99`, `PGID=100` (nobody:users). Der Agent startet als root, legt den Token an, liest die
+Container-Namen (`/host/docker/containers`, nur root lesbar), gibt `/config` diesem Benutzer und läuft dann ohne root weiter.
+Kann er `/config` nicht übergeben (z. B. NFS mit root_squash), bleibt er mit Hinweis im Log root. `PUID=0` = immer root:
+nötig nur für appdata-Grössen anderer Container mit engen Rechten. TrueNAS-Vorlage: 568:568 (Benutzer «apps»);
+Synology-Vorlage: root, weil DSM-ACLs im Container keinem Benutzer entsprechen.
+
+**Härtung in allen Vorlagen:** `--read-only` (Root-Dateisystem), `/tmp` als tmpfs, `no-new-privileges`, 512 MB RAM, 1 CPU,
+kein `privileged`, keine Zusatz-Capabilities. HEALTHCHECK im Image auf `/api/ping`.
+
+Weitere Variablen für andere Systeme: `FILES_EXCLUDE` (oberste Ordner, auch Muster wie `@*`), `FILES_SKIP` (in jeder Ebene,
+Standard `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (leer = kein Cache).
+
+Optional: Push-Meldung bei Hitze auch unterwegs: Variable `NTFY_URL` = `https://ntfy.sh/<langes-geheimes-wort>` und in der
+App «ntfy» dasselbe Thema abonnieren. Schwelle: `HEAT_ALERT_C` (Standard 95 °C, nach 5 Minuten).
+
+## Übersicht im Browser (ab 1.4.0)
+
+`http://<NAS-IP>:8099` (z. B. `http://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
+WireGuard). Beim ersten Mal den Token einfügen (siehe «Token» oben); er bleibt nur in diesem Browser gespeichert, «Abmelden» löscht ihn.
+
+Zu sehen, live alle 5 Sekunden: CPU und CPU-Temperatur mit Verlauf (12 Std.), Arbeitsspeicher, Netzwerk, Array mit
+Platten, Internet-Tempo (Knopf «Jetzt messen»), alle Temperaturen, meiste Last, Festplatten-Zugriffe, Grafikchip,
+Geräte im Heimnetz und Datei-Index. **Nur Anzeige**: Steuern (Container, Downloads, Array) geht in der App.
+
+Ganz oben **«Heute auf dem NAS»** (letzte 24 Stunden, Filter Probleme · Downloads · Unraid-Meldungen · Container · System):
+Unraid-Meldungen, fertige und fehlgeschlagene Downloads (aus dem Verlauf von SABnzbd in appdata, nur lesend), abgestürzte
+oder gestoppte Container, Fehler im Systemprotokoll (gleiche Meldungen zusammengefasst) und die Alarme des Agenten
+(Hitze, Array, neue Geräte, angelaufene Platten, Speedtest). Ohne Passwörter oder API-Keys. Dafür zwei zusätzliche
+Pfade, beide **nur lesen**: `/tmp/notifications` → `/host/notifications` und `/var/log` → `/host/log`.
+Fehlt eine Quelle, sagt die Seite unten in der Karte, welcher Pfad fehlt.
+
+Die Seite selbst braucht keinen Token, alle Werte schon. Sie lädt nichts aus dem Internet (strenge Content-Security-Policy).
+Nicht ins Internet freigeben; von unterwegs über WireGuard.
+
+Ab 1.9.0: Der Token gilt nur noch für den offenen Browser-Tab (`sessionStorage`, weg nach dem Schliessen). Die Seite
+aktualisiert sich alle 30 Sekunden, der Verlauf von CPU und Temperatur zeigt 24 Stunden. Neu dazu die Karten
+**«Cache & Mover»** (läuft der Mover, Belegung der Freigaben auf dem Cache) und **«Agent»** (Version, misst seit,
+Anzahl Absturzberichte der App, letzte Aktualisierung). Die HTML-Seite selbst enthält keine Werte vom NAS.
+
+## Schnittstelle
+
+Alle Anfragen ausser `/api/ping` und `/api/hello` mit `Authorization: Bearer <Token>`. Falscher Token: `401`. Konnte der
+Agent selbst keinen Token laden (ab 1.13.0, `token.txt` leer/kaputt/nicht lesbar): `503` mit `token_error`.
+
+Ausnahmen ohne Token: `GET /api/prices/watch` (nur Plattenserien) und `GET /api/crashes` (Absturzberichte der App, ohne
+Schlüssel). Beide nur aus privaten Netzen **und** nur mit IP-Adresse oder lokalem Namen im `Host`-Header (`nas`, `*.local`,
+`*.lan`, `*.home.arpa`, `*.internal`), damit fremde Websites sie nicht über DNS-Rebinding lesen können. Mit Token gehen beide
+immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); `token.txt` und `settings.json` haben Rechte 600.
+
+| Pfad | Inhalt |
+|---|---|
+| `GET /api/ping` | lebt der Agent? Ab 1.13.0 dazu `config_persistent` (`false` = `/config` geht beim Update verloren), sonst nichts |
+| `GET /api/hello?nonce=<32 Hex-Zeichen>` | ohne Token, ab 1.11.0: Heimnetz-Prüfung der App, siehe unten |
+| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung) |
+| `GET /api/now` | aktuelle Werte (höchstens alle 2 s neu gemessen) |
+| `GET /api/history?hours=24` | bis 192 h alle Messungen, darüber Stundenwerte (`res=hour` erzwingt Stundenwerte) |
+| `GET /api/today?hours=24` | «Heute»: Ereignisse aller Quellen, neueste zuerst, mit Zusammenfassung und welche Quellen fehlen |
+| `GET /api/prices` | Plattenpreise (ab 1.5.0): pro Platte im NAS der Preis des eigenen Modells (ab 1.12.0, mit günstigster Alternative), sonst pro Grösse bester Preis mit Shop, Schweizer Shops, Ausland, Verlauf, Tief/Hoch 90 Tage, «günstig» |
+| `GET /api/prices/watch` | ohne Token, nur aus privaten Netzen: welche Plattenserien die App zusätzlich beobachtet (für eine externe Preisliste, siehe unten) |
+| `POST /api/config` | `ntfy_url`, `price_alerts` (`{"hdd28": 900}`), `price_watch` (`[{"series": "ironwolfpro", "tb": 16}]`), `price_country` (`"DE"`, ab 1.10.0; mit `price_country_if_unset: true` nur, wenn noch keins gewählt ist). `price_alerts` und `price_watch` ersetzen jeweils die ganze Liste; ein leerer Wert (`{}`, `[]`, `null`) löscht alle Preisgrenzen bzw. beobachteten Serien |
+| `GET /api/wakes?hours=168` | Platten, die nach `DISK_IDLE_MINUTES` (30) Ruhe angelaufen sind, mit den Programmen in diesem Moment |
+| `GET /api/files/tree?path=` · `GET /api/files/largest?path=&limit=` | Speicher-Analyse (ab 1.7.0) |
+| `GET /api/files/duplicates?min_mb=100&limit=100` | doppelte Dateien (ab 1.8.0), siehe unten |
+| `GET /api/inventory` | Medien-Bestand: Filme, Serien, Lücken, neu seit dem letzten Index (ab 1.8.0) |
+| `GET /api/cache/shares` | Belegung jeder Freigabe auf dem Cache (ab 1.8.1; Pfad `/mnt/cache` → `/host/mnt/cache` nur lesen, mehrere Pools mit `CACHE_ROOTS`) |
+| `GET /api/appdata` | Grösse jedes Container-Ordners unter appdata (ab 1.8.2; misst im Hintergrund höchstens alle 6 Std., braucht `/mnt/user` → `/host/mnt/user` nur lesen) |
+| `GET /api/wireguard` | WireGuard-Tunnel und Geräte, ohne Schlüssel (ab 1.8.0) |
+
+## Heimnetz-Prüfung (ab 1.11.0)
+
+Bevor die App Schlüssel über `http://` an eine Adresse im Heimnetz schickt, prüft sie, ob dort wirklich das eigene NAS
+antwortet (ein fremdes WLAN kann denselben Adressbereich haben, z. B. 192.168.1.x). Dazu fragt sie ohne Token
+`GET /api/hello?nonce=<32 Zeichen 0-9a-f>`. Der Agent antwortet mit:
+
+- `id`: feste Zufalls-Kennung, beim ersten Start in `settings.json` angelegt (keine Namen, keine Adressen)
+- `proof`: HMAC-SHA256 mit dem Token als Schlüssel über `nzblab-hello:<nonce>`, als Hex-Text
+- `version`
+
+Die App rechnet denselben Wert mit ihrem gespeicherten Token nach und vergleicht in konstanter Zeit. Der Token selbst
+verlässt weder App noch Agent. Andere Nonce als 32 Zeichen `0-9a-f`: 400. Fremder Name im `Host`-Header: 403 (wie bei den
+anderen Endpunkten ohne Token). Den Agent deshalb weiterhin nicht ins Internet freigeben.
+
+## Testen
+
+```bash
+python3 test_agent.py        # im Ordner mit nzblab_agent.py (im App-Repo: agent/)
+```
+
+## Datei-Index (ab 1.1.0)
+
+Mit dem Pfad `/host/mnt/user` (nur lesen) baut der Agent alle 6 Stunden einen Index aller Ordner und Dateien der Freigaben
+(ohne `appdata`, `system`, `domains`, `isos`; änderbar mit `FILES_EXCLUDE`, Intervall mit `FILES_EVERY_HOURS`).
+Die App sucht dann direkt darin. Endpunkte: `GET /api/files/status`, `GET /api/files/search?q=…`, `POST /api/files/refresh`.
+
+
+## Plattenpreise selbst holen (ab 1.10.0)
+
+Ab 1.10.0 holt der Agent die Preise **selbst** (nur Python-Standardbibliothek), einmal am Tag ab 06:00, für die
+Plattengrössen in diesem NAS (aus `/sys/block`, ab 0.5 TB, HDD/SSD/NVMe getrennt) und die in der App beobachteten Serien.
+Das Land wählt man in der App (Plattenpreise › Land); die App schickt beim Einrichten das Land ihrer Spracheinstellung,
+ändert aber nie ein schon gewähltes. Ohne App: Variable `PRICE_COUNTRY` (z. B. `DE`). Ohne Land holt der Agent nichts.
+
+| Land | Quelle | Anfragen pro Tag |
+|---|---|---|
+| CH | Toppreise.ch (Suche nach Preis pro TB) | eine pro Grösse, dazu eine (selten zwei) pro Plattenmodell |
+| DE, AT | Geizhals.de / .at, **nur wenn deren robots.txt es erlaubt**; sonst Amazon.de über diskprices.com | eine pro Grösse bzw. eine für alle |
+| US, GB, FR, IT, ES, CA, AU, SE, IE, IN | Amazon über diskprices.com (eine Tabelle für alle Grössen) | eine |
+| andere | nächster Amazon-Markt (z. B. NL → Amazon.de), sonst Amazon USA | eine |
+
+Höflich: vorher `robots.txt` der Seite lesen (einmal pro Lauf; verbietet sie die Suche, wird nicht abgefragt), ehrlicher
+User-Agent `NZBLab-Agent/<Version>`, 20 s Timeout, 5 s Pause zwischen Anfragen (`PRICE_PAUSE_S`), keine Cookies, keine
+Wiederholung. Stand 28.10.2026: Geizhals verbietet in seiner robots.txt die Suche (`/?fs=`, `*?*sort=`) für alle Bots,
+darum fragt der Agent Geizhals in der Praxis nicht ab.
+
+**Nie erfundene Zahlen:** Ist eine Seite gesperrt (HTTP 403/429), eine Prüfseite («Sichere Verbindung wird überprüft»),
+von robots.txt verboten oder hat sie ein unbekanntes Layout, steht bei der Grösse «Preise gerade nicht lesbar» und
+`browser_url`: Die App zeigt dann den Knopf «Im Browser suchen». Beträge stehen in der Währung des Landes (`currency`);
+das Feld heisst aus Kompatibilität weiter `chf`.
+
+Ergebnis pro Land in `/config/prices-<Land>.json` (Verlauf 400 Tage). Für die Schweiz hat eine **frische** externe `prices.json`
+(höchstens 36 Stunden alt, siehe «Externe Preisliste») Vorrang; ist sie älter oder fehlt sie,
+holt der Agent selbst. Die Tests (`test_agent.py`, Klasse `PriceFetchTest`) prüfen die Leser mit Beispielseiten in
+`test_fixtures/` (Toppreise-, Geizhals- und diskprices-Seiten nachgebaut nach dem bekannten Aufbau; Sperr-/Prüfseiten und
+robots.txt echt, gekürzt), ohne Netz.
+
+`GET /api/prices` liefert dazu: `country`, `country_set`, `currency`, `countries` (Auswahl für die App) und pro Grösse
+`unreadable`, `browser_url`.
+
+### Preis des eigenen Modells (ab 1.12.0)
+
+Bis 1.11.0 war der Preis «die günstigste Platte gleicher Grösse», also oft eine Exos statt der IronWolf Pro im NAS. Ab
+1.12.0 liest der Agent das **Modell jeder Platte** aus sysfs (nur lesen, nie die Seriennummer):
+
+- SATA: voller Modellname aus der ATA-Information `device/vpd_pg89` (nur die Modell-Bytes), sonst `device/model`
+  (höchstens 16 Zeichen, z. B. `ST28000NT000-4AB`); NVMe: `device/model` bzw. `/sys/class/nvme/nvmeX/model`.
+  Funktioniert mit `/host/sys` (Container) und `/sys`.
+- Teilenummer und Serie per Tabelle: Seagate `ST…NT/NE` IronWolf Pro, `VN` IronWolf, `NM` Exos, `DM` BarraCuda,
+  `VX/VE` SkyHawk; WD `EFPX/EFZX/EFRX` Red Plus, `EFAX` Red (SMR), `FFBX/KFBX/KFGX` Red Pro, `PURZ` Purple,
+  `WUH…/HUH…` Ultrastar; Toshiba `HDWG` N300, `HDWR` X300, `HDWT` S300, `MG…` Enterprise; SSDs nach Name
+  (Samsung 990 PRO, WD Red SN700 …). Garantie aus der Tabelle, nur wo belegt (IronWolf Pro, Exos, Red Pro, Ultrastar,
+  MG, 990 PRO 5 Jahre; IronWolf, Red Plus, N300 3; BarraCuda 2). Quellen stehen im Code bei `MODEL_SERIES`.
+- Mehrere gleiche Platten = ein Eintrag (`disks` listet alle). Mehrere Modelle gleicher Grösse: das häufigste behält
+  den Schlüssel `hdd3`, die anderen heissen z. B. `hdd3-wd30ezrx` (Preisgrenzen aus der App gelten weiter).
+
+Ablauf pro Modell: zuerst die **genaue Teilenummer** suchen (Toppreise `?q=ST28000NT000`, springt meist direkt auf die
+Produktseite); zählt nur, was die Teilenummer im Namen trägt (`match: exact`). Nichts gefunden: Suche nach Serie und
+Grösse (`Seagate IronWolf Pro 28TB`), nur Angebote derselben Serie (`match: series`, «gleiche Serie»). Unbekannte Modelle:
+Suche nach dem Modellnamen selbst. Zusätzlich wie bisher die Suche nach der Grösse: deren günstigstes Angebot eines
+**anderen** Modells erscheint als `alternative`, nur wenn es billiger ist als das eigene. Jede Suche höchstens einmal
+pro Tag, gleiche Regeln (robots.txt, Pausen, «Preise gerade nicht lesbar»). Ohne lesbares Modell: wie bis 1.11.0.
+
+Neue Felder pro Eintrag in `GET /api/prices`: `model` («Seagate IronWolf Pro 28 TB»), `part` («ST28000NT000»), `series`,
+`warranty_years`, `match` (`exact`/`series`), `match_label` («exakt»/«gleiche Serie»), `alternative` (Angebot mit `model`),
+`alt_search_url`. `best`, Verlauf, «günstig» und Preisgrenzen gelten für das eigene Modell. Alte `prices-<Land>.json`
+laufen weiter: der alte Verlauf (günstigste Platte) wird beim ersten Lauf zu `alt_history`, bis dahin erscheint der
+alte Preis als Alternative. Bei einer externen `prices.json` nimmt der Agent den Preis aus `models_now` (Verlauf aus
+`model_history`, falls vorhanden) und das dortige `best` als Alternative.
+
+## Externe Preisliste (optional)
+
+Wer Preise lieber selbst sammelt (z. B. mit einem eigenen Skript), legt eine `prices.json` im gleichen Format wie
+`/config/prices-CH.json` ab. Der Agent liest sie nur, schreibt nie hinein:
+
+- Variable `PRICES_FILE` = Pfad im Container (z. B. `/host/mnt/user/daten/nzblab-prices/prices.json`), oder
+- ohne Variable: die erste Freigabe unter `/host/mnt/user` (alphabetisch), die `nzblab-prices/prices.json` enthält
+  (gesucht höchstens alle 6 Stunden).
+
+Welche Serien die App zusätzlich beobachtet, liefert `GET /api/prices/watch` (ohne Token, nur aus privaten Netzen).
+«Günstig» heisst: unter der eigenen Grenze, oder tiefster Preis seit 90 Tagen und mindestens 3 % unter dem 30-Tage-Mittel
+(ab 7 Tagen Verlauf). Der Agent meldet das per ntfy, die App als Benachrichtigung.
+
+
+## Doppelte Dateien (ab 1.8.0)
+
+`GET /api/files/duplicates?min_mb=100&limit=100`: Kandidaten sind Dateien mit genau gleicher Grösse (ab `min_mb` MB, aus dem
+Datei-Index). Ob sie wirklich gleich sind, prüft der Agent mit einer Teil-Prüfsumme (SHA-1 aus dem ersten und letzten MiB
+plus Grösse): Er liest also höchstens 2 MiB pro Datei, auch bei einem 40-GB-Film. Das läuft in einem Hintergrund-Thread mit
+tiefer Priorität, höchstens `DUP_MAX_FILES` (2000) Dateien pro Lauf, grösste zuerst. Solange er läuft, ist das Ergebnis
+unvollständig (`running: true`, `pending` = noch ungeprüfte Dateien); die App fragt einfach später nochmals. Die Prüfsummen
+bleiben in `files.db` gespeichert und gelten, solange Grösse und Änderungszeit gleich bleiben.
+`wasted` = Platz, der frei würde, wenn von jeder Gruppe nur eine Datei bliebe (über alle Gruppen).
+
+**Nur lesen:** Der Agent löscht und verschiebt nie etwas. Aufräumen macht man selbst.
+
+**Vorgerechnet (ab 1.13.0):** Die Kandidaten (ab 100 MB) und den Medien-Bestand rechnet der Agent nach jedem Index-Lauf
+(und einmal nach dem Start) im Hintergrund; eine Anfrage liest nur noch das fertige Ergebnis (`computed_at`, `building: false`).
+Gerechnet wird ausserhalb der Sperre des Index (erst Zeilen lesen, dann verarbeiten), Suche und Speicher-Analyse bleiben schnell.
+Fehlt das Ergebnis noch (z. B. kleinere Stufe als 100 MB oder direkt nach dem Start), wartet die Anfrage höchstens 2 Sekunden
+und antwortet sonst sofort mit `building: true`, leerer Liste und dem Stand des Index (`status`); die App fragt dann nach.
+
+## Medien-Bestand (ab 1.8.0)
+
+`GET /api/inventory` rechnet direkt auf dem NAS aus dem Datei-Index:
+
+- Film-Ordner heissen `Filme`, `Movies` oder `Film`, Serien-Ordner `Serien`, `Series`, `TV` oder `Shows` (Ebene 1 oder 2, z. B. `Media/Filme`).
+  Videos: `mkv mp4 avi m4v ts iso`.
+- Jeder Unterordner ist ein Film bzw. eine Serie. Titel, Jahr und IMDb-ID aus dem Ordnernamen, z. B. `Babylon 5 (1994) [imdbid-tt0105946]`.
+- Folgen aus dem Dateinamen: `S01E02`, `s1e2`, `S01E01E02`, `1x02`. `S01E001` (drei und mehr Stellen) gilt als durchlaufende
+  Nummer wie bei One Piece: Lücken dann über die ganze Nummernfolge (`S01E492`, `S01E780-S01E782`). Staffel 0 (Specials) ohne Lücken.
+  `mixed_numbering`: in einer Serie gibt es beides.
+- «Neu» vergleicht die letzten zwei Index-Läufe (alle 6 Stunden): Am Ende jedes Laufs merkt sich der Agent die Videodateien des
+  vorherigen Laufs (Tabelle `inv_prev`). Nach dem ersten Lauf ist noch nichts «neu» (`previous: 0`).
+
+## WireGuard (ab 1.8.0)
+
+`GET /api/wireguard` zeigt die Tunnel (`wg0` …) und pro Gerät: Name, Endpunkt, erlaubte IPs, letzter Handshake, Daten, online
+(Handshake vor weniger als 3 Minuten). **Private und Preshared Keys gibt der Agent nie heraus**, vom öffentlichen Schlüssel
+nur die ersten 8 Zeichen als Kennung.
+
+Ehrlich: **Im Standard-Aufbau liefert der Endpunkt nichts** (`available: false`). Die App zeigt dann den Grund:
+
+| `reason` | Bedeutung | Abhilfe |
+|---|---|---|
+| `no_wg` | Das Image `python:3.12-alpine` enthält das Programm `wg` nicht | `wireguard-tools` im Container nachinstallieren (z. B. `apk add --no-cache wireguard-tools` in `start.sh`) |
+| `no_interfaces` | `wg` läuft, sieht aber keinen Tunnel: Im Netzwerktyp «Bridge» hat der Container sein eigenes Netz | Netzwerktyp **Host** |
+| `no_permission` | `wg show` wird verweigert | zusätzlich die Capability `NET_ADMIN`: Extra Parameters `--cap-add=NET_ADMIN` (nicht «Privilegiert»). Die Vorlage setzt das bewusst nicht |
+
+Peer-Namen (z. B. «Peer 1», «Laptop») sind optional: Pfad `/boot/config/wireguard` **nur lesen** nach
+`/host/boot/config/wireguard` einbinden (anderer Ort: Variable `WG_CONFIG_DIR`). Der Agent liest daraus nur die Namen
+(Kommentar im `[Peer]`-Block von `wg0.conf` oder `NAME:n`/`PUBLIC:n` in `wg0.cfg`). Achtung: In diesen Dateien steht auch der
+private Schlüssel des NAS. Der Agent gibt ihn nie weiter, aber der Container könnte ihn lesen. Ohne den Pfad fehlen nur die Namen.
+
+## Lizenz
+
+Kostenlos, Quellcode öffentlich einsehbar, unter der **PolyForm Shield License 1.0.0** (`PolyForm-Shield-1.0.0`), siehe
+[`LICENSE`](LICENSE) und <https://polyformproject.org/licenses/shield/1.0.0>. Required Notice: Copyright (c) 2026 Tuxxler.
+
+- **Erlaubt:** den Agenten kostenlos nutzen, auch geschäftlich; den Code ansehen, ändern und weitergeben (mit Lizenztext
+  und der Zeile «Required Notice»).
+- **Verboten:** den Agenten oder Teile davon für ein Produkt verwenden, das mit ihm oder mit NZBLab konkurriert.
+
+English: free to use, also commercially, and you may read and change the code; you may not use it to build a competing
+product. Full text: [`LICENSE`](LICENSE).

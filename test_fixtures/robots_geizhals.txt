@@ -1,0 +1,12 @@
+# Echt (gekürzt): https://geizhals.de/robots.txt, abgerufen vom Agenten am 28.10.2026
+User-agent: *
+Disallow: /redir/
+Disallow: /?report
+Disallow: /hardware/
+Disallow: /?fs=
+Disallow: /*?*asuch=
+Disallow: /*?*sort=
+Disallow: /*?*view=
+
+User-agent: ClaudeBot
+Disallow: /

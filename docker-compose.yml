@@ -1,0 +1,33 @@
+# NZBLab-Agent mit Docker Compose (jedes Linux-NAS; Unraid: lieber die Vorlage unraid/nzblab-agent.xml).
+# Varianten mit den richtigen Pfaden: compose/truenas.yml (TrueNAS SCALE) und compose/synology.yml (Synology DSM).
+# Alle Host-Pfade nur lesend (:ro), nur /config ist schreibbar. Der Token steht beim ersten Start einmal im Log:
+#   docker compose logs nzblab-agent | grep "NZBLab-Agent Token"
+# Anleitung: https://tuxxler.github.io/nzblab/agent.html · Code (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
+services:
+  nzblab-agent:
+    image: ghcr.io/tuxxler/nzblab-agent:latest
+    container_name: nzblab-agent
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    environment:
+      TZ: Europe/Zurich
+      PUID: "99"            # Benutzer nach dem Start (99 = nobody); 0 = root
+      PGID: "100"           # Gruppe (100 = users)
+      # NZBLAB_AGENT_TOKEN: ""     # leer = Agent erzeugt selbst einen
+      # NTFY_URL: "https://ntfy.sh/ein-langes-geheimes-wort"
+    volumes:
+      # Pflicht: hier speichert der Agent Token und Verlauf, sonst gibt es nach jedem Update einen neuen Token
+      - ./nzblab-agent:/config                          # Verlauf, Datei-Index, token.txt (lesen/schreiben)
+      - /sys:/host/sys:ro                               # Temperaturen, Grafikchip
+      - /proc:/host/proc:ro                             # CPU-Last, Programme, Plattenzugriffe
+      - /mnt/user:/host/mnt/user:ro                     # Freigaben: Datei-Index und Suche (optional)
+      # - /mnt/cache:/host/mnt/cache:ro                 # Cache-Pool: was auf den Mover wartet (optional, Unraid)
+      # - /var/log:/host/log:ro                         # Fehler aus dem Systemprotokoll für «Heute» (optional)
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0

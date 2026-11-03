@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>nzblab-agent</Name>
+  <Repository>ghcr.io/tuxxler/nzblab-agent:latest</Repository>
+  <Registry>https://github.com/users/Tuxxler/packages/container/package/nzblab-agent</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://forums.unraid.net/topic/REPLACE-ME-support-nzblab-agent/</Support>
+  <Project>https://github.com/Tuxxler/nzblab-agent</Project>
+  <Overview>Read-only NAS monitor for the NZBLab Android app. Measures around the clock every 30 seconds: all temperature sensors, CPU load (total and per core), GPU (render and media engine used by Plex transcoding), RAM, network, disk spin-ups after idle (and which programs woke them), top processes, cache usage per share and a file index for searching all shares. Keeps 8 days at full resolution and 2 years of hourly values in /config. It never changes anything on your server: every host path is mounted read-only, only /config is writable, and the container drops root privileges (PUID/PGID).&#xD;
+&#xD;
+After the first start, open the container log: it shows "NZBLab-Agent Token: ..." once. Paste this token into the app (Settings &gt; Server connections &gt; NZBLab-Agent). The token is also stored in appdata/nzblab-agent/token.txt. A read-only dashboard is available in the browser on port 8099. Do not expose this port to the internet; use a VPN (WireGuard, Tailscale) when away from home.&#xD;
+&#xD;
+Deutsch: Misst Temperaturen, CPU, Grafikchip, RAM und Plattenzugriffe rund um die Uhr für die NZBLab-App. Nur lesen, ändert nichts am NAS. Den Token zeigt das Container-Log beim ersten Start («NZBLab-Agent Token: …»), danach steht er in appdata/nzblab-agent/token.txt.</Overview>
+  <Category>Tools:System</Category>
+  <WebUI>http://[IP]:[PORT:8099]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/nzblab-agent.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/icons/nzblab-agent.png</Icon>
+  <ExtraParams>--memory=512m --cpus=1 --read-only --tmpfs /tmp --security-opt no-new-privileges:true</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>The NZBLab Android app. Unraid 6.12 or newer.</Requires>
+  <Config Name="Web/API port" Target="8099" Default="8099" Mode="tcp" Description="Port for the app and the browser dashboard" Type="Port" Display="always" Required="true" Mask="false">8099</Config>
+  <Config Name="Data (/config)" Target="/config" Default="/mnt/user/appdata/nzblab-agent" Mode="rw" Description="Required, read/write. The agent stores its token and history here; without it you get a new token after every update. History (SQLite), file index, settings and token.txt. The only writable path." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/nzblab-agent</Config>
+  <Config Name="Shares (file index)" Target="/host/mnt/user" Default="/mnt/user" Mode="ro" Description="Read-only. Search across all shares, storage analysis, duplicates, media inventory, appdata sizes. appdata, system, domains and isos are skipped by the index." Type="Path" Display="always" Required="false" Mask="false">/mnt/user</Config>
+  <Config Name="Cache pool" Target="/host/mnt/cache" Default="/mnt/cache" Mode="ro" Description="Read-only. What is waiting for the mover, per share. Remove this path if you have no pool named 'cache' (more pools: variable CACHE_ROOTS)." Type="Path" Display="always" Required="false" Mask="false">/mnt/cache</Config>
+  <Config Name="Host /sys" Target="/host/sys" Default="/sys" Mode="ro" Description="Read-only. Temperature sensors and GPU." Type="Path" Display="advanced" Required="true" Mask="false">/sys</Config>
+  <Config Name="Host /proc" Target="/host/proc" Default="/proc" Mode="ro" Description="Read-only. CPU load, top programs, disk activity." Type="Path" Display="advanced" Required="true" Mask="false">/proc</Config>
+  <Config Name="Unraid notifications" Target="/host/notifications" Default="/tmp/notifications" Mode="ro" Description="Read-only. Unraid notifications for the 'Today' timeline." Type="Path" Display="advanced" Required="false" Mask="false">/tmp/notifications</Config>
+  <Config Name="System log" Target="/host/log" Default="/var/log" Mode="ro" Description="Read-only. Errors from syslog for the 'Today' timeline." Type="Path" Display="advanced" Required="false" Mask="false">/var/log</Config>
+  <Config Name="Docker container names" Target="/host/docker/containers" Default="/var/lib/docker/containers" Mode="ro" Description="Read-only. Container names in the 'top load' list. Needs PUID=0 (the files are readable by root only)." Type="Path" Display="advanced" Required="false" Mask="false">/var/lib/docker/containers</Config>
+  <Config Name="Time zone" Target="TZ" Default="Europe/Zurich" Mode="" Description="e.g. Europe/Berlin, America/New_York" Type="Variable" Display="always" Required="false" Mask="false">Europe/Zurich</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User the agent runs as after start (99 = nobody). 0 = root: needed only for container names and appdata folders of other containers with strict permissions." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group (100 = users)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+  <Config Name="Token (optional)" Target="NZBLAB_AGENT_TOKEN" Default="" Mode="" Description="Leave empty: the agent creates a random token on first start (container log and appdata/nzblab-agent/token.txt)." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="Heat alert (°C)" Target="HEAT_ALERT_C" Default="95" Mode="" Description="Push via ntfy when the CPU stays above this for 5 minutes" Type="Variable" Display="advanced" Required="false" Mask="false">95</Config>
+  <Config Name="ntfy URL (optional)" Target="NTFY_URL" Default="" Mode="" Description="e.g. https://ntfy.sh/a-long-secret-topic for push alerts while away" Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="Price country (optional)" Target="PRICE_COUNTRY" Default="" Mode="" Description="Disk prices: CH, DE, AT, US, GB, ... Usually set from the app. Empty = no price lookups." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+</Container>

@@ -1,0 +1,35 @@
+# NZBLab-Agent auf Synology DSM 7.2 und neuer (Container Manager).
+# 1. File Station: im Ordner «docker» den Ordner «nzblab-agent» anlegen.
+# 2. Container Manager › Projekt › Erstellen › Name «nzblab-agent», Pfad /docker/nzblab-agent,
+#    Quelle «docker-compose.yml erstellen» › diesen Text einfügen › Weiter › Fertig.
+# Token: Container Manager › Container › nzblab-agent › Protokoll: Zeile «NZBLab-Agent Token: …»
+# Mehrere Volumes: weitere Zeilen wie «/volume2:/host/mnt/volume2:ro» sind möglich, der Index sieht aber nur /host/mnt/user.
+# Code und Anleitung (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
+services:
+  nzblab-agent:
+    image: ghcr.io/tuxxler/nzblab-agent:latest
+    container_name: nzblab-agent
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    environment:
+      TZ: Europe/Zurich
+      # DSM regelt Freigaben über ACLs, die im Container keinem Benutzer entsprechen. Darum bleibt der Agent hier root;
+      # alle NAS-Pfade sind trotzdem nur lesend eingebunden. Eigene Nummer (SSH: «id») geht auch, z. B. PUID 1026 / PGID 100.
+      PUID: "0"
+      PGID: "0"
+      FILES_EXCLUDE: "@*,#*,docker"
+      CACHE_ROOTS: ""
+    volumes:
+      # Pflicht: hier speichert der Agent Token und Verlauf, sonst gibt es nach jedem Update einen neuen Token
+      - /volume1/docker/nzblab-agent:/config            # Verlauf, Datei-Index, token.txt (lesen/schreiben)
+      - /sys:/host/sys:ro
+      - /proc:/host/proc:ro
+      - /volume1:/host/mnt/user:ro                      # Volume nur lesend: Datei-Index und Suche
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0

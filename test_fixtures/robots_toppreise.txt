@@ -1,0 +1,13 @@
+# Echt: https://www.toppreise.ch/robots.txt, abgerufen vom Agenten am 28.10.2026
+User-agent: *
+Disallow: /ext_de
+Disallow: /ext_en
+Disallow: /ext_fr
+Disallow: /*?*asti=
+Disallow: /*?*astisi=
+Disallow: /*?*sp_is_ch=
+Disallow: /*?*sp_msaf_
+Disallow: /*?*wl_atwbt_
+Disallow: /*?*_view=
+
+Sitemap: https://www.toppreise.ch/sitemap_index.xml
