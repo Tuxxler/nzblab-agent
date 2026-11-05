@@ -33,7 +33,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -2188,6 +2188,364 @@ def local_disk_groups(sys_root=None):
     return sorted(out, key=lambda g: (-g["tb"], g["key"]))
 
 
+# ---------------------------------------------------------------- Linux-Server (ab 1.14.0)
+# Debian, Ubuntu und andere Linux-Server ohne eigene NAS-Schnittstelle: Die App liest Übersicht und Speicher hier.
+# Sicherheit zuerst: Das Wurzelverzeichnis des Hosts wird NIE eingebunden. Gelesen werden nur /host/proc und /host/sys
+# (beide nur lesen), die Datei /etc/os-release (einzeln, nur lesen, nach /host/os-release) und die Ordner, die der Benutzer
+# ausdrücklich nur lesend unter /host/fs/<Name> einbindet. Nur dort misst der Agent die Belegung (os.statvfs); alle anderen
+# Einhängepunkte stehen ohne Belegung in der Liste, die Grösse kommt dann aus /sys/class/block.
+HOST_FS = os.environ.get("HOST_FS", "/host/fs")
+HOST_OS_RELEASE = os.environ.get("HOST_OS_RELEASE", "/host/os-release")
+DOCKER_ROOT = os.environ.get("DOCKER_ROOT", "/host/docker-root")
+# Dateisysteme ohne Platte dahinter (Kernel, Container, Arbeitsspeicher): erscheinen nicht in der Liste
+PSEUDO_FS = {"proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "securityfs", "cgroup", "cgroup2", "pstore", "bpf", "debugfs",
+             "tracefs", "configfs", "fusectl", "mqueue", "hugetlbfs", "autofs", "binfmt_misc", "rpc_pipefs", "nsfs", "overlay",
+             "squashfs", "ramfs", "efivarfs", "selinuxfs", "fuse.lxcfs", "fuse.gvfsd-fuse", "fuse.portal", "nfsd", "shm", "none",
+             "aufs", "zram", "iso9660"}
+SKIP_MOUNTS = ("/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/docker", "/var/lib/containerd", "/var/snap", "/boot/efi")
+
+
+def parse_os_release(text):
+    """/etc/os-release: KEY=Wert (mit oder ohne Anführungszeichen) → dict. Kommentare und Fehlzeilen werden übersprungen."""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if not re.fullmatch(r"[A-Z0-9_]{1,40}", k):
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        out[k] = v[:200]
+    return out
+
+
+def _cpuinfo(proc_dir):
+    """Modell, Kerne (physisch) und Threads aus cpuinfo."""
+    model, threads, cores = "", 0, set()
+    phys = core = None
+    for line in (read(f"{proc_dir}/cpuinfo", "") or "").splitlines():
+        k, _, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if k == "processor":
+            threads += 1
+            phys = core = None
+        elif k in ("model name", "Model", "Hardware") and not model:
+            model = v
+        elif k == "physical id":
+            phys = v
+        elif k == "core id":
+            core = v
+            cores.add((phys, core))
+    return {"model": re.sub(r"\s+", " ", model)[:120], "threads": threads, "cores": len(cores) or threads}
+
+
+def _route_networks(proc_dir):
+    """Netze je Schnittstelle aus der Routing-Tabelle des Hosts: [(iface, Netz, Maske)] (Zahlen, Hex in Little Endian)."""
+    txt = read(f"{proc_dir}/1/net/route") if proc_dir != "/proc" else None
+    txt = txt or read(f"{proc_dir}/net/route", "") or ""
+    out = []
+    for line in txt.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 8:
+            continue
+        try:
+            dest, mask = int.from_bytes(bytes.fromhex(f[1]), "little"), int.from_bytes(bytes.fromhex(f[7]), "little")
+        except ValueError:
+            continue
+        if mask:
+            out.append((f[0], dest, mask))
+    return out
+
+
+def _local_ips(proc_dir):
+    """Eigene IPv4-Adressen des Hosts aus fib_trie (Einträge «/32 host LOCAL»), ohne 127.x."""
+    txt = read(f"{proc_dir}/1/net/fib_trie") if proc_dir != "/proc" else None
+    txt = txt or read(f"{proc_dir}/net/fib_trie", "") or ""
+    ips, last = [], None
+    for line in txt.splitlines():
+        m = re.search(r"\|-- (\d+\.\d+\.\d+\.\d+)$", line)
+        if m:
+            last = m.group(1)
+        elif last and "/32 host LOCAL" in line:
+            if not last.startswith("127.") and last not in ips:
+                ips.append(last)
+            last = None
+    return ips
+
+
+def host_net(proc_dir=None, sys_dir=None):
+    """Netzwerk-Schnittstellen des Hosts (ohne Docker-intern): Name, MAC, Zustand, Tempo, IPv4-Adressen."""
+    proc_dir, sys_dir = proc_dir or HOST_PROC, sys_dir or HOST_SYS
+    base = f"{sys_dir}/class/net"
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return []
+    nets = _route_networks(proc_dir)
+    ips = _local_ips(proc_dir)
+    out = []
+    for n in names:
+        if n.startswith(Sampler.SKIP_IF):
+            continue
+        sp = read(f"{base}/{n}/speed", "")
+        own = []
+        for ip in ips:
+            v = int(ipaddress.IPv4Address(ip))
+            if any(i == n and (v & m) == d for i, d, m in nets):
+                own.append(ip)
+        out.append({"name": n, "mac": (read(f"{base}/{n}/address", "") or "")[:17], "state": read(f"{base}/{n}/operstate", "") or "",
+                    "speed_mbit": int(sp) if sp and sp.lstrip("-").isdigit() and int(sp) > 0 else None, "ips": own})
+    return out
+
+
+def host_info(proc_dir=None, sys_dir=None, os_release=None, now=None):
+    """Übersicht für einen Linux-Server: Name, System, Kernel, Betriebszeit, CPU, Last, RAM, Netz. Nur lesen."""
+    proc_dir, sys_dir = proc_dir or HOST_PROC, sys_dir or HOST_SYS
+    rel = parse_os_release(read(os_release or HOST_OS_RELEASE, "") or "")
+    up = (read(f"{proc_dir}/uptime", "") or "").split()
+    try:
+        uptime = int(float(up[0])) if up else None
+    except ValueError:
+        uptime = None
+    load = (read(f"{proc_dir}/loadavg", "") or "").split()
+    try:
+        load = [float(x) for x in load[:3]] if len(load) >= 3 else []
+    except ValueError:
+        load = []
+    mem = {}
+    for line in (read(f"{proc_dir}/meminfo", "") or "").splitlines():
+        k, _, v = line.partition(":")
+        if v.split() and v.split()[0].isdigit():
+            mem[k] = int(v.split()[0]) * 1024
+    tot, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", mem.get("MemFree", 0))
+    t = int(now if now is not None else time.time())
+    return {
+        "hostname": read(f"{proc_dir}/sys/kernel/hostname", "") or socket.gethostname(),
+        "os": {"name": rel.get("NAME", ""), "version": rel.get("VERSION", rel.get("VERSION_ID", "")),
+               "id": rel.get("ID", ""), "pretty": rel.get("PRETTY_NAME", ""), "available": bool(rel)},
+        "kernel": read(f"{proc_dir}/sys/kernel/osrelease", "") or "",
+        "uptime_s": uptime, "boot_time": t - uptime if uptime is not None else None,
+        "cpu": _cpuinfo(proc_dir), "load": load,
+        "mem": {"total": tot, "available": avail, "used": max(0, tot - avail), "cache": mem.get("Cached", 0),
+                "swap_total": mem.get("SwapTotal", 0), "swap_used": max(0, mem.get("SwapTotal", 0) - mem.get("SwapFree", 0))},
+        "net": host_net(proc_dir, sys_dir),
+        "host_proc": proc_dir != "/proc", "host_sys": sys_dir != "/sys",
+    }
+
+
+def _unoctal(s):
+    """Leerzeichen und Sonderzeichen in Einhängepunkten (\\040 usw.) zurückwandeln."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+
+def host_mounts(proc_dir=None):
+    """
+    Einhängepunkte des Hosts: [{device, mount, fstype, dev ("8:17" oder None), root}]. Zuerst mountinfo von PID 1 des
+    Hosts (mit Gerätenummer), sonst dessen mounts, sonst die eigenen des Containers (dann «container»: True).
+    """
+    proc_dir = proc_dir or HOST_PROC
+    out = []
+    txt = read(f"{proc_dir}/1/mountinfo") if proc_dir != "/proc" else None
+    if txt:
+        for line in txt.splitlines():
+            left, sep, right = line.partition(" - ")
+            a, b = left.split(), right.split()
+            if not sep or len(a) < 5 or len(b) < 2:
+                continue
+            out.append({"device": _unoctal(b[1]), "mount": _unoctal(a[4]), "fstype": b[0], "dev": a[2], "root": _unoctal(a[3])})
+        return out, False
+    txt = read(f"{proc_dir}/1/mounts") if proc_dir != "/proc" else None
+    own = not txt
+    txt = txt or read("/proc/self/mounts", "") or ""
+    for line in txt.splitlines():
+        f = line.split()
+        if len(f) >= 3:
+            out.append({"device": _unoctal(f[0]), "mount": _unoctal(f[1]), "fstype": f[2], "dev": None, "root": "/"})
+    return out, own
+
+
+def block_size(sys_root, device):
+    """Grösse eines Blockgeräts in Bytes aus /sys/class/block (/dev/sdb1, /dev/mapper/vg-data, /dev/nvme0n1p2) oder None."""
+    if not device.startswith("/dev/"):
+        return None
+    name = os.path.basename(device)
+    base = f"{sys_root}/class/block"
+    if device.startswith("/dev/mapper/"):
+        try:
+            for dm in os.listdir(base):
+                if dm.startswith("dm-") and (read(f"{base}/{dm}/dm/name", "") or "") == name:
+                    name = dm
+                    break
+        except OSError:
+            return None
+    v = read(f"{base}/{name}/size", "")
+    return int(v) * 512 if v and v.isdigit() else None
+
+
+STATVFS_TIMEOUT = float(os.environ.get("STATVFS_TIMEOUT", "2"))
+_HUNG = {}                  # Pfad → Faden, der dort noch hängt (z. B. NFS weg): nicht nochmals einen starten
+_HUNG_LOCK = threading.Lock()
+
+
+def _measure(path):
+    """Belegung und Gerätenummer eines Ordners: {size, used, free, dev} oder None (gleiche Arbeit wie früher in einem Zug)."""
+    try:
+        st = os.statvfs(path)
+        d = os.stat(path).st_dev
+    except OSError:
+        return None
+    if st.f_blocks <= 0:
+        return None
+    return {"size": st.f_blocks * st.f_frsize, "used": (st.f_blocks - st.f_bfree) * st.f_frsize, "free": st.f_bavail * st.f_frsize,
+            "dev": f"{os.major(d)}:{os.minor(d)}"}
+
+
+def _statvfs(path, timeout=None):
+    """
+    Wie _measure, aber höchstens [timeout] Sekunden (Standard STATVFS_TIMEOUT): Ein hängender Netzwerk-Mount unter /host/fs
+    blockiert sonst den Arbeits-Faden der Anfrage für immer. Zeitüberschreitung → {"timeout": True}; solange der alte Faden
+    dort noch hängt, wird kein neuer gestartet.
+    """
+    timeout = STATVFS_TIMEOUT if timeout is None else timeout
+    with _HUNG_LOCK:
+        t = _HUNG.get(path)
+        if t is not None and t.is_alive():
+            return {"timeout": True}
+        _HUNG.pop(path, None)
+    box = {}
+    t = threading.Thread(target=lambda: box.setdefault("r", _measure(path)), daemon=True, name="statvfs")
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        with _HUNG_LOCK:
+            _HUNG[path] = t
+        return {"timeout": True}
+    return box.get("r")
+
+
+def _dev_of(path):
+    try:
+        d = os.stat(path).st_dev
+        return f"{os.major(d)}:{os.minor(d)}"
+    except OSError:
+        return None
+
+
+def disk_temp(sys_root, dev):
+    """Temperatur einer Platte in °C, falls der Kernel sie meldet (drivetemp für SATA, nvme-hwmon), sonst None."""
+    pats = [f"{sys_root}/block/{dev}/device/hwmon/hwmon*/temp1_input", f"{sys_root}/block/{dev}/device/hwmon*/temp1_input"]
+    for p in pats:
+        for f in sorted(glob.glob(p)):
+            v = read(f, "")
+            if v and v.lstrip("-").isdigit() and -40 < int(v) / 1000 < 150:
+                return round(int(v) / 1000)
+    return None
+
+
+def host_disks(sys_root=None):
+    """Physische Platten aus /sys/block (ohne loop, ram, zram, dm, md, sr): Gerät, Modell, Grösse, drehend, Temperatur."""
+    sys_root = sys_root or HOST_SYS
+    root = os.path.join(sys_root, "block")
+    try:
+        devs = sorted(os.listdir(root))
+    except OSError:
+        return []
+    out = []
+    for dev in devs:
+        if re.match(r"(loop|ram|zram|dm-|md|sr|nbd|fd)", dev):
+            continue
+        v = read(os.path.join(root, dev, "size"), "0") or "0"
+        size = int(v) * 512 if v.isdigit() else 0
+        if size <= 0:
+            continue
+        rot = read(os.path.join(root, dev, "queue", "rotational"), "") == "1"
+        out.append({"dev": dev, "model": disk_model(sys_root, dev), "size": size, "rotational": rot,
+                    "kind": "nvme" if dev.startswith("nvme") else ("hdd" if rot else "ssd"),
+                    "removable": read(os.path.join(root, dev, "removable"), "0") == "1",
+                    "temp": disk_temp(sys_root, dev)})
+    return out
+
+
+def filesystems(proc_dir=None, sys_dir=None, fs_root=None, docker_root=None):
+    """
+    Dateisysteme des Hosts für die App: Gerät, Einhängepunkt, Typ, Grösse und, nur für ausdrücklich eingebundene Ordner
+    (/host/fs/<Name>, Docker-Datenordner), Belegung. Dazu die physischen Platten.
+    """
+    proc_dir, sys_dir = proc_dir or HOST_PROC, sys_dir or HOST_SYS
+    fs_root = fs_root or HOST_FS
+    docker_root = docker_root or DOCKER_ROOT
+    mounts, own = host_mounts(proc_dir)
+    measured = []           # (Name, Pfad im Container)
+    try:
+        for n in sorted(os.listdir(fs_root)):
+            if os.path.isdir(os.path.join(fs_root, n)):
+                measured.append((n, os.path.join(fs_root, n)))
+    except OSError:
+        pass
+    if os.path.isdir(docker_root):
+        measured.append(("docker", docker_root))
+    out, seen = [], set()
+    if not own:
+        for m in mounts:
+            if m["fstype"] in PSEUDO_FS or any(m["mount"] == p or m["mount"].startswith(p + "/") for p in SKIP_MOUNTS) \
+                    or (m["mount"], m["device"]) in seen:
+                continue
+            # Bind-Mounts (root ≠ /) desselben Geräts nur einmal zeigen
+            if m["root"] not in ("/", "") and any(o["dev"] == m["dev"] and m["dev"] for o in out):
+                continue
+            seen.add((m["mount"], m["device"]))
+            out.append({"device": m["device"], "mount": m["mount"], "fstype": m["fstype"], "dev": m["dev"],
+                        "size": block_size(sys_dir, m["device"]), "used": None, "free": None, "measured": False, "label": ""})
+    for name, path in measured:
+        u = _statvfs(path)
+        if not u:
+            continue
+        if u.get("timeout"):
+            # Antwortet nicht (z. B. Netzwerk-Mount weg): ohne Belegung, aber sichtbar markiert
+            out.append({"device": "", "mount": f"/host/fs/{name}" if path.startswith(fs_root) else path, "fstype": "", "dev": None,
+                        "size": None, "used": None, "free": None, "measured": False, "label": name, "timeout": True})
+            continue
+        dev = u.pop("dev", None)
+        hit = next((o for o in out if dev and o["dev"] == dev and not o["measured"]), None) or \
+            next((o for o in out if dev and o["dev"] == dev), None)
+        if hit and not hit["measured"]:
+            hit.update(u, measured=True, label=name)
+        elif not hit:
+            fstype = next((m["fstype"] for m in mounts if dev and m["dev"] == dev), "")
+            out.append({"device": "", "mount": f"/host/fs/{name}" if path.startswith(fs_root) else path, "fstype": fstype,
+                        "dev": dev, "measured": True, "label": name, **u})
+    for o in out:
+        o.pop("dev", None)
+    return {"filesystems": out, "disks": host_disks(sys_dir), "mounts_from": "container" if own else "host",
+            "measured": [n for n, _ in measured], "os_release": os.path.isfile(HOST_OS_RELEASE)}
+
+
+HOST_CACHE_S = float(os.environ.get("HOST_CACHE_S", "15"))
+_HOST_CACHE = {}
+_HOST_CACHE_LOCK = threading.Lock()
+
+
+def cached(name, fn, ttl=None):
+    """
+    Ergebnis von /api/host bzw. /api/filesystems höchstens alle [ttl] Sekunden neu rechnen (die App fragt alle paar
+    Sekunden). Schlüssel enthält die Host-Pfade, damit Tests mit anderen Bäumen nicht das alte Ergebnis bekommen.
+    Gleichzeitige Anfragen rechnen nur einmal (Sperre je Schlüssel).
+    """
+    ttl = HOST_CACHE_S if ttl is None else ttl
+    key = (name, HOST_PROC, HOST_SYS, HOST_OS_RELEASE, HOST_FS, DOCKER_ROOT)
+    with _HOST_CACHE_LOCK:
+        entry = _HOST_CACHE.setdefault(key, {"t": 0.0, "v": None, "lock": threading.Lock()})
+    with entry["lock"]:
+        if entry["v"] is not None and time.time() - entry["t"] < ttl:
+            return entry["v"]
+        v = fn()
+        entry["v"], entry["t"] = v, time.time()
+        return v
+
+
 def http_get(url, lang="en"):
     """Eine Seite lesen: (Status, HTML). Höchstens 4 MB, ehrlicher User-Agent, kein Cookie, keine Wiederholung."""
     req = urllib.request.Request(url, headers={"User-Agent": PRICE_UA, "Accept": "text/html", "Accept-Language": lang})
@@ -3285,6 +3643,10 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                         # ab 1.13.0: bleibt /config beim Neuerstellen erhalten? Sonst Warnung mit Lösung
                                         "config_persistent": CONFIG_STATE.get("persistent") is not False,
                                         "token_source": TOKEN_STATE["source"] or "unknown",
+                                        # ab 1.14.0: Linux-Server (os-release eingebunden, Ordner unter /host/fs)
+                                        "host_os": os.path.isfile(HOST_OS_RELEASE),
+                                        "host_fs": sorted(n for n in (os.listdir(HOST_FS) if os.path.isdir(HOST_FS) else [])
+                                                          if os.path.isdir(os.path.join(HOST_FS, n)))[:50],
                                         "warnings": config_warnings()})
             if u.path == "/api/array" and array:
                 return self.reply(200, array.read() or {"state": "", "disks": []})
@@ -3295,6 +3657,12 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 return self.reply(200, dict(LAST_SPEED, nic=nic_info()) if LAST_SPEED else {"nic": nic_info()})
             if u.path == "/api/now":
                 return self.reply(200, sampler_now())
+            # Ab 1.14.0: Linux-Server (Debian, Ubuntu …), nur lesen. Fehler als JSON, nie den Agenten mitreissen
+            if u.path in ("/api/host", "/api/filesystems"):
+                try:
+                    return self.reply(200, cached("host", host_info) if u.path == "/api/host" else cached("fs", filesystems))
+                except Exception as e:  # noqa: BLE001
+                    return self.reply(500, {"error": f"{type(e).__name__}: {e}"[:150]})
             if u.path == "/api/prices":
                 return self.reply(200, price_summary())
             if u.path == "/api/today":

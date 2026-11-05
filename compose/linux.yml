@@ -1,0 +1,41 @@
+# NZBLab-Agent auf einem Linux-Server (Debian, Ubuntu, Raspberry Pi OS …), ab Agent 1.14.0. In der App: Server-Typ «Linux (Beta)».
+# 1. Ordner anlegen und dem Agenten-Benutzer geben (65534 = nobody, kein Login, kein Zugriff auf deine Dateien):
+#      mkdir -p ~/nzblab-agent/nzblab-agent-config && sudo chown 65534:65534 ~/nzblab-agent/nzblab-agent-config
+#    Darin (in ~/nzblab-agent) diese Datei als docker-compose.yml speichern.
+# 2. Unter /host/fs nur Ordner einbinden, deren Belegung die App zeigen soll, immer mit :ro (Beispiel /srv). Das ganze System (/)
+#    nie einbinden: Der Agent braucht es nicht, er liest /proc und /sys nur lesend.
+# 3. docker compose up -d, dann Token: docker logs nzblab-agent 2>&1 | grep "NZBLab-Agent Token"
+# Der Agent läuft von Anfang an ohne root und ohne Capabilities (user, cap_drop). Nicht als root oder als dein eigener
+# Benutzer starten: Mit /proc des Servers könnte er sonst über /proc/<pid>/root in die Dateien laufender Programme dieses Benutzers.
+# Netzwerk «host»: Der Agent sieht die echten Netzwerkkarten und IP-Adressen des Servers. Port 8099 nie ins Internet freigeben.
+# Docker-Container steuert die App über Portainer (eigener Dienst in der App), nicht über den Agenten: kein docker.sock hier.
+# Code und Anleitung (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
+services:
+  nzblab-agent:
+    image: ghcr.io/tuxxler/nzblab-agent:latest
+    container_name: nzblab-agent
+    restart: unless-stopped
+    network_mode: host
+    user: "65534:65534"     # eigener Benutzer ohne Login (nobody); Ordner unter /host/fs müssen für alle lesbar sein
+    environment:
+      TZ: Europe/Zurich
+      FILES_ROOT: "/host/fs"
+      CACHE_ROOTS: ""       # kein Unraid-Cache
+    volumes:
+      # Pflicht: hier speichert der Agent Token und Verlauf, sonst gibt es nach jedem Update einen neuen Token
+      - ./nzblab-agent-config:/config                   # Verlauf, Datei-Index, token.txt (lesen/schreiben, gehört 65534)
+      - /sys:/host/sys:ro                               # Temperaturen, Platten, Netzwerkkarten
+      - /proc:/host/proc:ro                             # CPU, RAM, Last, Einhängepunkte, Plattenzugriffe
+      - /etc/os-release:/host/os-release:ro             # nur diese eine Datei: Name und Version des Systems
+      - /srv:/host/fs/data:ro                           # Beispiel: Belegung und Datei-Index für /srv (Name «data» frei wählbar)
+      # - /home:/host/fs/home:ro                        # weitere Ordner je mit eigenem Namen unter /host/fs
+      # - /var/log:/host/log:ro                         # Fehler aus dem Systemprotokoll für «Heute» (optional)
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0

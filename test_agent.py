@@ -123,7 +123,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.13.0")
+        self.assertEqual(info["version"], "1.14.0")
         srv.shutdown()
 
 
@@ -159,7 +159,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.13.0")
+            self.assertEqual(r["version"], "1.14.0")
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents
@@ -1653,3 +1653,211 @@ class Precompute113Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LinuxHostTest(unittest.TestCase):
+    """1.14.0: Linux-Server (Debian, Ubuntu) mit nachgebautem /host/proc, /host/sys, os-release und /host/fs."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.proc, self.sys = f"{self.dir}/proc", f"{self.dir}/sys"
+        self.osr = f"{self.dir}/os-release"
+        self.fs = f"{self.dir}/fs"
+        p, s = self.proc, self.sys
+        write(self.osr, 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nNAME="Debian GNU/Linux"\nVERSION_ID="13"\n'
+                        'VERSION="13 (trixie)"\nID=debian\n# Kommentar\nkaputt\n')
+        write(f"{p}/sys/kernel/hostname", "debianvm")
+        write(f"{p}/sys/kernel/osrelease", "6.12.38+deb13-amd64")
+        write(f"{p}/uptime", "93784.51 180000.00")
+        write(f"{p}/loadavg", "0.52 0.41 0.30 1/321 4242")
+        write(f"{p}/meminfo", "MemTotal: 8000000 kB\nMemFree: 1000000 kB\nMemAvailable: 6000000 kB\nCached: 2000000 kB\n"
+                              "SwapTotal: 1000000 kB\nSwapFree: 750000 kB\n")
+        write(f"{p}/cpuinfo", "".join(f"processor\t: {i}\nmodel name\t: Intel(R) Core(TM) i5-8500T CPU @ 2.10GHz\n"
+                                      f"physical id\t: 0\ncore id\t\t: {i // 2}\n\n" for i in range(4)))
+        # Routing und eigene Adressen: 192.168.1.50 auf eth0, Docker-Brücke wird ausgeblendet
+        write(f"{p}/1/net/route", "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n"
+                                  "eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\n"
+                                  "eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\n"
+                                  "docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\n")
+        write(f"{p}/1/net/fib_trie", "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 192.168.1.50\n        /32 host LOCAL\n"
+                                     "     |-- 172.17.0.1\n        /32 host LOCAL\n     |-- 127.0.0.1\n        /32 host LOCAL\n")
+        for n, mac, st, sp in (("eth0", "52:54:00:12:34:56", "up", "1000"), ("lo", "00:00:00:00:00:00", "unknown", ""),
+                               ("docker0", "02:42:ac:11:00:01", "up", ""), ("veth1a2b", "aa:bb:cc:dd:ee:ff", "up", "10000")):
+            write(f"{s}/class/net/{n}/address", mac)
+            write(f"{s}/class/net/{n}/operstate", st)
+            if sp:
+                write(f"{s}/class/net/{n}/speed", sp)
+        # Platten: SATA-HDD mit Temperatur (drivetemp), NVMe, loop wird ausgelassen
+        write(f"{s}/block/sda/size", str(4_000_000_000_000 // 512))
+        write(f"{s}/block/sda/queue/rotational", "1")
+        write(f"{s}/block/sda/device/model", "WDC WD40EFPX-68C")
+        write(f"{s}/block/sda/device/vendor", "ATA")
+        write(f"{s}/block/sda/device/hwmon/hwmon3/temp1_input", "38000")
+        write(f"{s}/block/nvme0n1/size", str(500_000_000_000 // 512))
+        write(f"{s}/block/nvme0n1/queue/rotational", "0")
+        write(f"{s}/block/nvme0n1/device/model", "Samsung SSD 980 500GB")
+        write(f"{s}/block/loop0/size", "1000")
+        write(f"{s}/class/block/sda1/size", str(3_999_000_000_000 // 512))
+        write(f"{s}/class/block/nvme0n1p2/size", str(480_000_000_000 // 512))
+        write(f"{s}/class/block/dm-0/size", str(100_000_000_000 // 512))
+        write(f"{s}/class/block/dm-0/dm/name", "vg-home")
+        os.makedirs(f"{self.fs}/data")
+        self.data_dev = a._dev_of(f"{self.fs}/data")
+        write(f"{p}/1/mountinfo",
+              "22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n"
+              "23 22 0:21 / /proc rw - proc proc rw\n"
+              "24 22 0:22 / /sys rw - sysfs sysfs rw\n"
+              "25 22 0:23 / /run rw - tmpfs tmpfs rw\n"
+              f"30 22 {self.data_dev} / /srv rw,noatime shared:5 - ext4 /dev/sda1 rw\n"
+              "31 22 253:0 / /home\\040daten rw - xfs /dev/mapper/vg-home rw\n"
+              "32 22 259:1 / /boot/efi rw - vfat /dev/nvme0n1p1 rw\n"
+              "33 22 0:50 / /var/lib/docker/overlay2/abc/merged rw - overlay overlay rw\n"
+              f"34 30 {self.data_dev} /backup /mnt/backup rw - ext4 /dev/sda1 rw\n")
+
+    def test_host_info(self):
+        h = a.host_info(self.proc, self.sys, self.osr, now=100000)
+        self.assertEqual(h["hostname"], "debianvm")
+        self.assertEqual(h["os"]["pretty"], "Debian GNU/Linux 13 (trixie)")
+        self.assertEqual(h["os"]["version"], "13 (trixie)")
+        self.assertEqual(h["os"]["id"], "debian")
+        self.assertEqual(h["kernel"], "6.12.38+deb13-amd64")
+        self.assertEqual(h["uptime_s"], 93784)
+        self.assertEqual(h["boot_time"], 100000 - 93784)
+        self.assertEqual(h["cpu"], {"model": "Intel(R) Core(TM) i5-8500T CPU @ 2.10GHz", "threads": 4, "cores": 2})
+        self.assertEqual(h["load"], [0.52, 0.41, 0.30])
+        self.assertEqual(h["mem"]["total"], 8000000 * 1024)
+        self.assertEqual(h["mem"]["used"], 2000000 * 1024)
+        self.assertEqual(h["mem"]["swap_used"], 250000 * 1024)
+        self.assertEqual([n["name"] for n in h["net"]], ["eth0"])
+        self.assertEqual(h["net"][0]["ips"], ["192.168.1.50"])
+        self.assertEqual(h["net"][0]["speed_mbit"], 1000)
+        self.assertEqual(h["net"][0]["mac"], "52:54:00:12:34:56")
+
+    def test_ohne_os_release_und_ohne_host_ordner(self):
+        """Fehlt alles (kein /host-Ordner eingebunden), kommt trotzdem eine Antwort, nie das os-release des Containers."""
+        h = a.host_info(f"{self.dir}/leer", f"{self.dir}/leer", f"{self.dir}/fehlt")
+        self.assertFalse(h["os"]["available"])
+        self.assertEqual(h["os"]["name"], "")
+        self.assertIsNone(h["uptime_s"])
+        self.assertEqual(h["net"], [])
+        self.assertEqual(a.parse_os_release('A="x\\"y"\nb=klein\nLANG=' + "z" * 500)["A"], 'x"y')
+
+    def test_dateisysteme(self):
+        r = a.filesystems(self.proc, self.sys, self.fs, f"{self.dir}/kein-docker")
+        mounts = {f["mount"]: f for f in r["filesystems"]}
+        # Pseudo-Dateisysteme, /proc, /sys, /run, Docker-Overlays und /boot/efi nicht; Bind-Mount von /dev/sda1 nur einmal
+        self.assertEqual(sorted(mounts), ["/", "/home daten", "/srv"])
+        self.assertEqual(r["mounts_from"], "host")
+        # Nur der ausdrücklich eingebundene Ordner (/host/fs/data → /srv) hat eine Belegung
+        srv = mounts["/srv"]
+        self.assertTrue(srv["measured"])
+        self.assertEqual(srv["label"], "data")
+        self.assertGreater(srv["size"], 0)
+        self.assertIsNotNone(srv["free"])
+        root = mounts["/"]
+        self.assertFalse(root["measured"])
+        self.assertIsNone(root["used"])
+        self.assertEqual(root["size"], 480_000_000_000 // 512 * 512)
+        self.assertEqual(mounts["/home daten"]["size"], 100_000_000_000 // 512 * 512)   # /dev/mapper → dm-0
+        self.assertEqual(mounts["/home daten"]["fstype"], "xfs")
+        disks = {d["dev"]: d for d in r["disks"]}
+        self.assertEqual(sorted(disks), ["nvme0n1", "sda"])
+        self.assertEqual(disks["sda"]["model"], "WDC WD40EFPX-68C")
+        self.assertTrue(disks["sda"]["rotational"])
+        self.assertEqual(disks["sda"]["temp"], 38)
+        self.assertEqual(disks["nvme0n1"]["kind"], "nvme")
+        self.assertIsNone(disks["nvme0n1"]["temp"])
+        self.assertEqual(r["measured"], ["data"])
+
+    def test_ohne_host_mountinfo(self):
+        """Ohne /host/proc: nur die eingebundenen Ordner, nie die Einhängepunkte des Containers (/config, /host/sys …)."""
+        r = a.filesystems(f"{self.dir}/leer", self.sys, self.fs, f"{self.dir}/kein-docker")
+        self.assertEqual(r["mounts_from"], "container")
+        self.assertEqual([f["label"] for f in r["filesystems"]], ["data"])
+        self.assertTrue(all(f["measured"] for f in r["filesystems"]))
+        self.assertFalse(any(f["mount"] in ("/config", "/proc", "/") for f in r["filesystems"]))
+
+    def test_http_endpunkte_mit_token(self):
+        store = a.Store(":memory:")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(store, lambda: {"cpu": 1.0}, "geheim"))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            for path in ("/api/host", "/api/filesystems"):
+                with self.assertRaises(urllib.error.HTTPError) as e:
+                    urllib.request.urlopen(base + path)
+                self.assertEqual(e.exception.code, 401, path)
+            with patch.object(a, "HOST_PROC", self.proc), patch.object(a, "HOST_SYS", self.sys), \
+                    patch.object(a, "HOST_OS_RELEASE", self.osr), patch.object(a, "HOST_FS", self.fs):
+                auth = {"Authorization": "Bearer geheim"}
+                h = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/host", headers=auth)))
+                self.assertEqual(h["hostname"], "debianvm")
+                f = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/filesystems", headers=auth)))
+                self.assertIn("/srv", [x["mount"] for x in f["filesystems"]])
+                info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers=auth)))
+                self.assertTrue(info["host_os"])
+                self.assertEqual(info["host_fs"], ["data"])
+            # Fehler beim Lesen: 500 mit Text, der Agent läuft weiter
+            a._HOST_CACHE.clear()
+            with patch.object(a, "host_info", side_effect=RuntimeError("kaputt")):
+                with self.assertRaises(urllib.error.HTTPError) as e:
+                    urllib.request.urlopen(urllib.request.Request(base + "/api/host", headers={"Authorization": "Bearer geheim"}))
+                self.assertEqual(e.exception.code, 500)
+            self.assertTrue(json.load(urllib.request.urlopen(base + "/api/ping"))["ok"])
+        finally:
+            srv.shutdown()
+
+
+class LinuxLastTest(unittest.TestCase):
+    """Review 04.11.2026: /api/host und /api/filesystems zwischengespeichert, hängende Mounts blockieren nicht."""
+
+    def test_zwischenspeicher(self):
+        a._HOST_CACHE.clear()
+        calls = []
+        fn = lambda: calls.append(1) or {"n": len(calls)}
+        self.assertEqual(a.cached("x", fn, ttl=30), {"n": 1})
+        self.assertEqual(a.cached("x", fn, ttl=30), {"n": 1})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(a.cached("x", fn, ttl=0), {"n": 2})
+        # Andere Host-Pfade (z. B. Test mit anderem Baum): eigener Eintrag
+        with patch.object(a, "HOST_FS", "/anders"):
+            self.assertEqual(a.cached("x", fn, ttl=30), {"n": 3})
+        # Gleichzeitige Anfragen rechnen nur einmal
+        a._HOST_CACHE.clear()
+        slow_calls = []
+
+        def slow():
+            slow_calls.append(1)
+            time.sleep(0.3)
+            return {"ok": True}
+        ts = [threading.Thread(target=lambda: a.cached("y", slow, ttl=30)) for _ in range(5)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(slow_calls), 1)
+
+    def test_haengender_mount(self):
+        d = tempfile.mkdtemp()
+        os.makedirs(f"{d}/fs/nfs")
+        os.makedirs(f"{d}/fs/ok")
+        real = os.statvfs
+        gate = threading.Event()
+
+        def fake(path):
+            if path.endswith("/nfs"):
+                gate.wait(5)            # hängt wie ein weggefallener NFS-Mount
+            return real(path)
+        try:
+            with patch.object(a.os, "statvfs", side_effect=fake), patch.object(a, "STATVFS_TIMEOUT", 0.3):
+                t0 = time.time()
+                r = a.filesystems(f"{d}/leer", f"{d}/leer", f"{d}/fs", f"{d}/kein-docker")
+                self.assertLess(time.time() - t0, 2.5)
+                by = {f["label"]: f for f in r["filesystems"]}
+                self.assertTrue(by["nfs"].get("timeout"))
+                self.assertFalse(by["nfs"]["measured"])
+                self.assertTrue(by["ok"]["measured"])
+                # Zweiter Aufruf, solange der alte Faden hängt: sofort, ohne neuen Faden
+                t0 = time.time()
+                self.assertEqual(a._statvfs(f"{d}/fs/nfs"), {"timeout": True})
+                self.assertLess(time.time() - t0, 0.2)
+        finally:
+            gate.set()

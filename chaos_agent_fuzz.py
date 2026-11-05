@@ -101,7 +101,7 @@ class ChaosAgentTest(unittest.TestCase):
     # ------------------------------------------------------------------ ohne Token: keine Daten
     def test_ohne_token_keine_daten(self):
         paths = ["/api/info", "/api/now", "/api/history", "/api/files/search?q=x", "/api/files/tree", "/api/inventory",
-                 "/api/appdata", "/api/cache/shares", "/api/wireguard", "/api/today", "/API/INFO", "/api//info", "/api/info/",
+                 "/api/appdata", "/api/cache/shares", "/api/wireguard", "/api/today", "/api/host", "/api/filesystems", "/API/INFO", "/api//info", "/api/info/",
                  "/api/info;x", "/api/info%00", "/./api/info", "/../api/info", "//api/info", "/api/%69nfo"]
         bad = ["", "Bearer", "Bearer ", "bearer " + TOK, "Bearer " + TOK + " ", "Bearer " + TOK[:-1], "Basic " + TOK,
                "Bearer " + TOK + "\x00", "Bearer ÄÖÜ" , "Bearer " + "A" * 60000, TOK]

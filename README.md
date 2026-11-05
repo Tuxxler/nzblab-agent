@@ -20,6 +20,7 @@ Website <https://tuxxler.github.io/nzblab/agent.html>.
 | Unraid | `unraid/nzblab-agent.xml` | Apps › «NZBLab-Agent» › Install; bis zur Aufnahme in CA: Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent` |
 | TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = eigener Pool |
 | Synology DSM 7.2+ | `compose/synology.yml` | Ordner `docker/nzblab-agent` anlegen; Container Manager › Projekt › Erstellen |
+| Linux (Debian, Ubuntu …, ab 1.14.0) | `compose/linux.yml` | Ordner anlegen, Datei als `docker-compose.yml` speichern, `docker compose up -d`; siehe unten |
 | Docker allgemein | `docker-compose.yml` | `docker compose up -d` |
 
 **Token:** Beim ersten Start erzeugt der Agent einen zufälligen Token (`/config/token.txt`, Rechte 600) und schreibt ihn
@@ -70,6 +71,63 @@ Standard `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (leer = kein Cache).
 Optional: Push-Meldung bei Hitze auch unterwegs: Variable `NTFY_URL` = `https://ntfy.sh/<langes-geheimes-wort>` und in der
 App «ntfy» dasselbe Thema abonnieren. Schwelle: `HEAT_ALERT_C` (Standard 95 °C, nach 5 Minuten).
 
+## Linux (Debian, Ubuntu …) (ab 1.14.0)
+
+Für Linux-Server ohne eigene NAS-Schnittstelle (Debian, Ubuntu, Raspberry Pi OS und ähnliche). In der App heisst der
+Server-Typ **«Linux (Beta)»** (Einstellungen › Server-Verbindungen › NAS-Server). Übersicht, Speicher, Temperaturen und
+Meldungen kommen vom Agenten; Docker-Container steuert die App optional über **Portainer** (eigener Dienst in der App,
+Zugriffstoken aus Portainer › Mein Konto › Zugriffstoken). Der Agent selbst bekommt **kein** `docker.sock`.
+
+**Beta:** nur mit Testdaten geprüft (nachgebautes `/proc`, `/sys` und `os-release` in `test_agent.py`, Demo-Agent in der App),
+noch nie an einem echten Debian- oder Ubuntu-Server.
+
+Vorlage `compose/linux.yml`:
+
+1. Ordner anlegen und den Ordner für Token und Verlauf dem Agenten-Benutzer geben:
+   `mkdir -p ~/nzblab-agent/nzblab-agent-config && sudo chown 65534:65534 ~/nzblab-agent/nzblab-agent-config`,
+   dann in `~/nzblab-agent` die Datei als `docker-compose.yml` speichern.
+2. Ordner mit Daten anpassen (siehe unten), dann `docker compose up -d`.
+3. Token: `docker logs nzblab-agent 2>&1 | grep "NZBLab-Agent Token"`. In der App den Dienst «NZBLab-Agent» eintragen und
+   beim NAS-Server den Typ «Linux (Beta)» wählen.
+
+**Sicherheit zuerst: nie das ganze System (`/`) einbinden.** Der Agent braucht es nicht. Er liest:
+
+| Pfad im Container | vom Host | wofür |
+|---|---|---|
+| `/host/proc` | `/proc` (nur lesen) | CPU, RAM, Last, Betriebszeit, Einhängepunkte (`/host/proc/1/mountinfo`, sonst `mounts`, sonst die eigenen des Containers), Netz |
+| `/host/sys` | `/sys` (nur lesen) | Platten (Modell, Grösse, drehend, Temperatur über `drivetemp`/NVMe), Netzwerkkarten, Sensoren |
+| `/host/os-release` | `/etc/os-release` (nur lesen, **eine Datei**) | Name und Version des Systems |
+| `/host/fs/<Name>` | ein Ordner deiner Wahl (nur lesen) | **Belegung** (belegt, frei, gesamt per `os.statvfs`) und Datei-Index |
+| `/host/docker-root` | optional | Belegung des Docker-Datenordners. Vorsicht: `/var/lib/docker` enthält die Einstellungen aller Container (auch Passwörter); nur einbinden, wenn nötig |
+
+Belegung gibt es nur für Ordner unter `/host/fs` (Beispiel `- /srv:/host/fs/data:ro`, weitere mit eigenem Namen). Alle anderen
+Dateisysteme stehen ohne Belegung in der Liste, die Grösse kommt aus `/sys/class/block`. Pseudo-Dateisysteme (proc, tmpfs,
+overlay, squashfs …), `/proc`, `/sys`, `/dev`, `/run`, `/boot/efi` und Docker-Overlays sind ausgeblendet. Mit
+`FILES_ROOT=/host/fs` indexiert der Agent genau diese Ordner (Speicher-Analyse, Suche, Duplikate).
+
+`network_mode: host`: So sieht der Agent die echten Netzwerkkarten und IP-Adressen des Servers und die Geräte im Heimnetz.
+Port 8099 liegt dann direkt auf dem Server: nie ins Internet freigeben.
+
+**Benutzer (wichtig):** Die Vorlage startet den Agenten direkt als `65534:65534` (nobody, kein Login) mit `cap_drop: ALL`
+und `no-new-privileges`; er wechselt also nie von root weg, sondern hat root gar nicht erst. **Nicht** als root und
+**nicht** als deinen eigenen Benutzer (z. B. 1000) starten: Mit `/proc` des Servers kann ein Prozess über
+`/proc/<pid>/root` in das Dateisystem anderer Prozesse **desselben** Benutzers schauen, mit dessen Schreibrechten. Als
+nobody betrifft das höchstens Programme, die selbst als nobody laufen. Noch strenger: eine eigene, sonst unbenutzte Nummer
+(z. B. `user: "8099:8099"`, Ordner entsprechend `chown 8099:8099`). Ordner unter `/host/fs` müssen für diesen Benutzer
+lesbar sein (meist «für alle lesbar»); die Belegung (`statvfs`) geht auch ohne Leserecht.
+
+Optional härter: `/proc` auf dem Server mit `hidepid=invisible` (früher `hidepid=2`) einhängen
+(`proc /proc proc defaults,hidepid=invisible 0 0` in `/etc/fstab`). Dann sieht der Agent keine fremden Prozesse mehr:
+Die Liste «meiste Last» bleibt leer, und die Einhängepunkte kommen nur noch aus den eingebundenen Ordnern.
+
+Hängt ein Netzwerk-Mount unter `/host/fs` (NFS/SMB weg), wartet der Agent höchstens `STATVFS_TIMEOUT` Sekunden (Standard 2)
+und markiert ihn mit `timeout: true`. `/api/host` und `/api/filesystems` rechnet er höchstens alle `HOST_CACHE_S`
+Sekunden neu (Standard 15).
+
+Die Vorlagen für Unraid (99:100), TrueNAS (568:568) und Synology (root) sind davon unverändert.
+
+Unraid, TrueNAS und Synology ändern sich dadurch nicht: Die neuen Pfade sind nur zusätzlich.
+
 ## Übersicht im Browser (ab 1.4.0)
 
 `http://<NAS-IP>:8099` (z. B. `http://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
@@ -108,7 +166,7 @@ immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); 
 |---|---|
 | `GET /api/ping` | lebt der Agent? Ab 1.13.0 dazu `config_persistent` (`false` = `/config` geht beim Update verloren), sonst nichts |
 | `GET /api/hello?nonce=<32 Hex-Zeichen>` | ohne Token, ab 1.11.0: Heimnetz-Prüfung der App, siehe unten |
-| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung) |
+| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung); ab 1.14.0 `host_os` (os-release eingebunden) und `host_fs` (Ordner unter `/host/fs`) |
 | `GET /api/now` | aktuelle Werte (höchstens alle 2 s neu gemessen) |
 | `GET /api/history?hours=24` | bis 192 h alle Messungen, darüber Stundenwerte (`res=hour` erzwingt Stundenwerte) |
 | `GET /api/today?hours=24` | «Heute»: Ereignisse aller Quellen, neueste zuerst, mit Zusammenfassung und welche Quellen fehlen |
@@ -122,6 +180,8 @@ immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); 
 | `GET /api/cache/shares` | Belegung jeder Freigabe auf dem Cache (ab 1.8.1; Pfad `/mnt/cache` → `/host/mnt/cache` nur lesen, mehrere Pools mit `CACHE_ROOTS`) |
 | `GET /api/appdata` | Grösse jedes Container-Ordners unter appdata (ab 1.8.2; misst im Hintergrund höchstens alle 6 Std., braucht `/mnt/user` → `/host/mnt/user` nur lesen) |
 | `GET /api/wireguard` | WireGuard-Tunnel und Geräte, ohne Schlüssel (ab 1.8.0) |
+| `GET /api/host` | Linux-Server (ab 1.14.0): `hostname`, `os` (aus `/host/os-release`: `name`, `version`, `id`, `pretty`, `available`), `kernel`, `uptime_s`, `boot_time`, `cpu` (`model`, `cores`, `threads`), `load` (1/5/15 Min.), `mem` (Bytes), `net` (Schnittstellen mit MAC, Zustand, Tempo, IPv4) |
+| `GET /api/filesystems` | Linux-Server (ab 1.14.0): `filesystems` (`device`, `mount`, `fstype`, `size`, `used`/`free` nur bei `measured: true`, `label`), `disks` (`dev`, `model`, `size`, `rotational`, `kind`, `temp`), `mounts_from` (`host` oder `container`), `measured` (Namen unter `/host/fs`) |
 
 ## Heimnetz-Prüfung (ab 1.11.0)
 
