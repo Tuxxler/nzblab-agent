@@ -1,7 +1,12 @@
-# NZBLab-Agent mit Docker Compose (jedes Linux-NAS; Unraid: lieber die Vorlage unraid/nzblab-agent.xml).
-# Varianten mit den richtigen Pfaden: compose/truenas.yml (TrueNAS SCALE) und compose/synology.yml (Synology DSM).
+# NZBLab-Agent mit Docker Compose: EINE Datei für alle Server-Typen (ab Agent 1.15.0).
+# So gehts: den Block deines Servers (A–D) einkommentieren, die anderen Server-Blöcke so lassen; freiwillige Blöcke (S, L, B)
+# nur bei Bedarf. Eine Zeile einkommentieren = das «# » am Anfang entfernen, Einrückung behalten.
+# Fertige Einzeldateien mit denselben Werten: compose/linux.yml, compose/truenas.yml, compose/synology.yml; Unraid: lieber
+# die Vorlage unraid/nzblab-agent.xml (Apps › «NZBLab-Agent»).
 # Alle Host-Pfade nur lesend (:ro), nur /config ist schreibbar. Der Token steht beim ersten Start einmal im Log:
 #   docker compose logs nzblab-agent | grep "NZBLab-Agent Token"
+# Getestete Architekturen: amd64 und arm64 (beide werden gebaut; Raspberry Pi 4/5 mit 64-Bit-System, Intel/AMD-NAS).
+# Der Agent aktualisiert sich nie selbst: neue Version = «docker compose pull && docker compose up -d».
 # Anleitung: https://tuxxler.github.io/nzblab/agent.html · Code (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
 services:
   nzblab-agent:
@@ -9,21 +14,64 @@ services:
     container_name: nzblab-agent
     restart: unless-stopped
     ports:
-      - "8099:8099"
+      - "8099:8099"           # Linux-Block A: statt «ports» besser «network_mode: host» (siehe unten)
+    # network_mode: host     # A (Linux): echte Netzwerkkarten, Heimnetz-Geräte. Dann «ports» oben löschen
     environment:
       TZ: Europe/Zurich
-      PUID: "99"            # Benutzer nach dem Start (99 = nobody); 0 = root
-      PGID: "100"           # Gruppe (100 = users)
-      # NZBLAB_AGENT_TOKEN: ""     # leer = Agent erzeugt selbst einen
+      PUID: "99"              # Benutzer nach dem Start (Unraid 99 = nobody); TrueNAS 568, Synology 0, Linux 65534; 0 = root
+      PGID: "100"             # Gruppe (Unraid 100 = users); TrueNAS 568, Synology 0, Linux 65534
+      # NZBLAB_AGENT_TOKEN: ""        # leer = Agent erzeugt selbst einen
       # NTFY_URL: "https://ntfy.sh/ein-langes-geheimes-wort"
+      # NZBLAB_BIND: "0.0.0.0"        # nur auf dieser Adresse lauschen, z. B. die LAN-Adresse des NAS
+      # NZBLAB_NET: "0"               # Netz-/Latenz-Messung aus (Standard an: TCP-Aufbau zu Router und 1.1.1.1:443, jede Minute)
+      # NZBLAB_NET_TARGET: "1.1.1.1:443"
+      # --- B (Linux, Debian/Ubuntu): Freigaben unter /host/fs statt /host/mnt/user
+      # FILES_ROOT: "/host/fs"
+      # CACHE_ROOTS: ""
+      # --- C (TrueNAS SCALE):
+      # FILES_EXCLUDE: "ix-applications,.ix-apps,.system,apps"
+      # CACHE_ROOTS: ""
+      # --- D (Synology DSM):
+      # FILES_EXCLUDE: "@*,#*,docker"
+      # CACHE_ROOTS: ""
+      # --- S (SMART, freiwillig): siehe Block S unten
+      # NZBLAB_SMART: "1"
+      # --- L (Log-Auszüge, freiwillig): siehe Block L unten
+      # NZBLAB_LOGS: "1"
+      # --- B2 (Backups, freiwillig): Pfade im Container, durch Komma getrennt; Suche unter den Freigaben: NZBLAB_BACKUP_AUTO
+      # NZBLAB_BACKUP_PATHS: "/host/backup/restic,/host/backup/rsync-backup.log"
+      # NZBLAB_BACKUP_AUTO: "1"
     volumes:
       # Pflicht: hier speichert der Agent Token und Verlauf, sonst gibt es nach jedem Update einen neuen Token
       - ./nzblab-agent:/config                          # Verlauf, Datei-Index, token.txt (lesen/schreiben)
-      - /sys:/host/sys:ro                               # Temperaturen, Grafikchip
-      - /proc:/host/proc:ro                             # CPU-Last, Programme, Plattenzugriffe
-      - /mnt/user:/host/mnt/user:ro                     # Freigaben: Datei-Index und Suche (optional)
+      - /sys:/host/sys:ro                               # Temperaturen, Grafikchip, Btrfs-Zustand
+      - /proc:/host/proc:ro                             # CPU-Last, Programme, Plattenzugriffe, Neustarts, mdadm/ZFS-Zustand
+      # --- Unraid (Standard):
+      - /mnt/user:/host/mnt/user:ro                     # Freigaben: Datei-Index, Suche, Backup-Suche (optional)
       # - /mnt/cache:/host/mnt/cache:ro                 # Cache-Pool: was auf den Mover wartet (optional, Unraid)
-      # - /var/log:/host/log:ro                         # Fehler aus dem Systemprotokoll für «Heute» (optional)
+      # --- A/B Linux: obige /mnt/user-Zeile löschen, dafür:
+      # - /etc/os-release:/host/os-release:ro           # nur diese Datei: Name und Version des Systems
+      # - /srv:/host/fs/data:ro                         # Ordner, deren Belegung die App zeigen soll (Name frei wählbar)
+      # --- C TrueNAS: /mnt/user-Zeile ersetzen durch («tank» = dein Pool):
+      # - /mnt/tank:/host/mnt/user:ro
+      # --- D Synology: /mnt/user-Zeile ersetzen durch:
+      # - /volume1:/host/mnt/user:ro
+      # --- L Log-Auszüge und «Heute» (freiwillig, mit NZBLAB_LOGS=1): nur Textdateien (syslog, messages, kern.log)
+      # - /var/log:/host/log:ro
+      # --- B2 Backups (freiwillig): Repository-Ordner oder Log-Dateien nur lesend einbinden
+      # - /mnt/backup/restic:/host/backup/restic:ro
+      # - /var/log/rsync-backup.log:/host/backup/rsync-backup.log:ro
+    # --- S SMART (freiwillig, mit NZBLAB_SMART=1): jede Platte einzeln freigeben (ls /dev/sd? /dev/nvme?), dazu SYS_RAWIO.
+    # Nur ein kleiner Helfer-Prozess bleibt dafür root und startet ausschliesslich «smartctl --scan» und «smartctl -a -n standby»
+    # (keine Selbsttests, schlafende Platten werden nicht geweckt); der Agent selbst läuft als PUID ohne Rechte.
+    # Nicht zusammen mit «user:» (Linux-Einzeldatei) und nicht mit «cap_drop: ALL» ohne die Rechte unten.
+    # devices:
+    #   - /dev/sda:/dev/sda
+    #   - /dev/sdb:/dev/sdb
+    #   - /dev/nvme0:/dev/nvme0
+    # cap_add:
+    #   - SYS_RAWIO            # SATA/SAS-Platten lesen
+    #   # - SYS_ADMIN          # nur für NVMe-SMART nötig (breites Recht; NVMe-Temperatur geht auch ohne)
     read_only: true
     tmpfs:
       - /tmp

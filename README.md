@@ -21,7 +21,7 @@ Website <https://tuxxler.github.io/nzblab/agent.html>.
 | TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = eigener Pool |
 | Synology DSM 7.2+ | `compose/synology.yml` | Ordner `docker/nzblab-agent` anlegen; Container Manager › Projekt › Erstellen |
 | Linux (Debian, Ubuntu …, ab 1.14.0) | `compose/linux.yml` | Ordner anlegen, Datei als `docker-compose.yml` speichern, `docker compose up -d`; siehe unten |
-| Docker allgemein | `docker-compose.yml` | `docker compose up -d` |
+| Docker allgemein / alle in einer Datei (ab 1.15.0) | `docker-compose.yml` | Block A–D für deinen Server einkommentieren, freiwillige Blöcke S (SMART), L (Logs), B2 (Backups); `docker compose up -d` |
 
 **Token:** Beim ersten Start erzeugt der Agent einen zufälligen Token (`/config/token.txt`, Rechte 600) und schreibt ihn
 **genau einmal** ins Container-Log:
@@ -128,6 +128,68 @@ Die Vorlagen für Unraid (99:100), TrueNAS (568:568) und Synology (root) sind da
 
 Unraid, TrueNAS und Synology ändern sich dadurch nicht: Die neuen Pfade sind nur zusätzlich.
 
+## Ab 1.15.0: Neustarts, Plattentemperaturen, Netz, SMART, Backups, RAID, Logs
+
+**Versionen:** `/api/info` liefert `api_level` (15 für 1.15.0) und `features`. Die App vergleicht `api_level` mit ihrem
+Minimum und zeigt «neuer Agent verfügbar». Der Agent aktualisiert sich **nie selbst**: neue Version = Image neu holen
+(Unraid «update ready», Compose `docker compose pull && docker compose up -d`).
+
+Immer an (nur lesen, nichts Neues einzubinden):
+
+- **Neustarts:** beim Start und jede Minute `btime` aus `/proc/stat` und `/proc/uptime`. Neu gespeichert, wenn die
+  Betriebszeit kleiner ist als zuletzt gesehen oder das System erst nach dem letzten Lebenszeichen des Agenten gestartet ist.
+  `previous_uptime_s` = zuletzt gesehene Betriebszeit davor (war der Agent vorher gestoppt: Mindestwert). Ob ein Neustart
+  geplant war, weiss der Agent nicht (`planned: "unknown"`). 2 Jahre.
+- **Plattentemperatur pro Gerät:** alle 5 Minuten aus drivetemp (SATA) bzw. nvme-hwmon, mit SMART auch von Platten ohne
+  hwmon. Rohwerte 2 Tage, danach Stundenwerte (Mittel, Tief, Hoch) für 400 Tage.
+- **RAID/Pools:** mdadm aus `/proc/mdstat` (ausgefallen, Resync/Recovery mit Prozent), ZFS aus `/proc/spl/kstat/zfs/<pool>/state`
+  (ohne `zpool`; gibt es `zpool` im Container, wird es gefragt, sonst `unavailable`), Btrfs aus `/sys/fs/btrfs` (Profile,
+  fehlende Geräte, Fehlerzähler). Unraid-Array weiter über `/api/array`.
+- **Netz/Latenz** (`NZBLAB_NET=0` schaltet aus): jede Minute (`NZBLAB_NET_INTERVAL`) je 3 TCP-Verbindungsaufbauten zum Router
+  (Standard-Gateway des NAS, Port `NZBLAB_NET_GATEWAY_PORT` = 53; eine Ablehnung zählt auch als Antwort) und zu
+  `NZBLAB_NET_TARGET` (Standard `1.1.1.1:443`). Gespeichert: Median in ms und Verlust in %. Kein ICMP, keine Rechte nötig,
+  es werden keine Daten gesendet (nur Verbindungsaufbau und sofort schliessen).
+- **Backups** (best effort): Ordner in `NZBLAB_BACKUP_PATHS` (Komma, Pfade im Container, nur lesend eingebunden) und
+  Suche unter `/host/mnt/user` bzw. `/host/fs` (`NZBLAB_BACKUP_AUTO=0` schaltet sie aus): oberste Ebene jeder Freigabe, darunter
+  nur Ordner mit Backup-Namen (backup, restic, borg, kopia, sicherung, rsync …), höchstens 3 Ebenen, alle 6 Stunden.
+  restic (`config` + `snapshots/` + `data/` + `keys/`): neueste Datei in `snapshots/`; borg (`README`): Zeit von
+  `index.N`/`hints.N`; Kopia (`kopia.repository.f`): neueste Index-/Metadaten-Blobs. Die Werkzeuge werden nie gestartet, verschlüsselte
+  Inhalte nie gelesen. Log-Dateien (rsync, cron-Skripte): letzte Erfolgszeile (`sent … bytes received`, `total size is`,
+  `backup completed` …) und letzte Fehlerzeile (gefiltert wie die Logs). Was sich nicht bestimmen lässt, ist `null`.
+
+Freiwillig (eigener Compose-Block in `docker-compose.yml`):
+
+| Block | Schalter | Liest | Braucht |
+|---|---|---|---|
+| S SMART | `NZBLAB_SMART=1` (`NZBLAB_SMART_MINUTES`, Standard 60) | `smartctl --scan` und `smartctl --json -a -n standby` pro Platte: Modell, Seriennummer, Betriebsstunden, neu zugewiesene, instabile und nicht korrigierbare Sektoren, CRC- und Medienfehler, Verschleiss, Temperatur. Nie Selbsttests, nie Schreiben, schlafende Platten bleiben schlafen | `devices:` jede Platte, `cap_add: SYS_RAWIO` (NVMe zusätzlich `SYS_ADMIN`), Start als root mit PUID (nicht `user:`) |
+| L Logs | `NZBLAB_LOGS=1` | Fehler-/Warnzeilen der letzten Stunden aus `syslog`, `messages`, `kern.log`, `daemon.log` (Textdateien; journald-Binärdateien nicht) | `/var/log:/host/log:ro` |
+| B2 Backups | `NZBLAB_BACKUP_PATHS` | Repository-Ordner (nur Dateinamen und -zeiten) und Log-Dateien | die Pfade `:ro` |
+
+**SMART und Rechte:** smartctl braucht root und `CAP_SYS_RAWIO`. Damit der Agent selbst trotzdem ohne Rechte läuft, startet
+er (als root gestartet, `NZBLAB_SMART=1`) vor dem Wechsel auf PUID einen kleinen Helfer-Prozess, der root bleibt und über ein
+privates Socket-Paar nur zwei Befehle annimmt (`--scan`, `-a -n standby` für Gerätenamen wie `/dev/sda`, `/dev/nvme0`).
+Der Agent selbst verliert beim Wechsel auf PUID alle Capabilities. Gruppen-IDs für `/dev` sind darum nicht nötig. Mit
+`user:` im Compose (Linux-Einzeldatei) gibt es keinen root-Start: SMART meldet dann einen Rechtefehler (Docker gibt
+Nicht-root-Prozessen kein `SYS_RAWIO`, auch nicht mit `group_add: [disk]` = GID 6). Image: `smartmontools` aus Alpine,
+rund 3 MB; ohne `NZBLAB_SMART=1` wird es nie gestartet. Mit dem alten Setup (offizielles `python:3.12-alpine`, Code
+eingebunden) fehlt smartctl: `/api/smart` meldet «smartctl fehlt im Image».
+
+**Datenschutz der Logs:** Vor der Antwort entfernt der Agent IPv4/IPv6-, MAC- und E-Mail-Adressen, Tokens, Schlüssel und
+Passwörter (`key=…`, `password: …`, `Bearer …`, `user:pass@`), Benutzernamen (`user …`, `for invalid user …`),
+Heimordner (`/home/<user>`), Datei- und Ordnernamen unter den Freigaben (`/mnt/user/<Freigabe>/…`) und lange Zufallsketten.
+Gleiche Meldungen werden zu einer Zeile mit Anzahl. Der Agent schickt Logs nie von selbst irgendwohin; nur die App holt
+sie mit Token.
+
+**Weitere Schalter:** `NZBLAB_BIND` (Standard `0.0.0.0`; z. B. die LAN-Adresse oder `127.0.0.1` hinter einem Proxy, IPv6 `::`),
+`NZBLAB_AUTH_FAILS` (Token-Bremse, Standard 10 pro Minute).
+
+**Gesundheitsprüfung:** Der `HEALTHCHECK` im Image fragt `/api/health`: Er schlägt auch fehl, wenn die Messschleife hängt
+(letzte Messung älter als 2 Intervalle + 15 s). `/api/ping` bleibt billig und ändert sich nicht im Verhalten.
+
+**Getestete Architekturen:** Das Image wird für amd64 und arm64 gebaut (GitHub Actions, Smoke-Test auf amd64). Im Dauereinsatz:
+Unraid 7.x (amd64). 1.15.0 ist mit den Tests und einem Probelauf auf Unraid (amd64) geprüft, noch nicht als Image. arm64 (Raspberry Pi 4/5 mit 64-Bit-System) wird gebaut, aber nicht auf echter
+Hardware geprüft; 32-Bit-ARM (armv7) gibt es nicht.
+
 ## Übersicht im Browser (ab 1.4.0)
 
 `http://<NAS-IP>:8099` (z. B. `http://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
@@ -154,7 +216,9 @@ Anzahl Absturzberichte der App, letzte Aktualisierung). Die HTML-Seite selbst en
 
 ## Schnittstelle
 
-Alle Anfragen ausser `/api/ping` und `/api/hello` mit `Authorization: Bearer <Token>`. Falscher Token: `401`. Konnte der
+Alle Anfragen ausser `/api/ping`, `/api/health` und `/api/hello` mit `Authorization: Bearer <Token>`. Falscher Token: `401`;
+ab 1.15.0 nach 10 falschen Tokens in einer Minute von derselben Adresse `429` mit `Retry-After` für 5 Minuten
+(`NZBLAB_AUTH_FAILS`). Anfragen über 64 KiB: `413` (Absturzberichte bis 128 000 Bytes), `Transfer-Encoding`: `411`. Konnte der
 Agent selbst keinen Token laden (ab 1.13.0, `token.txt` leer/kaputt/nicht lesbar): `503` mit `token_error`.
 
 Ausnahmen ohne Token: `GET /api/prices/watch` (nur Plattenserien) und `GET /api/crashes` (Absturzberichte der App, ohne
@@ -164,9 +228,9 @@ immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); 
 
 | Pfad | Inhalt |
 |---|---|
-| `GET /api/ping` | lebt der Agent? Ab 1.13.0 dazu `config_persistent` (`false` = `/config` geht beim Update verloren), sonst nichts |
+| `GET /api/ping` | lebt der Agent? Ab 1.13.0 dazu `config_persistent` (`false` = `/config` geht beim Update verloren), ab 1.15.0 `api_level` und `sampling_ok`, sonst nichts |
 | `GET /api/hello?nonce=<32 Hex-Zeichen>` | ohne Token, ab 1.11.0: Heimnetz-Prüfung der App, siehe unten |
-| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung); ab 1.14.0 `host_os` (os-release eingebunden) und `host_fs` (Ordner unter `/host/fs`) |
+| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung); ab 1.14.0 `host_os` (os-release eingebunden) und `host_fs` (Ordner unter `/host/fs`); ab 1.15.0 `api_level` (Zahl, 15), `features` (eingeschaltete Zusätze: `boots`, `disktemps`, `health`, `smart`, `backups`, `raid`, `net`, `logs`), `last_boot`, `boots_7d`, `sampling_ok` |
 | `GET /api/now` | aktuelle Werte (höchstens alle 2 s neu gemessen) |
 | `GET /api/history?hours=24` | bis 192 h alle Messungen, darüber Stundenwerte (`res=hour` erzwingt Stundenwerte) |
 | `GET /api/today?hours=24` | «Heute»: Ereignisse aller Quellen, neueste zuerst, mit Zusammenfassung und welche Quellen fehlen |
@@ -182,6 +246,15 @@ immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); 
 | `GET /api/wireguard` | WireGuard-Tunnel und Geräte, ohne Schlüssel (ab 1.8.0) |
 | `GET /api/host` | Linux-Server (ab 1.14.0): `hostname`, `os` (aus `/host/os-release`: `name`, `version`, `id`, `pretty`, `available`), `kernel`, `uptime_s`, `boot_time`, `cpu` (`model`, `cores`, `threads`), `load` (1/5/15 Min.), `mem` (Bytes), `net` (Schnittstellen mit MAC, Zustand, Tempo, IPv4) |
 | `GET /api/filesystems` | Linux-Server (ab 1.14.0): `filesystems` (`device`, `mount`, `fstype`, `size`, `used`/`free` nur bei `measured: true`, `label`), `disks` (`dev`, `model`, `size`, `rotational`, `kind`, `temp`), `mounts_from` (`host` oder `container`), `measured` (Namen unter `/host/fs`) |
+| `GET /api/health` | ohne Token, ab 1.15.0: `200 {"ok": true, "sample_age_s", "interval"}`, `503`, wenn die Messschleife länger als 2 Intervalle (+15 s) steht (Docker-Gesundheitsprüfung) |
+| `GET /api/boots?days=30` | ab 1.15.0: `boots: [{boot_time, previous_uptime_s (oder null), planned: "unknown"}]`, neueste zuerst |
+| `GET /api/disktemps?days=7&res=` | ab 1.15.0: `devices: {sda: {model, latest, points}}`, `res` = `raw` (bis 2 Tage, Punkte `[t, °C]` alle 5 Min.), `hour` (bis 14 Tage) oder `day` (Punkte `[t, Mittel, Höchstwert]`), `fields`, `interval_s` |
+| `GET /api/net?days=1&res=` | ab 1.15.0: `enabled`, `targets` (`gateway`, `internet`), `latest` (`{gateway: {t, rtt, loss}}`), `series` (`{gateway: {rtt: [...], loss: [...]}}`, ms bzw. %), `res`/`fields` wie oben |
+| `GET /api/smart` | ab 1.15.0, nur mit `NZBLAB_SMART=1`: `enabled`, `checked`, `error`, `disks: [{device, device_name, model_name, serial_number, firmware, capacity, rotational_speed, device_protocol, smart_passed, power_on_hours, power_cycle_count, temp, reallocated, pending, uncorrectable, crc, media_errors, percentage_used, unsafe_shutdowns, standby, attrs}]` (`attrs` wie Scrutiny: nach ID `"5"` bzw. bei NVMe nach Namen `media_errors`, `percentage_used` …, je `raw_value`) |
+| `GET /api/smart/history?days=90` | ab 1.15.0: ein Tageswert pro Platte (letzter Stand, Temperatur = Höchstwert): `disks: [{serial, model, device, rows: [{day, realloc, pending, uncorr, crc, media, temp_max, hours, wear, passed}]}]`, 2 Jahre |
+| `GET /api/backups` | ab 1.15.0: `backups: [{kind (restic, borg, kopia, rsync, log, unknown), name, path, last_success, last_error, error_text, snapshots, source, found_by (path, auto)}]`, `checked`, `paths`; unbekannt = `null` |
+| `GET /api/raid` | ab 1.15.0: `pools: [...]` (mdadm: `level`, `devices`, `total`, `active`, `degraded`, `sync {action, percent, finish_min}`; ZFS: `state`; Btrfs: `profiles`, `devices` mit `missing` und `errors`; Unraid: Verweis auf `/api/array`), `degraded`, `sources {mdadm, zfs: kstat/zpool/none/unavailable, btrfs}` |
+| `GET /api/logs?hours=24&max=200` | ab 1.15.0, nur mit `NZBLAB_LOGS=1`: `lines: [{t, level (err, warn), src, text, n}]`, `files`, `redacted: true`; sonst `403` |
 
 ## Heimnetz-Prüfung (ab 1.11.0)
 

@@ -4,6 +4,7 @@
 # Datasets an (Dataset «apps», darin «nzblab-agent»), oder Docker legt ihn beim ersten Start an.
 # Token: Apps › Installed › nzblab-agent › Workloads › Logs: Zeile «NZBLab-Agent Token: …»
 # Code und Anleitung (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
+# Ab 1.15.0 freiwillige Zusätze (SMART, Log-Auszüge, Backups, Netz-Messung aus): Blöcke S, L, B2 in ../docker-compose.yml.
 services:
   nzblab-agent:
     image: ghcr.io/tuxxler/nzblab-agent:latest

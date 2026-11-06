@@ -5,6 +5,7 @@
 # Token: Container Manager › Container › nzblab-agent › Protokoll: Zeile «NZBLab-Agent Token: …»
 # Mehrere Volumes: weitere Zeilen wie «/volume2:/host/mnt/volume2:ro» sind möglich, der Index sieht aber nur /host/mnt/user.
 # Code und Anleitung (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
+# Ab 1.15.0 freiwillige Zusätze (SMART, Log-Auszüge, Backups, Netz-Messung aus): Blöcke S, L, B2 in ../docker-compose.yml.
 services:
   nzblab-agent:
     image: ghcr.io/tuxxler/nzblab-agent:latest

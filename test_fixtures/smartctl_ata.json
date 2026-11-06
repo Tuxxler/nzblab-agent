@@ -1,0 +1,26 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {"version": [7, 4], "argv": ["smartctl", "--json=c", "-a", "-n", "standby", "-d", "sat", "/dev/sda"], "exit_status": 0},
+  "device": {"name": "/dev/sda", "info_name": "/dev/sda [SAT]", "type": "sat", "protocol": "ATA"},
+  "model_family": "Seagate IronWolf Pro",
+  "model_name": "ST16000NT001-3LV101",
+  "serial_number": "ZRS0TEST",
+  "firmware_version": "EN01",
+  "user_capacity": {"blocks": 31251759104, "bytes": 16000900661248},
+  "rotation_rate": 7200,
+  "smart_status": {"passed": true},
+  "ata_smart_attributes": {"revision": 10, "table": [
+    {"id": 1, "name": "Raw_Read_Error_Rate", "value": 83, "worst": 64, "thresh": 44, "when_failed": "", "raw": {"value": 213374328, "string": "213374328"}},
+    {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "thresh": 10, "when_failed": "", "raw": {"value": 8, "string": "8"}},
+    {"id": 9, "name": "Power_On_Hours", "value": 88, "worst": 88, "thresh": 0, "when_failed": "", "raw": {"value": 10712, "string": "10712"}},
+    {"id": 12, "name": "Power_Cycle_Count", "value": 100, "worst": 100, "thresh": 20, "when_failed": "", "raw": {"value": 37, "string": "37"}},
+    {"id": 192, "name": "Power-Off_Retract_Count", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 12, "string": "12"}},
+    {"id": 194, "name": "Temperature_Celsius", "value": 36, "worst": 52, "thresh": 0, "when_failed": "", "raw": {"value": 36, "string": "36 (0 18 0 0 0)"}},
+    {"id": 197, "name": "Current_Pending_Sector", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 2, "string": "2"}},
+    {"id": 198, "name": "Offline_Uncorrectable", "value": 100, "worst": 100, "thresh": 0, "when_failed": "", "raw": {"value": 0, "string": "0"}},
+    {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 200, "worst": 200, "thresh": 0, "when_failed": "", "raw": {"value": 3, "string": "3"}}
+  ]},
+  "power_on_time": {"hours": 10712},
+  "power_cycle_count": 37,
+  "temperature": {"current": 36}
+}

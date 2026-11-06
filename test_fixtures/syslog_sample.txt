@@ -1,0 +1,11 @@
+Nov  6 03:00:01 tower CRON[1234]: (root) CMD (/usr/local/bin/backup.sh)
+Nov  6 03:10:12 tower kernel: ata3.00: exception Emask 0x0 SAct 0x0 SErr 0x0 action 0x6 frozen
+Nov  6 03:10:12 tower kernel: sd 3:0:0:0: [sdc] tag#0 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_OK
+Nov  6 03:10:13 tower kernel: blk_update_request: I/O error, dev sdc, sector 123456 op 0x0:(READ)
+Nov  6 03:10:14 tower kernel: blk_update_request: I/O error, dev sdc, sector 123999 op 0x0:(READ)
+Nov  6 04:00:00 tower sshd[555]: error: Failed password for invalid user admin from 203.0.113.77 port 51234 ssh2
+Nov  6 04:01:00 tower nginx: upstream timed out connecting to 192.168.1.20:8080, client: 2001:db8::42
+Nov  6 04:02:00 tower dhcpcd[77]: warning: eth0: MAC 00:11:22:33:44:55 changed, owner hans.muster@example.com
+Nov  6 04:03:00 tower app[9]: error: login failed url=https://bob:hunter2@nas.local/api?apikey=abcdef1234567890 token=Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg
+Nov  6 04:04:00 tower app[9]: error: cannot open /mnt/user/Privat/Steuern/2026.pdf and /home/maria/.ssh/id_ed25519
+Nov  6 04:05:00 tower smbd[10]: failed: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig password=geheim123

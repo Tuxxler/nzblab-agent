@@ -33,7 +33,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -435,6 +435,13 @@ class Store:
             self.db.execute("CREATE TABLE IF NOT EXISTS hourly (h INTEGER PRIMARY KEY, j TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS wakes (t INTEGER, disk TEXT, j TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS events (t INTEGER, kind TEXT, level TEXT, title TEXT, text TEXT)")
+            # ab 1.15.0: Neustarts, Messreihen (Plattentemperaturen, Netz) roh + Stundenwerte, SMART-Tageswerte
+            self.db.execute("CREATE TABLE IF NOT EXISTS boots (id INTEGER PRIMARY KEY AUTOINCREMENT, boot INTEGER, last_seen INTEGER, "
+                            "last_up INTEGER, prev_up INTEGER)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS series (t INTEGER, k TEXT, v REAL, PRIMARY KEY (k, t))")
+            self.db.execute("CREATE INDEX IF NOT EXISTS series_t ON series (t)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS series_h (h INTEGER, k TEXT, mx REAL, mn REAL, sm REAL, n INTEGER, PRIMARY KEY (k, h))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS smart_daily (day TEXT, disk TEXT, t INTEGER, j TEXT, PRIMARY KEY (disk, day))")
             self.db.commit()
 
     def add_event(self, kind, level, title, text, t=None):
@@ -501,6 +508,97 @@ class Store:
     def wakes(self, since):
         with self.lock:
             return [dict(json.loads(j), t=t, disk=d) for (t, d, j) in self.db.execute("SELECT t, disk, j FROM wakes WHERE t >= ? ORDER BY t DESC", (since,))]
+
+    # --- ab 1.15.0: Neustarts
+    def note_boot(self, boot, uptime, now=None):
+        """Neustart erkennen und speichern. Ein Neustart beendet immer auch den Agenten, darum reicht der Vergleich mit dem
+        letzten gespeicherten Stand: Betriebszeit kleiner als zuletzt gesehen, oder das System ist erst nach dem letzten
+        Lebenszeichen gestartet (Agent war während des Neustarts gestoppt). Kleine Sprünge von boot_time (Uhr per NTP
+        gestellt) gelten als derselbe Start. True = neuer Start gespeichert."""
+        now = int(now if now is not None else time.time())
+        boot, uptime = int(boot), int(uptime)
+        with self.lock:
+            row = self.db.execute("SELECT id, boot, last_seen, last_up FROM boots ORDER BY id DESC LIMIT 1").fetchone()
+            if row and not (uptime < row[3] - 5 or boot > row[2] + 60):
+                self.db.execute("UPDATE boots SET boot=?, last_seen=?, last_up=? WHERE id=?", (boot, now, uptime, row[0]))
+                self.db.commit()
+                return False
+            self.db.execute("INSERT INTO boots (boot, last_seen, last_up, prev_up) VALUES (?,?,?,?)", (boot, now, uptime, row[3] if row else None))
+            self.db.execute("DELETE FROM boots WHERE boot < ?", (now - 730 * 86400,))
+            self.db.commit()
+            return True
+
+    def boots(self, since):
+        with self.lock:
+            return [{"boot_time": b, "previous_uptime_s": p, "planned": "unknown"}
+                    for (b, p) in self.db.execute("SELECT boot, prev_up FROM boots WHERE boot >= ? ORDER BY boot DESC", (since,))]
+
+    # --- ab 1.15.0: Messreihen. Rohwerte 2 Tage, danach nur Stundenwerte (Höchst-, Tiefst- und Mittelwert) für 400 Tage
+    SERIES_RAW_S = 2 * 86400
+    SERIES_KEEP_S = 400 * 86400
+
+    def add_series(self, t, vals):
+        t = int(t)
+        h = t // 3600 * 3600
+        with self.lock:
+            for k, v in vals.items():
+                if v is None:
+                    continue
+                v = float(v)
+                self.db.execute("INSERT OR REPLACE INTO series VALUES (?,?,?)", (t, k, v))
+                self.db.execute("INSERT INTO series_h VALUES (?,?,?,?,?,1) ON CONFLICT(k, h) DO UPDATE SET mx=max(mx, excluded.mx), "
+                                "mn=min(mn, excluded.mn), sm=sm+excluded.sm, n=n+1", (h, k, v, v, v))
+            self.db.execute("DELETE FROM series WHERE t < ?", (t - self.SERIES_RAW_S,))
+            self.db.execute("DELETE FROM series_h WHERE h < ?", (t - self.SERIES_KEEP_S,))
+            self.db.commit()
+
+    def series(self, prefix, since, res="raw"):
+        """{Schlüssel ohne Präfix: Punkte}. raw: [t, Wert]; hour/day: [t, Mittel, Höchstwert] (Tag nach Ortszeit)."""
+        like = prefix.replace("%", "").replace("_", "") + "%"
+        out = {}
+        with self.lock:
+            if res == "raw":
+                rows = self.db.execute("SELECT k, t, v FROM series WHERE k LIKE ? AND t >= ? ORDER BY k, t", (like, since))
+                for k, t, v in rows:
+                    out.setdefault(k[len(prefix):], []).append([t, round(v, 1)])
+                return out
+            if res == "day":
+                off = time.localtime().tm_gmtoff
+                rows = self.db.execute("SELECT k, ((h + ?) / 86400) * 86400 - ? AS d, SUM(sm) / SUM(n), MAX(mx) FROM series_h "
+                                       "WHERE k LIKE ? AND h >= ? GROUP BY k, d ORDER BY k, d", (off, off, like, since))
+            else:
+                rows = self.db.execute("SELECT k, h, sm / n, mx FROM series_h WHERE k LIKE ? AND h >= ? ORDER BY k, h", (like, since))
+            for k, t, avg, mx in rows:
+                out.setdefault(k[len(prefix):], []).append([t, round(avg, 1), round(mx, 1)])
+        return out
+
+    def latest_series(self, prefix):
+        like = prefix.replace("%", "").replace("_", "") + "%"
+        with self.lock:
+            rows = self.db.execute("SELECT k, t, v FROM series WHERE k LIKE ? AND t = (SELECT MAX(t) FROM series s2 WHERE s2.k = series.k)", (like,))
+            return {k[len(prefix):]: {"t": t, "v": round(v, 1)} for k, t, v in rows}
+
+    # --- ab 1.15.0: SMART-Tageswerte (letzter Stand des Tages, Temperatur = Höchstwert des Tages), 2 Jahre
+    def add_smart_day(self, disk, row, t=None):
+        t = int(t or time.time())
+        day = time.strftime("%Y-%m-%d", time.localtime(t))
+        with self.lock:
+            old = self.db.execute("SELECT j FROM smart_daily WHERE disk=? AND day=?", (disk, day)).fetchone()
+            row = dict(row, t=t)
+            if old:
+                o = json.loads(old[0])
+                if o.get("temp_max") is not None and (row.get("temp_max") is None or o["temp_max"] > row["temp_max"]):
+                    row["temp_max"] = o["temp_max"]
+            self.db.execute("INSERT OR REPLACE INTO smart_daily VALUES (?,?,?,?)", (day, disk, t, json.dumps(row, separators=(",", ":"))))
+            self.db.execute("DELETE FROM smart_daily WHERE t < ?", (t - 730 * 86400,))
+            self.db.commit()
+
+    def smart_days(self, since):
+        out = {}
+        with self.lock:
+            for day, disk, j in self.db.execute("SELECT day, disk, j FROM smart_daily WHERE t >= ? ORDER BY disk, day", (since,)):
+                out.setdefault(disk, []).append(dict(json.loads(j), day=day))
+        return out
 
 
 # ---------------------------------------------------------------- Überwachen
@@ -930,6 +1028,7 @@ def load_container_names():
 
 
 def run_sampler(store, sampler, watcher, stop):
+    SAMPLER_STATE["last"] = time.time()
     sampler.sample()                       # erste Messung nur für die Differenzen
     last_hour = int(time.time()) // 3600 * 3600
     while not stop.wait(INTERVAL):
@@ -943,6 +1042,7 @@ def run_sampler(store, sampler, watcher, stop):
             if hour > last_hour:
                 store.roll_hour(last_hour)
                 last_hour = hour
+            SAMPLER_STATE["last"] = time.time()    # ab 1.15.0: Gesundheitsprüfung (Messschleife hängt nicht)
         except Exception as e:             # eine kaputte Messung darf den Dienst nicht beenden
             print("Messung fehlgeschlagen:", e, flush=True)
 
@@ -3538,11 +3638,951 @@ class Today:
                             "unread": sum(1 for e in items if e.get("unread"))}}
 
 
+# ---------------------------------------------------------------- Ab 1.15.0: Neustarts, Plattentemperaturen, Netz, SMART,
+# Backups, RAID, Log-Auszüge. Alles nur lesen; was Geräte oder Logs braucht, ist freiwillig (Umgebungsvariable + Compose-Block).
+
+API_LEVEL = 15              # steigt mit jeder Agent-Version, die neue Endpunkte bringt; die App vergleicht mit ihrem Minimum
+
+
+def _env_int(name, default, lo, hi):
+    try:
+        return max(lo, min(int(os.environ.get(name, "") or default), hi))
+    except ValueError:
+        return default
+
+
+def _env_on(name, default):
+    v = os.environ.get(name, "").strip().lower()
+    return default if not v else v not in ("0", "false", "no", "off", "nein")
+
+
+NET_ON = _env_on("NZBLAB_NET", True)
+NET_TARGET = os.environ.get("NZBLAB_NET_TARGET", "1.1.1.1:443").strip()
+NET_INTERVAL = _env_int("NZBLAB_NET_INTERVAL", 60, 30, 3600)
+NET_GATEWAY_PORT = _env_int("NZBLAB_NET_GATEWAY_PORT", 53, 1, 65535)
+NET_PROBES = 3
+SMART_ON = _env_on("NZBLAB_SMART", False)
+SMART_EVERY = _env_int("NZBLAB_SMART_MINUTES", 60, 10, 1440) * 60
+LOGS_ON = _env_on("NZBLAB_LOGS", False)
+BACKUP_PATHS = [x.strip() for x in os.environ.get("NZBLAB_BACKUP_PATHS", "").split(",") if x.strip()]
+BACKUP_AUTO = _env_on("NZBLAB_BACKUP_AUTO", True)
+BIND = os.environ.get("NZBLAB_BIND", "0.0.0.0").strip() or "0.0.0.0"
+MAX_BODY = 64 * 1024        # grösste Anfrage (Bytes); Absturzberichte behalten ihr eigenes Limit (CRASH_MAX_BYTES * 2)
+AUTH_FAILS = _env_int("NZBLAB_AUTH_FAILS", 10, 3, 1000)
+DISKTEMP_EVERY = 300        # Plattentemperaturen alle 5 Minuten speichern
+SAMPLER_STATE = {"last": time.time()}   # letzte fertige Messung (Gesundheitsprüfung: hängt die Messschleife?)
+
+
+def sampling_age(now=None):
+    return int((now if now is not None else time.time()) - SAMPLER_STATE["last"])
+
+
+def sampling_ok(now=None):
+    """Messschleife lebt: letzte Messung höchstens 2 Intervalle (plus 15 s Spielraum) her."""
+    return sampling_age(now) <= 2 * INTERVAL + 15
+
+
+# --- Neustarts
+
+def boot_now(proc_dir=None):
+    """(boot_time, uptime_s) des Hosts: btime aus /proc/stat (genau), Betriebszeit aus /proc/uptime. None, wenn nicht lesbar."""
+    proc_dir = proc_dir or HOST_PROC
+    up = (read(f"{proc_dir}/uptime", "") or "").split()
+    try:
+        uptime = float(up[0])
+    except (IndexError, ValueError):
+        return None
+    btime = None
+    for line in (read(f"{proc_dir}/stat", "") or "").splitlines():
+        if line.startswith("btime "):
+            try:
+                btime = int(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+    return (btime if btime else int(time.time() - uptime)), int(uptime)
+
+
+def check_boot(store, proc_dir=None, now=None):
+    b = boot_now(proc_dir)
+    if b is None:
+        return False
+    new = store.note_boot(b[0], b[1], now)
+    if new:
+        print(f"Neustart erkannt: System läuft seit {time.strftime('%d.%m.%Y %H:%M', time.localtime(b[0]))}", flush=True)
+    return new
+
+
+# --- Plattentemperaturen pro Gerät
+
+DISK_DEV = re.compile(r"(sd[a-z]{1,3}|hd[a-z]|nvme\d+n\d+|vd[a-z]{1,2})$")
+
+
+def disk_temps(sys_root=None, smart_latest=None):
+    """{Gerät: °C} aus drivetemp (SATA) bzw. nvme-hwmon; fehlt ein Wert, der letzte SMART-Wert (falls SMART an)."""
+    sys_root = sys_root or HOST_SYS
+    try:
+        devs = sorted(d for d in os.listdir(os.path.join(sys_root, "block")) if DISK_DEV.match(d))
+    except OSError:
+        devs = []
+    out = {}
+    for dev in devs:
+        t = disk_temp(sys_root, dev)
+        if t is not None:
+            out[dev] = t
+    for d in (smart_latest or {}).values():
+        name = (d.get("device_name") or "").rsplit("/", 1)[-1]
+        if name and name not in out and isinstance(d.get("temp"), (int, float)) and not d.get("standby") and 0 < d["temp"] < 120:
+            out[name] = d["temp"]
+    return out
+
+
+def record_disk_temps(store, sys_root=None, smart_latest=None, now=None):
+    temps = disk_temps(sys_root, smart_latest)
+    if temps:
+        store.add_series(int(now or time.time()), {f"disk:{k}": v for k, v in temps.items()})
+    return temps
+
+
+def series_res(days, res):
+    if res == "raw":
+        return "raw" if days <= 2 else "hour"         # Rohwerte gibt es nur 2 Tage
+    if res in ("hour", "day"):
+        return res
+    return "raw" if days <= 2 else ("hour" if days <= 14 else "day")
+
+
+def disktemps_reply(store, days, res=None, sys_root=None, now=None):
+    now = int(now or time.time())
+    res = series_res(days, res)
+    data = store.series("disk:", now - days * 86400, res)
+    latest = store.latest_series("disk:")
+    devices = {}
+    for dev in sorted(set(data) | set(latest)):
+        try:
+            model = disk_model(sys_root or HOST_SYS, dev)
+        except Exception:  # noqa: BLE001
+            model = ""
+        devices[dev] = {"model": model or "", "latest": (latest.get(dev) or {}).get("v"), "points": data.get(dev, [])}
+    return {"days": days, "res": res, "fields": ["t", "c"] if res == "raw" else ["t", "avg", "max"],
+            "interval_s": DISKTEMP_EVERY, "devices": devices}
+
+
+# --- Netz und Latenz (TCP-Verbindungsaufbau, keine ICMP-Rechte nötig)
+
+def default_gateway(proc_dir=None):
+    """Standard-Gateway des Hosts (IPv4) aus der Routing-Tabelle, sonst None."""
+    proc_dir = proc_dir or HOST_PROC
+    paths = ([f"{proc_dir}/1/net/route"] if proc_dir != "/proc" else []) + [f"{proc_dir}/net/route"]
+    for p in paths:
+        for line in (read(p, "") or "").splitlines()[1:]:
+            f = line.split()
+            if len(f) >= 8 and f[1] == "00000000" and f[7] == "00000000":
+                try:
+                    if int(f[3], 16) & 2:
+                        return str(ipaddress.IPv4Address(int.from_bytes(bytes.fromhex(f[2]), "little")))
+                except ValueError:
+                    continue
+    return None
+
+
+def parse_target(s, default_port=443):
+    """«host:port», «[v6]:port» oder «host» → (host, port) oder None."""
+    s = (s or "").strip()
+    m = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\](?::(\d{1,5}))?", s) or re.fullmatch(r"([A-Za-z0-9.-]{1,253})(?::(\d{1,5}))?", s)
+    if not m:
+        return None
+    port = int(m.group(2) or default_port)
+    return (m.group(1), port) if 0 < port < 65536 else None
+
+
+def tcp_probe(host, port, timeout=2.0):
+    """Zeit für den TCP-Verbindungsaufbau in ms. Eine Ablehnung (RST) zählt auch als Antwort; keine Antwort = None."""
+    t0 = time.monotonic()
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+    except ConnectionRefusedError:
+        pass
+    except OSError:
+        return None
+    return round((time.monotonic() - t0) * 1000, 1)
+
+
+def net_targets(proc_dir=None):
+    out = {}
+    gw = default_gateway(proc_dir)
+    if gw:
+        out["gateway"] = (gw, NET_GATEWAY_PORT)
+    t = parse_target(NET_TARGET)
+    if t:
+        out["internet"] = t
+    return out
+
+
+def net_round(targets, probe=tcp_probe, probes=NET_PROBES):
+    """Je Ziel einige Versuche: Median der Antwortzeit (ms) und Verlust in Prozent."""
+    vals = {}
+    for name, (host, port) in targets.items():
+        ms = [probe(host, port) for _ in range(probes)]
+        ok = sorted(x for x in ms if x is not None)
+        vals[f"net:{name}:rtt"] = ok[len(ok) // 2] if ok else None
+        vals[f"net:{name}:loss"] = round(100.0 * (probes - len(ok)) / probes, 1)
+    return vals
+
+
+def net_reply(store, days, res=None, now=None, proc_dir=None):
+    now = int(now or time.time())
+    res = series_res(days, res)
+    data = store.series("net:", now - days * 86400, res)
+    latest = store.latest_series("net:")
+    series, last = {}, {}
+    for key, pts in data.items():
+        name, _, what = key.partition(":")
+        series.setdefault(name, {})[what] = pts
+    for key, v in latest.items():
+        name, _, what = key.partition(":")
+        last.setdefault(name, {"t": v["t"]})[what] = v["v"]
+    return {"enabled": NET_ON, "interval_s": NET_INTERVAL, "probes": NET_PROBES, "days": days, "res": res,
+            "fields": ["t", "v"] if res == "raw" else ["t", "avg", "max"],
+            "targets": {k: f"{h}:{p}" for k, (h, p) in net_targets(proc_dir).items()} if NET_ON else {},
+            "latest": last, "series": series}
+
+
+def run_net(store, stop):
+    while not stop.wait(NET_INTERVAL):
+        try:
+            targets = net_targets()
+            if targets:
+                store.add_series(int(time.time()), net_round(targets))
+        except Exception as e:  # noqa: BLE001
+            print("Netz-Messung fehlgeschlagen:", e, flush=True)
+
+
+# --- SMART (freiwillig, nur lesen: smartctl --scan und smartctl -a, nie Selbsttests, nie Schreiben)
+
+SMART_DEV = re.compile(r"/dev/(sd[a-z]{1,3}|hd[a-z]|nvme\d{1,3}(n\d{1,3})?|sg\d{1,3}|bus/\d{1,3})")
+SMART_TYPE = re.compile(r"[a-z0-9][a-z0-9,+_-]{0,31}")
+SMART_TIMEOUT = 60
+
+
+def smartctl_args(op, dev=None, dtype=None):
+    """Die einzigen Befehle, die der Agent kennt. «-n standby»: schlafende Platten nicht aufwecken (Unraid)."""
+    if op == "scan":
+        return ["smartctl", "--scan", "--json=c"]
+    if op == "read" and isinstance(dev, str) and SMART_DEV.fullmatch(dev) and (dtype is None or (isinstance(dtype, str) and SMART_TYPE.fullmatch(dtype))):
+        return ["smartctl", "--json=c", "-a", "-n", "standby"] + (["-d", dtype] if dtype else []) + [dev]
+    return None
+
+
+def run_smartctl(args):
+    try:
+        p = subprocess.run(args, capture_output=True, timeout=SMART_TIMEOUT, check=False)
+        return p.returncode, p.stdout[:4_000_000].decode("utf-8", "replace")
+    except FileNotFoundError:
+        return 127, ""
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 126, json.dumps({"smartctl": {"messages": [{"string": f"{type(e).__name__}", "severity": "error"}]}})
+
+
+def _smart_serve(conn):
+    """Kleiner Helfer, der root bleibt (nur bei NZBLAB_SMART=1 und Start als root): nimmt über ein Socket-Paar nur
+    {"op": "scan"} oder {"op": "read", "dev", "type"} an, prüft sie nochmals und startet nur smartctl mit festen Argumenten."""
+    f = conn.makefile("rwb")
+    for line in f:
+        try:
+            req = json.loads(line[:4096])
+            args = smartctl_args(req.get("op"), req.get("dev"), req.get("type")) if isinstance(req, dict) else None
+        except ValueError:
+            args = None
+        rc, out = run_smartctl(args) if args else (2, "")
+        f.write(json.dumps({"rc": rc, "out": out}).encode() + b"\n")
+        f.flush()
+
+
+class SmartHelper:
+    """Rechte trennen: Der Agent selbst läuft als PUID ohne Rechte; smartctl braucht root und CAP_SYS_RAWIO (Platten-
+    Befehle über SG_IO). Darum spaltet main() vor dem Rechte-Abgeben einen Helfer ab, der nur smartctl ausführt."""
+
+    def __init__(self):
+        self.sock, self.pid, self.lock = None, None, threading.Lock()
+
+    def start(self):
+        if not (hasattr(os, "fork") and hasattr(os, "geteuid") and os.geteuid() == 0):
+            return False
+        parent, child = socket.socketpair()
+        pid = os.fork()
+        if pid == 0:                                   # Helfer
+            parent.close()
+            try:
+                _smart_serve(child)
+            finally:
+                os._exit(0)
+        child.close()
+        self.sock, self.pid = parent, pid
+        return True
+
+    def call(self, op, dev=None, dtype=None):
+        args = smartctl_args(op, dev, dtype)
+        if args is None:
+            return 2, ""
+        if self.sock is None:
+            return run_smartctl(args)
+        with self.lock:
+            try:
+                self.sock.settimeout(SMART_TIMEOUT + 10)
+                self.sock.sendall(json.dumps({"op": op, "dev": dev, "type": dtype}).encode() + b"\n")
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    c = self.sock.recv(65536)
+                    if not c:
+                        raise OSError("SMART-Helfer beendet")
+                    buf += c
+                    if len(buf) > 20_000_000:
+                        raise OSError("Antwort zu gross")
+                r = json.loads(buf)
+                return int(r.get("rc", 2)), str(r.get("out", ""))
+            except (OSError, ValueError) as e:
+                print("SMART-Helfer:", e, flush=True)
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+                return 126, ""
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def parse_smart_scan(text):
+    try:
+        js = json.loads(text or "{}")
+    except ValueError:
+        return []
+    out = []
+    for d in js.get("devices") or []:
+        if isinstance(d, dict) and SMART_DEV.fullmatch(str(d.get("name", ""))):
+            t = d.get("type")
+            out.append({"name": d["name"], "type": t if isinstance(t, str) and SMART_TYPE.fullmatch(t) else None,
+                        "protocol": d.get("protocol", "")})
+    return out
+
+
+def parse_smart(text, dev=None):
+    """smartctl --json -a → Werte mit den Namen, die die App von Scrutiny kennt (model_name, serial_number, power_on_hours,
+    temp, attrs nach ID bzw. bei NVMe nach Namen wie media_errors, percentage_used). None, wenn kein JSON."""
+    try:
+        js = json.loads(text or "")
+    except ValueError:
+        return None
+    if not isinstance(js, dict):
+        return None
+    d = js.get("device") or {}
+    msgs = [m.get("string", "") for m in ((js.get("smartctl") or {}).get("messages") or []) if isinstance(m, dict)]
+    standby = any(re.search(r"(?i)standby|sleep", m) for m in msgs)
+    name = d.get("name") or dev or ""
+    rot = _num(js.get("rotation_rate"))
+    out = {"device": name, "device_name": name.rsplit("/", 1)[-1], "device_type": d.get("type", ""),
+           "device_protocol": d.get("protocol", ""), "model_name": js.get("model_name") or js.get("scsi_model_name") or "",
+           "serial_number": js.get("serial_number", ""), "firmware": js.get("firmware_version", ""),
+           "capacity": _num((js.get("user_capacity") or {}).get("bytes")) or _num(js.get("nvme_total_capacity")),
+           "rotational_speed": rot or 0, "smart_passed": (js.get("smart_status") or {}).get("passed"),
+           "power_on_hours": _num((js.get("power_on_time") or {}).get("hours")), "power_cycle_count": _num(js.get("power_cycle_count")),
+           "temp": _num((js.get("temperature") or {}).get("current")), "reallocated": None, "pending": None, "uncorrectable": None,
+           "crc": None, "media_errors": None, "percentage_used": None, "unsafe_shutdowns": None, "standby": standby, "attrs": {},
+           "error": next((m for m in msgs if m and not standby and re.search(r"(?i)denied|failed|unable|error", m)), "")[:200]}
+    for a in ((js.get("ata_smart_attributes") or {}).get("table") or []):
+        if not isinstance(a, dict) or not isinstance(a.get("id"), int):
+            continue
+        raw = a.get("raw") or {}
+        out["attrs"][str(a["id"])] = {"attribute_id": a["id"], "name": a.get("name", ""), "value": _num(a.get("value")),
+                                      "worst": _num(a.get("worst")), "thresh": _num(a.get("thresh")), "raw_value": _num(raw.get("value")),
+                                      "raw_string": str(raw.get("string", ""))[:60], "failing": bool(a.get("when_failed"))}
+
+    def raw(i):
+        return (out["attrs"].get(str(i)) or {}).get("raw_value")
+    out["reallocated"], out["pending"], out["uncorrectable"], out["crc"] = raw(5), raw(197), raw(198), raw(199)
+    if out["power_cycle_count"] is None:
+        out["power_cycle_count"] = raw(12)
+    out["unsafe_shutdowns"] = raw(192)
+    nv = js.get("nvme_smart_health_information_log")
+    if isinstance(nv, dict):
+        for k in ("media_errors", "percentage_used", "unsafe_shutdowns", "power_cycles", "data_units_read", "data_units_written",
+                  "num_err_log_entries", "available_spare", "critical_warning"):
+            if _num(nv.get(k)) is not None:
+                out["attrs"][k] = {"attribute_id": k, "name": k, "raw_value": nv[k]}
+        out["media_errors"], out["percentage_used"] = _num(nv.get("media_errors")), _num(nv.get("percentage_used"))
+        out["unsafe_shutdowns"] = _num(nv.get("unsafe_shutdowns"))
+        out["power_on_hours"] = out["power_on_hours"] if out["power_on_hours"] is not None else _num(nv.get("power_on_hours"))
+        out["power_cycle_count"] = out["power_cycle_count"] if out["power_cycle_count"] is not None else _num(nv.get("power_cycles"))
+        out["temp"] = out["temp"] if out["temp"] is not None else _num(nv.get("temperature"))
+    if _num(js.get("scsi_grown_defect_list")) is not None:          # SAS/SCSI: gewachsene Defektliste ≈ neu zugewiesen
+        out["reallocated"] = js["scsi_grown_defect_list"]
+    ecl = js.get("scsi_error_counter_log")
+    if isinstance(ecl, dict):
+        unc = [_num((ecl.get(k) or {}).get("total_uncorrected_errors")) for k in ("read", "write", "verify")]
+        if any(x is not None for x in unc):
+            out["uncorrectable"] = sum(x or 0 for x in unc)
+    return out
+
+
+def smart_day_row(p):
+    """Tageswert mit den Namen der App-Frühwarnung (DiskDay)."""
+    return {"device": p.get("device_name"), "model": p.get("model_name"), "realloc": p.get("reallocated"), "pending": p.get("pending"),
+            "uncorr": p.get("uncorrectable"), "crc": p.get("crc"), "media": p.get("media_errors"), "temp_max": p.get("temp"),
+            "hours": p.get("power_on_hours"), "wear": p.get("percentage_used"), "passed": p.get("smart_passed")}
+
+
+class SmartMonitor:
+    def __init__(self, store, helper=None, enabled=None):
+        self.store, self.helper = store, helper or SmartHelper()
+        self.enabled = SMART_ON if enabled is None else enabled
+        self.latest, self.checked, self.error, self.lock = {}, 0, "", threading.Lock()
+
+    def poll(self, now=None):
+        now = int(now or time.time())
+        rc, out = self.helper.call("scan")
+        devs = parse_smart_scan(out)
+        err = ""
+        if rc == 127:
+            err = "smartctl fehlt im Image"
+        elif not devs:
+            err = "Keine Platten gefunden: im Compose-Block «devices» die Platten freigeben (siehe README, SMART)"
+        latest = {}
+        for d in devs:
+            rc, out = self.helper.call("read", d["name"], d["type"])
+            p = parse_smart(out, d["name"])
+            if p is None:
+                continue
+            old = self.latest.get(d["name"])
+            if p["standby"] and old:
+                p = dict(old, standby=True)          # schlafende Platte: letzter Stand bleibt, nicht aufwecken
+            latest[d["name"]] = p
+            if not p["standby"] and (p["serial_number"] or p["model_name"]):
+                self.store.add_smart_day(p["serial_number"] or p["device_name"], smart_day_row(p), now)
+        if devs and not latest:
+            err = "smartctl lieferte keine Werte (Rechte: cap_add SYS_RAWIO, Platten unter devices, PUID-Start als root)"
+        with self.lock:
+            self.latest, self.checked, self.error = latest, now, err
+        return latest
+
+    def current(self):
+        with self.lock:
+            return {"enabled": self.enabled, "checked": self.checked or None, "error": self.error if self.enabled else
+                    "SMART ist aus (NZBLAB_SMART=1 und SMART-Block im Compose)", "disks": list(self.latest.values())}
+
+    def history(self, days, now=None):
+        now = int(now or time.time())
+        return {"enabled": self.enabled, "days": days,
+                "disks": [{"serial": k, "model": (rows[-1].get("model") or ""), "device": rows[-1].get("device") or "", "rows": rows}
+                          for k, rows in self.store.smart_days(now - days * 86400).items()]}
+
+
+def run_smart(smart, stop):
+    if stop.wait(20):
+        return
+    while True:
+        try:
+            smart.poll()
+        except Exception as e:  # noqa: BLE001
+            print("SMART fehlgeschlagen:", e, flush=True)
+        if stop.wait(SMART_EVERY):
+            return
+
+
+# --- Backups erkennen (nur lesen, aus Dateien und Dateizeiten; restic/borg/Kopia werden nie gestartet)
+
+BACKUP_WORDS = re.compile(r"(?i)backup|restic|borg|kopia|sicherung|rsync|snapshot|duplicati|timemachine|time.machine|bak")
+BACKUP_OK = re.compile(r"(?i)(sent [\d,.]+ bytes\s+received|total size is [\d,.]+|speedup is|backup (completed|finished|successful|done|ok)|"
+                       r"snapshot [0-9a-f]+ saved|archive fingerprint|created snapshot|sicherung (erfolgreich|abgeschlossen|fertig))")
+BACKUP_ERR = re.compile(r"(?i)(rsync error|rsync: \[|\berror\b|\bfailed\b|fatal|permission denied|no space left|fehlgeschlagen|abgebrochen)")
+LOG_TIME_ISO = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})")
+LOG_TIME_BSD = re.compile(r"^([A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2})")
+
+
+def _newest_mtime(paths):
+    best = None
+    for p in paths:
+        try:
+            m = int(os.stat(p).st_mtime)
+        except OSError:
+            continue
+        best = m if best is None or m > best else best
+    return best
+
+
+def _listdir(p):
+    try:
+        return os.listdir(p)
+    except OSError:
+        return []
+
+
+def detect_repo(path):
+    """restic, borg oder kopia (Dateisystem-Repository) an seinen Kennzeichen erkennen, sonst None."""
+    if os.path.isfile(os.path.join(path, "kopia.repository.f")):
+        return "kopia"
+    if all(os.path.isdir(os.path.join(path, x)) for x in ("snapshots", "data", "keys")) and os.path.isfile(os.path.join(path, "config")):
+        return "restic"
+    if os.path.isfile(os.path.join(path, "README")) and "borg backup repository" in (read(os.path.join(path, "README"), "") or "")[:300].lower():
+        return "borg"
+    return None
+
+
+def repo_info(kind, path, now=None):
+    """Letzte Sicherung aus Dateizeiten: restic = neueste Datei in snapshots/, borg = index/hints/integrity (bei jedem
+    Abschluss neu geschrieben), Kopia = neueste Index- und Metadaten-Blobs (x…, q…). Inhalt ist verschlüsselt: nie gelesen."""
+    if kind == "restic":
+        snaps = [os.path.join(path, "snapshots", f) for f in _listdir(os.path.join(path, "snapshots"))]
+        return {"last_success": _newest_mtime(snaps), "snapshots": len(snaps), "source": "restic: Dateizeit in snapshots/"}
+    if kind == "borg":
+        files = [os.path.join(path, f) for f in _listdir(path) if re.match(r"(index|hints|integrity)\.\d+$", f)]
+        return {"last_success": _newest_mtime(files), "source": "borg: Dateizeit von index/hints"}
+    files, budget = [], 5000
+    for top in _listdir(path):
+        if not top.startswith(("x", "q")):
+            continue
+        p = os.path.join(path, top)
+        if os.path.isfile(p):
+            files.append(p)
+            continue
+        for root, dirs, fs in os.walk(p):
+            files += [os.path.join(root, f) for f in fs]
+            budget -= len(fs) + 1
+            if budget <= 0:
+                break
+    return {"last_success": _newest_mtime(files), "source": "kopia: Dateizeit der Index-/Metadaten-Blobs"}
+
+
+def _log_time(line, fallback):
+    m = LOG_TIME_ISO.search(line[:40])
+    try:
+        if m:
+            return int(time.mktime(time.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")))
+        m = LOG_TIME_BSD.match(line)
+        if m:
+            year = time.localtime().tm_year
+            t = int(time.mktime(time.strptime(f"{year} {' '.join(m.group(1).split())}", "%Y %b %d %H:%M:%S")))
+            return t if t <= time.time() + 86400 else int(time.mktime(time.strptime(f"{year - 1} {' '.join(m.group(1).split())}", "%Y %b %d %H:%M:%S")))
+    except (ValueError, OverflowError):
+        pass
+    return fallback
+
+
+def backup_log_info(path):
+    """Log-Datei eines Backup-Skripts (rsync, cron …): Zeitpunkt der letzten Erfolgs- und Fehlerzeile (letzte 256 KB)."""
+    try:
+        mtime = int(os.stat(path).st_mtime)
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 262_144))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    ok = err = None
+    err_text = ""
+    for line in lines:
+        if BACKUP_OK.search(line):
+            ok = _log_time(line, mtime)
+        elif BACKUP_ERR.search(line):
+            err, err_text = _log_time(line, mtime), redact_log(line.strip())[:200]
+    kind = "rsync" if "rsync" in os.path.basename(path).lower() or any("rsync" in l for l in lines[-200:]) else "log"
+    return {"kind": kind, "last_success": ok, "last_error": err, "error_text": err_text, "source": "Log-Datei"}
+
+
+def _host_path(p):
+    """Pfad im Container → Pfad auf dem NAS, so gut es geht (nur Anzeige)."""
+    return p[len("/host"):] if p.startswith("/host/mnt/") else p
+
+
+def scan_backups(explicit=None, auto_roots=None, max_depth=3, budget=2000, deadline_s=20.0):
+    """Explizite Pfade (Ordner = Repository oder Ordner mit Repositories, Datei = Log) und automatisch gefundene
+    Repositories unter den eingebundenen Ordnern. Automatisch: oberste Ebene jeder Freigabe, darunter nur Ordner mit
+    Backup-Namen (backup, restic, borg, kopia, sicherung, rsync …), höchstens 3 Ebenen tief."""
+    found, seen, t_end = [], set(), time.monotonic() + deadline_s
+
+    def add(kind, path, info, origin):
+        rp = os.path.realpath(path)
+        if rp in seen:
+            return
+        seen.add(rp)
+        found.append({"kind": kind, "name": os.path.basename(path.rstrip("/")) or path, "path": _host_path(path),
+                      "last_success": info.get("last_success"), "last_error": info.get("last_error"),
+                      "error_text": info.get("error_text", ""), "snapshots": info.get("snapshots"),
+                      "source": info.get("source", "unknown"), "found_by": origin})
+
+    def visit(path, depth, origin, only_named):
+        nonlocal budget
+        if budget <= 0 or time.monotonic() > t_end:
+            return
+        budget -= 1
+        kind = detect_repo(path)
+        if kind:
+            return add(kind, path, repo_info(kind, path), origin)
+        if depth >= max_depth:
+            return
+        for name in sorted(_listdir(path))[:500]:
+            p = os.path.join(path, name)
+            if name.startswith(".") or os.path.islink(p):
+                continue
+            if os.path.isdir(p):
+                if not only_named or BACKUP_WORDS.search(name) or BACKUP_WORDS.search(os.path.basename(path)):
+                    visit(p, depth + 1, origin, only_named)
+            elif origin == "path" and name.endswith(".log") and BACKUP_WORDS.search(name):
+                info = backup_log_info(p)
+                if info:
+                    add(info["kind"], p, info, origin)
+
+    for p in explicit or []:
+        if os.path.isfile(p):
+            info = backup_log_info(p)
+            if info:
+                add(info["kind"], p, info, "path")
+        elif os.path.isdir(p):
+            visit(p, 0, "path", False)
+        else:
+            found.append({"kind": "unknown", "name": os.path.basename(p.rstrip("/")) or p, "path": _host_path(p), "last_success": None,
+                          "last_error": None, "error_text": "Pfad nicht gefunden (im Compose nur lesend einbinden)", "snapshots": None,
+                          "source": "unknown", "found_by": "path"})
+    for root in auto_roots or []:
+        for share in sorted(_listdir(root))[:200]:
+            p = os.path.join(root, share)
+            if os.path.isdir(p) and not share.startswith(".") and not top_excluded(share, FILES_EXCLUDE - {"appdata"}):
+                visit(p, 0, "auto", True)
+    return found
+
+
+class BackupScanner:
+    """Ergebnis wird im Hintergrund gerechnet (explizite Pfade stündlich, Suche unter den Freigaben alle 6 Stunden,
+    wie der Datei-Index), Anfragen bekommen sofort den letzten Stand."""
+
+    def __init__(self, explicit=None, auto_roots=None, auto=None):
+        self.explicit = BACKUP_PATHS if explicit is None else explicit
+        self.auto = BACKUP_AUTO if auto is None else auto
+        self.auto_roots = auto_roots if auto_roots is not None else [r for r in (FILES_ROOT, HOST_FS) if os.path.isdir(r)]
+        self.items, self.auto_items, self.checked, self.auto_checked = [], [], 0, 0
+        self.lock = threading.Lock()
+
+    def enabled(self):
+        return bool(self.explicit) or (self.auto and bool(self.auto_roots))
+
+    def refresh(self, auto=False):
+        items = scan_backups(self.explicit)
+        auto_items = scan_backups(auto_roots=self.auto_roots) if auto and self.auto else None
+        with self.lock:
+            self.items, self.checked = items, int(time.time())
+            if auto_items is not None:
+                self.auto_items, self.auto_checked = auto_items, int(time.time())
+
+    def get(self):
+        with self.lock:
+            paths = {i["path"] for i in self.items}
+            items = self.items + [i for i in self.auto_items if i["path"] not in paths]
+            return {"enabled": self.enabled(), "checked": self.checked or None, "auto": self.auto, "auto_checked": self.auto_checked or None,
+                    "paths": [_host_path(p) for p in self.explicit], "backups": items,
+                    "note": "Zeiten aus Dateizeiten und Log-Zeilen; last_error nur aus Logs, sonst null (unbekannt)"}
+
+
+def run_backups(scanner, stop):
+    n = 0
+    if stop.wait(30):
+        return
+    while True:
+        try:
+            if scanner.enabled():
+                scanner.refresh(auto=n % 6 == 0)
+        except Exception as e:  # noqa: BLE001
+            print("Backup-Suche fehlgeschlagen:", e, flush=True)
+        n += 1
+        if stop.wait(3600):
+            return
+
+
+# --- RAID und Pools: mdadm (/proc/mdstat), ZFS (kstat, zpool falls vorhanden), Btrfs (/sys/fs/btrfs)
+
+MD_HEAD = re.compile(r"^(md\S*)\s*:\s*(\S+)\s*(?:\((auto-read-only|read-only)\)\s*)?(.*)$")
+MD_DEV = re.compile(r"^(\S+?)\[(\d+)\]((?:\([A-Z]\))*)$")
+MD_COUNT = re.compile(r"\[(\d+)/(\d+)\]\s*\[([U_]+)\]")
+MD_SYNC = re.compile(r"(resync|recovery|check|reshape|repair)\s*=\s*([\d.]+)%(?:.*?finish=([\d.]+)min)?")
+MD_WAIT = re.compile(r"(resync|recovery|check|reshape)\s*=\s*(DELAYED|PENDING)")
+
+
+def parse_mdstat(text):
+    """Linux-Software-RAID (mdadm). Unraid hat ein eigenes Format (mdState=…): dafür gibt es /api/array."""
+    if not text:
+        return []
+    if "mdState=" in text:
+        kv = dict(l.split("=", 1) for l in text.splitlines() if "=" in l)
+        return [{"kind": "unraid", "name": "array", "state": kv.get("mdState", ""), "degraded": None, "details": "/api/array"}]
+    out, cur = [], None
+    for line in text.splitlines():
+        m = MD_HEAD.match(line)
+        if m and not line.startswith(("Personalities", "unused")):
+            rest = m.group(4).split()
+            level = rest[0] if rest and not MD_DEV.match(rest[0]) else ""
+            devs = []
+            for tok in rest[1 if level else 0:]:
+                dm = MD_DEV.match(tok)
+                if dm:
+                    flags = dm.group(3)
+                    devs.append({"name": dm.group(1), "role": int(dm.group(2)), "failed": "(F)" in flags, "spare": "(S)" in flags})
+            cur = {"kind": "mdadm", "name": m.group(1), "state": m.group(2) + (f" ({m.group(3)})" if m.group(3) else ""), "level": level,
+                   "devices": devs, "total": None, "active": None, "degraded": any(d["failed"] for d in devs) or m.group(2) == "inactive",
+                   "sync": None}
+            out.append(cur)
+            continue
+        if cur is None:
+            continue
+        c = MD_COUNT.search(line)
+        if c:
+            cur["total"], cur["active"] = int(c.group(1)), int(c.group(2))
+            cur["degraded"] = cur["degraded"] or cur["active"] < cur["total"] or "_" in c.group(3)
+        s = MD_SYNC.search(line)
+        if s:
+            cur["sync"] = {"action": s.group(1), "percent": float(s.group(2)), "finish_min": float(s.group(3)) if s.group(3) else None}
+        w = MD_WAIT.search(line)
+        if w:
+            cur["sync"] = {"action": w.group(1), "percent": None, "finish_min": None, "waiting": w.group(2).lower()}
+    return out
+
+
+def zfs_pools(proc_dir=None, run=None):
+    """ZFS-Pools: Zustand aus /proc/spl/kstat/zfs/<pool>/state (ab OpenZFS 0.8, ohne Werkzeuge). Ist «zpool» im Container
+    vorhanden (normal nicht), wird es zusätzlich gefragt. (pools, Quelle)."""
+    proc_dir = proc_dir or HOST_PROC
+    base = f"{proc_dir}/spl/kstat/zfs"
+    pools = []
+    for name in sorted(_listdir(base)):
+        st = read(f"{base}/{name}/state")
+        if st:
+            pools.append({"kind": "zfs", "name": name, "state": st, "degraded": st != "ONLINE"})
+    if pools:
+        return pools, "kstat"
+    import shutil
+    if run is None and shutil.which("zpool"):
+        def run():
+            return subprocess.run(["zpool", "list", "-H", "-o", "name,health"], capture_output=True, timeout=15, check=False).stdout.decode()
+    if run is not None:
+        try:
+            for line in run().splitlines():
+                f = line.split("\t")
+                if len(f) == 2:
+                    pools.append({"kind": "zfs", "name": f[0], "state": f[1], "degraded": f[1] != "ONLINE"})
+            return pools, "zpool"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return pools, ("none" if os.path.isdir(base) else "unavailable")
+
+
+def btrfs_pools(sys_dir=None):
+    """Btrfs aus /sys/fs/btrfs/<uuid>: Name, Profile (raid1, raid5 …), Geräte, fehlende Geräte, Fehlerzähler je Gerät."""
+    base = f"{sys_dir or HOST_SYS}/fs/btrfs"
+    out = []
+    for uuid in sorted(_listdir(base)):
+        if not re.fullmatch(r"[0-9a-f-]{36}", uuid):
+            continue
+        d = f"{base}/{uuid}"
+        profiles = {}
+        for kind in ("data", "metadata", "system"):
+            prof = [p for p in _listdir(f"{d}/allocation/{kind}") if re.fullmatch(r"single|dup|raid\d+c?\d*", p)]
+            if prof:
+                profiles[kind] = ",".join(sorted(prof))
+        devs, errors = [], 0
+        for devid in sorted(_listdir(f"{d}/devinfo"), key=lambda x: int(x) if x.isdigit() else 0):
+            stats = {}
+            for line in (read(f"{d}/devinfo/{devid}/error_stats", "") or "").splitlines():
+                k, _, v = line.partition(" ")
+                if v.strip().isdigit():
+                    stats[k] = int(v)
+            errors += sum(stats.values())
+            devs.append({"devid": int(devid) if devid.isdigit() else devid, "missing": read(f"{d}/devinfo/{devid}/missing", "0") == "1",
+                         "errors": stats})
+        out.append({"kind": "btrfs", "name": read(f"{d}/label", "") or uuid[:8], "uuid": uuid, "profiles": profiles,
+                    "devices": devs, "members": sorted(_listdir(f"{d}/devices")), "errors": errors,
+                    "degraded": any(x["missing"] for x in devs)})
+    return out
+
+
+def raid_status(proc_dir=None, sys_dir=None):
+    proc_dir = proc_dir or HOST_PROC
+    md = parse_mdstat(read(f"{proc_dir}/mdstat", "") or "")
+    zfs, zsrc = zfs_pools(proc_dir)
+    bt = btrfs_pools(sys_dir)
+    pools = md + zfs + bt
+    return {"pools": pools, "degraded": any(p.get("degraded") for p in pools),
+            "sources": {"mdadm": os.path.exists(f"{proc_dir}/mdstat"), "zfs": zsrc, "btrfs": os.path.isdir(f"{sys_dir or HOST_SYS}/fs/btrfs")}}
+
+
+# --- Log-Auszüge (freiwillig: NZBLAB_LOGS=1, /var/log nur lesend). Vor der Antwort lokal gefiltert, nie von selbst verschickt
+
+_REDACT = [
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,15}://)[^/\s:@]+:[^/\s@]+@"), r"\1<user>:<redacted>@"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{6,}"), "Bearer <redacted>"),
+    (re.compile(r"(?i)\b(pass(?:word|wd|phrase)?|pwd|token|api[_-]?key|apikey|secret|auth[a-z]*|private[_-]?key|access[_-]?key|session(?:id)?|"
+                r"cookie|sig(?:nature)?|key)(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s&,;]+)"), r"\1\2<redacted>"),
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<email>"),
+    (re.compile(r"(?i)(?<![0-9a-f:])[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5,}(?![0-9a-f:])"), "<mac>"),
+    (re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"), "<ip>"),
+    (re.compile(r"(?i)(?<![\w:.])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?:%\w+)?(?![\w:])"), None),      # IPv6, siehe _ipv6
+    (re.compile(r"(?i)\b(user(?:name)?|login|for user|invalid user|uid)([=: ]+)([^\s,;:'\"()\[\]]+)"), r"\1\2<user>"),
+    (re.compile(r"(/(?:home|Users))/[^/\s]+"), r"\1/<user>"),
+    (re.compile(r"(/mnt/(?:user|disk\d+|cache[^/\s]*|remotes|disks)/[^/\s]+)/[^\s'\"]+"), r"\1/…"),
+    (re.compile(r"(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\d)(?=[A-Za-z0-9+/_-]*[A-Za-z])[A-Za-z0-9+/_-]{32,}={0,2}"), "<secret>"),
+]
+
+
+def _ipv6(m):
+    s = m.group(0)
+    return "<ip>" if "::" in s or s.count(":") >= 4 else s       # «12:34:56» (Uhrzeit) bleibt
+
+
+def redact_log(s):
+    """Entfernt IP-Adressen (v4/v6), MAC-Adressen, E-Mails, Tokens, Schlüssel und Passwörter (key=wert, Bearer, user:pass@),
+    Benutzernamen, Heimordner und Datei-/Ordnernamen unter den Freigaben, lange Zufallsketten."""
+    for rx, rep in _REDACT:
+        s = rx.sub(_ipv6 if rep is None else rep, s)
+    return s
+
+
+LOG_FILES = ("syslog", "messages", "kern.log", "daemon.log", "syslog.1", "messages.1")
+LOG_ERR = re.compile(r"(?i)(i/o error|\berror\b|\berr\b|\bfail(ed|ure)?\b|critical|\bcrit\b|panic|segfault|out of memory|oom-kill|call trace|corrupt|"
+                     r"read-only file system|\bemerg|\balert\b)")
+LOG_WARN = re.compile(r"(?i)(\bwarn(ing)?\b|timed out|timeout|degraded|retry|retrying|not responding|link is down|throttl|deprecated)")
+
+
+def collect_logs(log_dir=None, hours=24, limit=200, now=None):
+    """Fehler- und Warnzeilen der letzten Stunden aus Text-Logs (syslog, messages, kern.log, daemon.log), gefiltert und
+    zusammengefasst (gleiche Meldung = eine Zeile mit Anzahl). Journald-Binärdateien werden nicht gelesen."""
+    log_dir = log_dir or LOG_DIR
+    now = int(now or time.time())
+    since = now - hours * 3600
+    seen, files = {}, []
+    for name in LOG_FILES:
+        path = os.path.join(log_dir, name)
+        try:
+            if not os.path.isfile(path) or os.stat(path).st_mtime < since:
+                continue
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 4_000_000))
+                lines = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        files.append(name)
+        for line in lines:
+            err = LOG_ERR.search(line)
+            if not err and not LOG_WARN.search(line):
+                continue
+            if Today.SYSLOG_SKIP.search(line):
+                continue
+            t = _log_time(line, None)
+            if t is None or t < since or t > now + 300:
+                continue
+            m = LOG_TIME_ISO.match(line)
+            rest = re.sub(r"^\S*", "", line[m.end():]) if m else ""        # Sekundenbruchteile und Zeitzone weg
+            if not m:
+                m = LOG_TIME_BSD.match(line)
+                rest = line[m.end():] if m else line
+            rest = rest.strip()
+            if m and re.match(r"^[^\s:]+\s+\S+?(\[\d+\])?:", rest):
+                rest = re.sub(r"^\S+\s+", "", rest, count=1)                # Rechnername weg
+            src, sep, msg = rest.partition(": ")
+            if not sep:
+                src, msg = "", rest
+            msg = redact_log(msg.strip())[:300]
+            src = re.sub(r"\[\d+\]$", "", src.strip())[:40]
+            key = (src, re.sub(r"\d+", "#", msg)[:120])
+            if key in seen:
+                seen[key]["n"] += 1
+                seen[key]["t"] = max(seen[key]["t"], t)
+                continue
+            seen[key] = {"t": t, "level": "err" if err else "warn", "src": redact_log(src), "text": msg, "n": 1}
+    lines = sorted(seen.values(), key=lambda e: -e["t"])[:limit]
+    return {"enabled": True, "hours": hours, "files": files, "lines": lines, "redacted": True,
+            "note": "IP, MAC, E-Mail, Tokens/Passwörter, Benutzer und Pfade sind entfernt"}
+
+
+def agent_features(smart=None, backups=None, log_dir=None):
+    feats = ["boots", "disktemps", "health"]
+    if SMART_ON or (smart is not None and smart.enabled):
+        feats.append("smart")
+    if backups is not None and backups.enabled():
+        feats.append("backups")
+    try:
+        r = cached("raid", raid_status, ttl=60)
+        if r["pools"] or r["sources"]["mdadm"] or r["sources"]["btrfs"] or r["sources"]["zfs"] != "unavailable":
+            feats.append("raid")
+    except Exception:  # noqa: BLE001
+        pass
+    if NET_ON:
+        feats.append("net")
+    if LOGS_ON and os.path.isdir(log_dir or LOG_DIR):
+        feats.append("logs")
+    return feats
+
+
+class AuthLimiter:
+    """Bremse gegen Token-Raten: höchstens AUTH_FAILS falsche Tokens pro Minute und Absender-IP, danach 5 Minuten 429."""
+
+    def __init__(self, max_fail=None, window=60, block=300):
+        self.max_fail, self.window, self.block = max_fail or AUTH_FAILS, window, block
+        self.fails, self.blocked, self.lock = {}, {}, threading.Lock()
+
+    def blocked_for(self, ip, now=None):
+        now = now if now is not None else time.monotonic()
+        with self.lock:
+            until = self.blocked.get(ip)
+            if until is None:
+                return 0
+            if until <= now:
+                self.blocked.pop(ip, None)
+                return 0
+            return int(until - now) + 1
+
+    def fail(self, ip, now=None):
+        now = now if now is not None else time.monotonic()
+        with self.lock:
+            if len(self.fails) > 10000:                     # viele Absender: alte Einträge weg, Speicher bleibt klein
+                self.fails = {k: v for k, v in self.fails.items() if v and v[-1] > now - self.window}
+            if len(self.blocked) > 10000:
+                self.blocked = {k: v for k, v in self.blocked.items() if v > now}
+            lst = [x for x in self.fails.get(ip, []) if x > now - self.window] + [now]
+            if len(lst) >= self.max_fail:
+                self.blocked[ip] = now + self.block
+                self.fails.pop(ip, None)
+                print(f"Token-Bremse: {len(lst)} falsche Tokens in {self.window} s von einer Adresse, 5 Minuten gesperrt", flush=True)
+                return True
+            self.fails[ip] = lst
+            return False
+
+
+def run_extras(store, stop, smart=None):
+    """Neustarts (jede Minute) und Plattentemperaturen (alle 5 Minuten)."""
+    try:
+        check_boot(store)
+    except Exception as e:  # noqa: BLE001
+        print("Neustart-Prüfung fehlgeschlagen:", e, flush=True)
+    last_temp = 0
+    while not stop.wait(60):
+        try:
+            check_boot(store)
+            if time.time() - last_temp >= DISKTEMP_EVERY - 5:
+                last_temp = time.time()
+                record_disk_temps(store, smart_latest=smart.latest if smart and smart.enabled else None)
+        except Exception as e:  # noqa: BLE001
+            print("Zusatz-Messung fehlgeschlagen:", e, flush=True)
+
+
 CACHE_SHARES = CacheShares()
 APPDATA_SIZES = AppdataSizes()
 
 
-def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, today=None, crashes=None):
+def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, today=None, crashes=None, smart=None, backups=None,
+                 limiter=None, log_dir=None):
+    limiter = limiter or AuthLimiter()       # je Server eine eigene Token-Bremse (Tests starten viele Server)
+    smart = smart or SmartMonitor(store, SmartHelper(), enabled=False)
+    backups = backups or BackupScanner(explicit=[], auto_roots=[], auto=False)
+
     class H(BaseHTTPRequestHandler):
         # Lese-Timeout je Verbindung: halbe Anfragen (Slowloris) oder eine zu grosse Content-Length halten sonst einen
         # Arbeits-Thread für immer fest (Chaos-Test 28.10.2026)
@@ -3555,11 +4595,23 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             """Token als Bytes vergleichen (Umlaute im Header würden compare_digest sonst abbrechen lassen)."""
             if not tok:
                 return False                    # ohne geladenen Token nie «Bearer » mit leerem Token annehmen
+            ip = self.client_address[0]
+            wait = limiter.blocked_for(ip)
+            if wait:
+                self._limited = wait            # ab 1.15.0: zu viele falsche Tokens von dieser Adresse → 429
+                return False
             got = self.headers.get("Authorization", "").encode("utf-8", "replace")
-            return secrets.compare_digest(got, f"Bearer {tok}".encode())
+            ok = secrets.compare_digest(got, f"Bearer {tok}".encode())
+            if not ok and got:
+                limiter.fail(ip)
+            return ok
 
         def refuse(self):
-            """401 bei falschem Token; 503 mit genauem Grund, wenn der Agent selbst keinen Token laden konnte (ab 1.13.0)."""
+            """401 bei falschem Token; 503 mit genauem Grund, wenn der Agent selbst keinen Token laden konnte (ab 1.13.0);
+            429 nach zu vielen falschen Tokens (ab 1.15.0)."""
+            if getattr(self, "_limited", 0):
+                return self.reply(429, {"error": "Zu viele falsche Tokens, später nochmals versuchen", "retry_after": self._limited},
+                                  {"Retry-After": str(self._limited)})
             if not tok:
                 why = TOKEN_STATE["error"] or "Kein Token geladen (token.txt fehlt oder ist nicht lesbar)."
                 return self.reply(503, {"error": why, "token_error": why})
@@ -3569,17 +4621,35 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             """Ohne Token: nur aus dem Heimnetz und nur mit IP oder lokalem Namen im Host-Header (gegen DNS-Rebinding)."""
             return from_private_net(self.client_address[0]) and local_host_header(self.headers.get("Host", ""))
 
-        def reply(self, code, obj):
+        def reply(self, code, obj, headers=None):
             # «replace»: ein einzelnes Ersatzzeichen (\ud800) aus einem Bericht darf die Antwort nicht abbrechen
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8", "replace")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
+        def body_too_big(self, limit=MAX_BODY):
+            """Ab 1.15.0: Anfragen über 64 KiB (Content-Length) gleich mit 413 abweisen und die Verbindung schliessen."""
+            try:
+                n = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                return False                    # ungültige Länge: der Endpunkt antwortet 400
+            if n > limit:
+                self.close_connection = True
+                self.reply(413, {"error": f"Anfrage zu gross (höchstens {limit} Bytes)"})
+                return True
+            return False
+
         def do_GET(self):
             u = urlparse(self.path)
+            if self.body_too_big():
+                return None
+            if self.headers.get("Content-Length") not in (None, "", "0") or self.headers.get("Transfer-Encoding"):
+                self.close_connection = True    # GET mit Inhalt: nicht lesen, Verbindung danach schliessen
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if u.path in ("/", "/index.html"):
                 # Übersicht im Browser: die Seite selbst ist ohne Token, die Werte holt sie mit dem Token
@@ -3596,7 +4666,12 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 return self.wfile.write(body)
             if u.path == "/api/ping":
                 # Ohne Token: nur ob /config bleibt (ab 1.13.0), nichts Geheimes. Unbekannt (kein Linux) zählt als bleibend.
-                return self.reply(200, {"ok": True, "version": VERSION, "config_persistent": CONFIG_STATE.get("persistent") is not False})
+                return self.reply(200, {"ok": True, "version": VERSION, "api_level": API_LEVEL,
+                                        "config_persistent": CONFIG_STATE.get("persistent") is not False, "sampling_ok": sampling_ok()})
+            if u.path == "/api/health":
+                # Ohne Token, für die Docker-Gesundheitsprüfung (ab 1.15.0): 503, wenn die Messschleife hängt
+                ok = sampling_ok()
+                return self.reply(200 if ok else 503, {"ok": ok, "sample_age_s": sampling_age(), "interval": INTERVAL})
             if u.path == "/api/hello":
                 # Ohne Token (die App prüft damit, ob sie im eigenen Heimnetz ist, bevor sie Schlüssel sendet). Antwort:
                 # feste Zufalls-Kennung und HMAC über die Nonce der App; der Token selbst verlässt den Agent nie.
@@ -3629,9 +4704,34 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             now = int(time.time())
             try:
                 hours = max(1, min(int(q.get("hours", "24")), 24 * 730))
-                int(q.get("days", "30")); int(q.get("limit", "200"))
+                int(q.get("days", "30")); int(q.get("limit", "200")); int(q.get("max", "200"))
             except ValueError:
-                return self.reply(400, {"error": "hours, days und limit müssen Zahlen sein"})
+                return self.reply(400, {"error": "hours, days, limit und max müssen Zahlen sein"})
+            # Ab 1.15.0: Neustarts, Plattentemperaturen, Netz, SMART, Backups, RAID, Logs. Fehler als JSON, nie den Agenten mitreissen
+            try:
+                if u.path == "/api/boots":
+                    days = max(1, min(int(q.get("days", "30")), 730))
+                    return self.reply(200, {"days": days, "boots": store.boots(now - days * 86400)})
+                if u.path == "/api/disktemps":
+                    return self.reply(200, disktemps_reply(store, max(1, min(int(q.get("days", "7")), 400)), q.get("res")))
+                if u.path == "/api/net":
+                    return self.reply(200, net_reply(store, max(1, min(int(q.get("days", "1")), 400)), q.get("res")))
+                if u.path == "/api/smart":
+                    return self.reply(200, smart.current())
+                if u.path == "/api/smart/history":
+                    return self.reply(200, smart.history(max(1, min(int(q.get("days", "90")), 730))))
+                if u.path == "/api/backups":
+                    return self.reply(200, backups.get())
+                if u.path == "/api/raid":
+                    return self.reply(200, cached("raid", raid_status, ttl=30))
+                if u.path == "/api/logs":
+                    if not LOGS_ON:
+                        return self.reply(403, {"enabled": False, "error": "Log-Auszüge sind aus (NZBLAB_LOGS=1 und /var/log nur lesend einbinden)"})
+                    if not os.path.isdir(log_dir or LOG_DIR):
+                        return self.reply(409, {"enabled": True, "error": f"{log_dir or LOG_DIR} fehlt: /var/log nur lesend nach /host/log einbinden"})
+                    return self.reply(200, collect_logs(log_dir, max(1, min(hours, 168)), max(1, min(int(q.get("max", "200")), 1000))))
+            except Exception as e:  # noqa: BLE001
+                return self.reply(500, {"error": f"{type(e).__name__}: {e}"[:150]})
             if u.path == "/api/info":
                 return self.reply(200, {"version": VERSION, "hostname": socket.gethostname(), "interval": INTERVAL,
                                         "heat_alert": HEAT_ALERT, "push": bool(NTFY_URL), "since": store.first_t() or now,
@@ -3647,7 +4747,13 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                         "host_os": os.path.isfile(HOST_OS_RELEASE),
                                         "host_fs": sorted(n for n in (os.listdir(HOST_FS) if os.path.isdir(HOST_FS) else [])
                                                           if os.path.isdir(os.path.join(HOST_FS, n)))[:50],
-                                        "warnings": config_warnings()})
+                                        "warnings": config_warnings(),
+                                        # ab 1.15.0: Stand der Schnittstelle für die App (vergleicht mit ihrem Minimum; der Agent
+                                        # aktualisiert sich nie selbst), was eingeschaltet ist, letzter Neustart
+                                        "api_level": API_LEVEL, "features": agent_features(smart, backups, log_dir),
+                                        "last_boot": (boot_now() or (None,))[0],
+                                        "boots_7d": len(store.boots(now - 7 * 86400)),
+                                        "sampling_ok": sampling_ok()})
             if u.path == "/api/array" and array:
                 return self.reply(200, array.read() or {"state": "", "disks": []})
             if u.path == "/api/devices" and lan:
@@ -3714,6 +4820,11 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
 
         def do_POST(self):
             u = urlparse(self.path)
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                return self.reply(411, {"error": "Content-Length nötig (kein chunked)"})
+            if self.body_too_big(CRASH_MAX_BYTES * 2 if u.path == "/api/crash" else MAX_BODY):
+                return None
             if not self.authorized(tok):
                 return self.refuse()
             if u.path == "/api/config":
@@ -3816,6 +4927,9 @@ def main():
     tok = token()                          # als root anlegen und anzeigen, danach gehört er dem Benutzer (drop_privileges)
     announce_config()                      # laute Warnung mit Lösung, wenn nicht (nach dem Token, damit sie danach im Log steht)
     load_container_names()                 # braucht root (config.v2.json ist 600); einmal beim Start reicht
+    smart_helper = SmartHelper()
+    if SMART_ON and smart_helper.start():  # ab 1.15.0: nur smartctl bleibt root (eigener kleiner Prozess), vor dem Rechte-Abgeben
+        print("SMART an: Helfer für smartctl gestartet (nur --scan und -a, nie Selbsttests).", flush=True)
     who = drop_privileges()
     if who:
         print(f"Läuft als Benutzer {who[0]}:{who[1]} (PUID/PGID). Für alle Container-Namen und appdata-Grössen: PUID=0.", flush=True)
@@ -3833,6 +4947,16 @@ def main():
     lan = LanScan(f"{CONFIG}/devices.db", alerter("lan", "warn"))
     threading.Thread(target=run_prices, args=(stop, alerter("prices", "info")), daemon=True).start()
     threading.Thread(target=run_lan, args=(lan, stop), daemon=True).start()
+    smart = SmartMonitor(store, smart_helper)
+    backups = BackupScanner()
+    threading.Thread(target=run_extras, args=(store, stop, smart), daemon=True).start()
+    if SMART_ON:
+        threading.Thread(target=run_smart, args=(smart, stop), daemon=True).start()
+    if NET_ON:
+        threading.Thread(target=run_net, args=(store, stop), daemon=True).start()
+    threading.Thread(target=run_backups, args=(backups, stop), daemon=True).start()
+    print(f"Ab 1.15.0: SMART {'an' if SMART_ON else 'aus'}, Netz-Messung {'an' if NET_ON else 'aus'}, Log-Auszüge {'an' if LOGS_ON else 'aus'}, "
+          f"Backup-Pfade {len(BACKUP_PATHS)}, Backup-Suche {'an' if BACKUP_AUTO else 'aus'}.", flush=True)
     latest = {"v": None, "t": 0}
 
     def now_values():
@@ -3849,7 +4973,21 @@ def main():
         announce_config()                  # nochmals am Ende des Starts, damit sie im Log nicht untergeht
     print("Heute: Quellen", Today(store).sources(), flush=True)
     crashes = CrashStore(f"{CONFIG}/crashes")
-    ThreadingHTTPServer(("0.0.0.0", PORT), make_handler(store, now_values, tok, index, array, lan, Today(store), crashes)).serve_forever()
+    make_server(BIND, PORT, make_handler(store, now_values, tok, index, array, lan, Today(store), crashes, smart, backups)).serve_forever()
+
+
+def make_server(bind, port, handler):
+    """Ab 1.15.0: Adresse wählbar (NZBLAB_BIND, z. B. 127.0.0.1 hinter einem Proxy oder die LAN-Adresse); IPv6 mit «::»."""
+    try:
+        fam = socket.AF_INET6 if ipaddress.ip_address(bind).version == 6 else socket.AF_INET
+    except ValueError:
+        print(f"NZBLAB_BIND «{bind}» ist keine IP-Adresse: nehme 0.0.0.0", flush=True)
+        bind, fam = "0.0.0.0", socket.AF_INET
+
+    class Server(ThreadingHTTPServer):
+        address_family = fam
+        daemon_threads = True
+    return Server((bind, port), handler)
 
 
 if __name__ == "__main__":

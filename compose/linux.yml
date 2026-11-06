@@ -10,6 +10,10 @@
 # Netzwerk «host»: Der Agent sieht die echten Netzwerkkarten und IP-Adressen des Servers. Port 8099 nie ins Internet freigeben.
 # Docker-Container steuert die App über Portainer (eigener Dienst in der App), nicht über den Agenten: kein docker.sock hier.
 # Code und Anleitung (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
+# Ab 1.15.0 freiwillige Zusätze (SMART, Log-Auszüge, Backups, Netz-Messung aus): Blöcke S, L, B2 in ../docker-compose.yml.
+# SMART auf Linux: «user:» und «cap_drop: ALL» unten ersetzen durch PUID/PGID «65534» unter environment und
+#   cap_drop: [ALL]  +  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_RAWIO]
+# (Start als root nur für /config und den kleinen smartctl-Helfer, danach läuft der Agent als 65534 ohne Rechte).
 services:
   nzblab-agent:
     image: ghcr.io/tuxxler/nzblab-agent:latest

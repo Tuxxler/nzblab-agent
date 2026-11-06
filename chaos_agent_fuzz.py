@@ -63,7 +63,9 @@ class ChaosAgentTest(unittest.TestCase):
         cls.crashes = a.CrashStore(os.path.join(cls.dir, "crashes"))
         store = a.Store(":memory:")
         store.add({"t": int(time.time()), "cpu": 5.0})
-        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(store, lambda: {"cpu": 1.0}, TOK, index=cls.ix, crashes=cls.crashes))
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(store, lambda: {"cpu": 1.0}, TOK, index=cls.ix, crashes=cls.crashes,
+                                                                               # Token-Bremse (ab 1.15.0) hier aus: der Test schickt absichtlich Hunderte falsche Tokens
+                                                                               limiter=a.AuthLimiter(max_fail=10**9)))
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         cls.port = cls.srv.server_port
         cls.findings = []
@@ -231,6 +233,23 @@ class ChaosAgentTest(unittest.TestCase):
         if errs:
             self.findings.append(f"Parallel-Flut: {len(errs)} von 100 ohne 200, z. B. {errs[:3]}")
         self.assertTrue(self.alive())
+
+    def test_token_bremse_flut(self):
+        """Ab 1.15.0: 50 falsche Tokens schnell hintereinander → danach 429 statt 401, Ping bleibt erreichbar."""
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(a.Store(":memory:"), lambda: {}, TOK))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            codes = []
+            for i in range(50):
+                h = f"GET /api/info HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Bearer falsch{i}\r\n\r\n"
+                codes.append(status(raw(srv.server_port, h.encode())[0]))
+            if codes.count(429) < 40:
+                self.findings.append(f"Token-Bremse greift nicht: {codes.count(429)} von 50 mit 429")
+            ok = status(raw(srv.server_port, b"GET /api/ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")[0])
+            self.assertEqual(ok, 200)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_halbe_anfragen_ohne_token(self):
         """Slowloris: 200 Verbindungen ohne Token schicken nur den Anfang der Kopfzeilen. Werden sie je geschlossen?"""

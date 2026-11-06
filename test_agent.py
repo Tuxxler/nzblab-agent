@@ -123,7 +123,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.14.0")
+        self.assertEqual(info["version"], "1.15.0")
         srv.shutdown()
 
 
@@ -159,7 +159,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.14.0")
+            self.assertEqual(r["version"], "1.15.0")
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents
@@ -1455,7 +1455,7 @@ class ConfigPersistTest(unittest.TestCase):
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
             ping = json.load(urllib.request.urlopen(base + "/api/ping"))
-            self.assertEqual(set(ping), {"ok", "version", "config_persistent"})   # ohne Token nur der Wahrheitswert
+            self.assertEqual(set(ping), {"ok", "version", "config_persistent", "api_level", "sampling_ok"})   # ohne Token nur der Wahrheitswert
             self.assertIs(ping["config_persistent"], False)
             info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
             self.assertIs(info["config_persistent"], False)
@@ -1650,9 +1650,6 @@ class Precompute113Test(unittest.TestCase):
             self.assertEqual(a.settings(), {"price_country": "CH", "agent_id": "a" * 32})
             self.assertFalse([f for f in os.listdir(d) if ".broken-" in f])
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class LinuxHostTest(unittest.TestCase):
@@ -1861,3 +1858,491 @@ class LinuxLastTest(unittest.TestCase):
                 self.assertLess(time.time() - t0, 0.2)
         finally:
             gate.set()
+
+
+FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixtures")
+
+
+def fixture(name):
+    with open(os.path.join(FIX, name)) as f:
+        return f.read()
+
+
+class Server115:
+    """Agent-Server auf einem freien Port für die Tests von 1.15.0."""
+
+    def __init__(self, store=None, **kw):
+        self.store = store or a.Store(":memory:")
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(self.store, lambda: {}, "geheim", **kw))
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.port = self.srv.server_port
+
+    def get(self, path, tok="geheim", headers=None):
+        h = dict(headers or {})
+        if tok:
+            h["Authorization"] = f"Bearer {tok}"
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read()), r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}"), e.headers
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class Agent115Test(unittest.TestCase):
+    """1.15.0: Neustarts, Plattentemperaturen, Netz, SMART, Backups, RAID, Logs, Token-Bremse, Grössenlimit, Gesundheit."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    # --- Neustarts
+    def test_neustarts_erkennen(self):
+        st = a.Store(":memory:")
+        t0 = 1_760_000_000
+        self.assertTrue(st.note_boot(t0, 100, now=t0 + 100))            # erster Start: neu, Vorlaufzeit unbekannt
+        self.assertFalse(st.note_boot(t0 + 1, 3700, now=t0 + 3700))     # NTP stellt die Uhr um 1 s: derselbe Start
+        self.assertFalse(st.note_boot(t0, 7300, now=t0 + 7300))         # nur der Container neu gestartet
+        self.assertTrue(st.note_boot(t0 + 8000, 60, now=t0 + 8060))     # Betriebszeit kleiner → Neustart
+        # Agent war während des Neustarts gestoppt und die neue Betriebszeit ist schon grösser: trotzdem erkannt
+        self.assertTrue(st.note_boot(t0 + 90000, 9000, now=t0 + 99000))
+        b = st.boots(0)
+        self.assertEqual([x["boot_time"] for x in b], [t0 + 90000, t0 + 8000, t0])
+        self.assertEqual(b[1]["previous_uptime_s"], 7300)
+        self.assertEqual(b[0]["previous_uptime_s"], 60)
+        self.assertIsNone(b[2]["previous_uptime_s"])
+        self.assertEqual({x["planned"] for x in b}, {"unknown"})
+
+    def test_boot_aus_proc_und_endpunkt(self):
+        write(f"{self.d}/proc/uptime", "3600.55 7000.00\n")
+        write(f"{self.d}/proc/stat", "cpu  1 2 3 4\nbtime 1760000000\n")
+        self.assertEqual(a.boot_now(f"{self.d}/proc"), (1760000000, 3600))
+        st = a.Store(":memory:")
+        self.assertTrue(a.check_boot(st, f"{self.d}/proc", now=1760003600))
+        self.assertFalse(a.check_boot(st, f"{self.d}/proc", now=1760003660))
+        srv = Server115(st)
+        try:
+            code, body, _ = srv.get("/api/boots?days=36500")
+            self.assertEqual(code, 200)
+            self.assertEqual(body["boots"][0]["boot_time"], 1760000000)
+            code, info, _ = srv.get("/api/info")
+            for k in ("api_level", "features", "last_boot", "boots_7d", "sampling_ok"):
+                self.assertIn(k, info)
+            self.assertEqual(info["api_level"], 15)
+            self.assertIn("boots", info["features"])
+            self.assertNotIn("smart", info["features"])
+            self.assertNotIn("logs", info["features"])
+            self.assertEqual(srv.get("/api/boots?days=x")[0], 400)
+        finally:
+            srv.close()
+
+    # --- Plattentemperaturen: Aufbewahrung und Verdichtung
+    def test_plattentemperaturen_pro_geraet(self):
+        sysd = f"{self.d}/sys"
+        write(f"{sysd}/block/sda/device/hwmon/hwmon3/temp1_input", "35000")
+        write(f"{sysd}/block/sda/device/model", "ST16000NT001")
+        write(f"{sysd}/block/nvme0n1/device/hwmon2/temp1_input", "41850")
+        write(f"{sysd}/block/sdb/size", "1")           # ohne Temperatur (schläft): kommt aus SMART, falls bekannt
+        os.makedirs(f"{sysd}/block/loop0", exist_ok=True)
+        smart = {"/dev/sdb": {"device_name": "sdb", "temp": 31, "standby": False}}
+        self.assertEqual(a.disk_temps(sysd, smart), {"sda": 35, "nvme0n1": 42, "sdb": 31})
+        st = a.Store(":memory:")
+        a.record_disk_temps(st, sysd, now=1_760_000_000)
+        self.assertEqual(st.latest_series("disk:")["sda"]["v"], 35)
+
+    def test_reihen_verdichtet_nach_zwei_tagen(self):
+        st = a.Store(":memory:")
+        h0 = 1_760_000_000 // 86400 * 86400
+        for i in range(40 * 24 * 12):                  # 40 Tage alle 5 Minuten
+            t = h0 + i * 300
+            st.add_series(t, {"disk:sda": 30 + (i % 12), "disk:sdb": None})
+        now = h0 + 40 * 86400
+        raw = st.series("disk:", 0, "raw")["sda"]
+        self.assertGreaterEqual(raw[0][0], now - 2 * 86400 - 300)      # Rohwerte nur 2 Tage
+        self.assertLessEqual(len(raw), 2 * 24 * 12 + 1)
+        hourly = st.series("disk:", now - 35 * 86400, "hour")["sda"]
+        self.assertGreaterEqual(len(hourly), 35 * 24 - 1)              # ≥ 35 Tage Stundenwerte
+        self.assertEqual(hourly[0][1:], [35.5, 41.0])                 # Mittel, Höchstwert
+        daily = st.series("disk:", now - 35 * 86400, "day")["sda"]
+        self.assertTrue(34 <= len(daily) <= 36, len(daily))
+        self.assertNotIn("sdb", st.series("disk:", 0, "raw"))
+        r = a.disktemps_reply(st, 35, None, sys_root=self.d, now=now)
+        self.assertEqual(r["res"], "day")
+        self.assertEqual(r["fields"], ["t", "avg", "max"])
+        self.assertLess(len(json.dumps(r)), 5000)                      # Antwort bleibt klein
+        self.assertEqual(a.series_res(7, None), "hour")
+        self.assertEqual(a.series_res(30, "raw"), "hour")
+        self.assertEqual(a.series_res(1, None), "raw")
+
+    # --- Netz
+    def test_netz_gateway_und_verlauf(self):
+        # Default-Route über 192.168.1.1 (hex little endian 0101A8C0)
+        write(f"{self.d}/proc/net/route", "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n"
+                                          "eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\n"
+                                          "eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\n")
+        self.assertEqual(a.default_gateway(f"{self.d}/proc"), "192.168.1.1")
+        self.assertEqual(a.parse_target("1.1.1.1:443"), ("1.1.1.1", 443))
+        self.assertEqual(a.parse_target("[2606:4700::1111]:53"), ("2606:4700::1111", 53))
+        self.assertIsNone(a.parse_target("x:99999"))
+        self.assertIsNone(a.parse_target("http://evil"))
+        answers = iter([5.0, None, 7.0, None, None, None])
+        vals = a.net_round({"gateway": ("192.168.1.1", 53), "internet": ("1.1.1.1", 443)}, probe=lambda h, p: next(answers))
+        self.assertEqual(vals["net:gateway:rtt"], 7.0)
+        self.assertAlmostEqual(vals["net:gateway:loss"], 33.3)
+        self.assertIsNone(vals["net:internet:rtt"])
+        self.assertEqual(vals["net:internet:loss"], 100.0)
+        st = a.Store(":memory:")
+        st.add_series(int(time.time()), vals)
+        r = a.net_reply(st, 1, proc_dir=f"{self.d}/proc")
+        self.assertEqual(r["series"]["gateway"]["rtt"][0][1], 7.0)
+        self.assertEqual(r["latest"]["internet"]["loss"], 100.0)
+        self.assertEqual(r["targets"]["gateway"], "192.168.1.1:53")
+
+    def test_tcp_probe_echt(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        try:
+            self.assertIsNotNone(a.tcp_probe("127.0.0.1", s.getsockname()[1], 1))
+        finally:
+            s.close()
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+        free.close()
+        self.assertIsNotNone(a.tcp_probe("127.0.0.1", port, 1))      # abgelehnt (RST) = Antwort
+
+    # --- SMART
+    def test_smart_befehle_nur_lesen(self):
+        self.assertEqual(a.smartctl_args("scan"), ["smartctl", "--scan", "--json=c"])
+        self.assertEqual(a.smartctl_args("read", "/dev/sda", "sat"), ["smartctl", "--json=c", "-a", "-n", "standby", "-d", "sat", "/dev/sda"])
+        for bad in [("read", "/dev/sda; reboot", None), ("read", "-t long", None), ("read", "/dev/sda", "sat -t long"),
+                    ("read", "/etc/shadow", None), ("test", "/dev/sda", None), ("read", "/dev/../etc", None), ("read", 5, None)]:
+            self.assertIsNone(a.smartctl_args(*bad), bad)
+        for args in (a.smartctl_args("scan"), a.smartctl_args("read", "/dev/nvme0", "nvme")):
+            self.assertFalse({"-t", "--test", "-s", "--smart", "-o", "-S", "--set", "-X"} & set(args))
+
+    def test_smart_json_ata_nvme_standby(self):
+        devs = a.parse_smart_scan(fixture("smartctl_scan.json"))
+        self.assertEqual([d["name"] for d in devs], ["/dev/sda", "/dev/nvme0", "/dev/sdc"])
+        self.assertIsNone(devs[2]["type"])
+        p = a.parse_smart(fixture("smartctl_ata.json"))
+        self.assertEqual((p["model_name"], p["serial_number"], p["power_on_hours"], p["temp"]), ("ST16000NT001-3LV101", "ZRS0TEST", 10712, 36))
+        self.assertEqual((p["reallocated"], p["pending"], p["uncorrectable"], p["crc"]), (8, 2, 0, 3))
+        self.assertEqual(p["attrs"]["5"]["raw_value"], 8)
+        self.assertEqual(p["rotational_speed"], 7200)
+        self.assertTrue(p["smart_passed"])
+        self.assertFalse(p["standby"])
+        n = a.parse_smart(fixture("smartctl_nvme.json"))
+        self.assertEqual((n["media_errors"], n["percentage_used"], n["power_on_hours"], n["temp"], n["unsafe_shutdowns"]), (0, 3, 4321, 41, 9))
+        self.assertEqual(n["attrs"]["percentage_used"]["raw_value"], 3)
+        self.assertEqual(n["device_protocol"], "NVMe")
+        self.assertTrue(a.parse_smart(fixture("smartctl_standby.json"))["standby"])
+        self.assertIsNone(a.parse_smart("kein json"))
+        row = a.smart_day_row(p)
+        self.assertEqual({k: row[k] for k in ("realloc", "pending", "uncorr", "crc", "temp_max", "hours")},
+                         {"realloc": 8, "pending": 2, "uncorr": 0, "crc": 3, "temp_max": 36, "hours": 10712})
+
+    def test_smart_monitor_tageswerte_und_endpunkte(self):
+        class FakeHelper:
+            def __init__(self):
+                self.calls, self.standby = [], False
+
+            def call(self, op, dev=None, dtype=None):
+                self.calls.append((op, dev, dtype))
+                if op == "scan":
+                    return 0, json.dumps({"devices": [{"name": "/dev/sda", "type": "sat"}]})
+                return 0, fixture("smartctl_standby.json" if self.standby else "smartctl_ata.json")
+        st = a.Store(":memory:")
+        h = FakeHelper()
+        mon = a.SmartMonitor(st, h, enabled=True)
+        t = int(time.time())
+        mon.poll(t)
+        h.standby = True
+        mon.poll(t + 60)                                  # schlafend: letzter Stand bleibt, kein neuer Tageswert
+        cur = mon.current()
+        self.assertEqual(cur["disks"][0]["serial_number"], "ZRS0TEST")
+        self.assertTrue(cur["disks"][0]["standby"])
+        self.assertEqual(h.calls[1], ("read", "/dev/sda", "sat"))
+        hist = mon.history(30, now=t + 60)
+        self.assertEqual(hist["disks"][0]["serial"], "ZRS0TEST")
+        self.assertEqual(len(hist["disks"][0]["rows"]), 1)
+        self.assertEqual(hist["disks"][0]["rows"][0]["realloc"], 8)
+        # gleicher Tag, höhere Temperatur früher: Höchstwert bleibt
+        st.add_smart_day("ZRS0TEST", dict(a.smart_day_row(a.parse_smart(fixture("smartctl_ata.json"))), temp_max=30), t + 120)
+        self.assertEqual(st.smart_days(0)["ZRS0TEST"][0]["temp_max"], 36)
+        srv = Server115(st, smart=mon)
+        try:
+            code, body, _ = srv.get("/api/smart")
+            self.assertEqual(code, 200)
+            self.assertTrue(body["enabled"])
+            code, body, _ = srv.get("/api/smart/history?days=7")
+            self.assertEqual(body["disks"][0]["rows"][0]["hours"], 10712)
+        finally:
+            srv.close()
+        off = a.SmartMonitor(st, FakeHelper(), enabled=False).current()
+        self.assertFalse(off["enabled"])
+        self.assertIn("NZBLAB_SMART", off["error"])
+
+    @unittest.skipUnless(hasattr(os, "fork") and os.geteuid() == 0, "nur als root prüfbar")
+    def test_smart_helfer_prozess(self):
+        h = a.SmartHelper()
+        self.assertTrue(h.start())
+        try:
+            with patch.object(a, "run_smartctl", side_effect=AssertionError("Hauptprozess darf nicht selbst starten")):
+                rc, out = h.call("scan")          # läuft im Helfer (smartctl fehlt hier vermutlich: 127)
+            self.assertIn(rc, (0, 1, 2, 4, 127))
+            self.assertEqual(h.call("read", "/dev/sda; reboot"), (2, ""))
+        finally:
+            h.sock.close()
+            os.waitpid(h.pid, 0)
+
+    # --- Backups
+    def _restic(self, path, t):
+        for sub in ("data", "keys", "index", "snapshots"):
+            os.makedirs(f"{path}/{sub}", exist_ok=True)
+        write(f"{path}/config", "x")
+        for i, ts in enumerate((t - 86400, t)):
+            write(f"{path}/snapshots/{i:064x}", "enc")
+            os.utime(f"{path}/snapshots/{i:064x}", (ts, ts))
+
+    def test_backup_repos_erkennen(self):
+        t = 1_760_000_000
+        share = f"{self.d}/mnt/user"
+        self._restic(f"{share}/backups/restic-repo", t)
+        borg = f"{share}/backups/borg"
+        write(f"{borg}/README", "This is a Borg Backup repository.\nSee https://borgbackup.readthedocs.io/\n")
+        write(f"{borg}/config", "[repository]\nversion = 1\n")
+        write(f"{borg}/index.42", "x")
+        write(f"{borg}/hints.42", "x")
+        os.utime(f"{borg}/index.42", (t - 3600, t - 3600))
+        os.utime(f"{borg}/hints.42", (t - 7200, t - 7200))
+        kopia = f"{share}/data/kopia"
+        write(f"{kopia}/kopia.repository.f", "{}")
+        write(f"{kopia}/xn0/_abc.f", "x")
+        write(f"{kopia}/q12/q12345.f", "x")
+        write(f"{kopia}/p00/p00123.f", "x")
+        os.utime(f"{kopia}/xn0/_abc.f", (t - 60, t - 60))
+        os.utime(f"{kopia}/q12/q12345.f", (t - 600, t - 600))
+        os.utime(f"{kopia}/p00/p00123.f", (t + 999, t + 999))   # Datenblöcke zählen nicht
+        write(f"{share}/Filme/Film (2020)/film.mkv", "x")
+        self.assertEqual(a.detect_repo(f"{share}/backups/restic-repo"), "restic")
+        self.assertEqual(a.detect_repo(borg), "borg")
+        self.assertEqual(a.detect_repo(kopia), "kopia")
+        self.assertIsNone(a.detect_repo(f"{share}/Filme"))
+        found = {b["kind"]: b for b in a.scan_backups(auto_roots=[share])}
+        self.assertEqual(found["restic"]["last_success"], t)
+        self.assertEqual(found["restic"]["snapshots"], 2)
+        self.assertEqual(found["borg"]["last_success"], t - 3600)
+        self.assertEqual(found["kopia"]["last_success"], t - 60)
+        self.assertIsNone(found["restic"]["last_error"])              # ehrlich: unbekannt
+        self.assertEqual(found["restic"]["found_by"], "auto")
+
+    def test_backup_log_und_endpunkt(self):
+        log = f"{self.d}/logs/rsync-backup.log"
+        write(log, fixture("backup_rsync.log"))
+        info = a.backup_log_info(log)
+        self.assertEqual(info["kind"], "rsync")
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.localtime(info["last_success"])), "2026-11-06 03:15")
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.localtime(info["last_error"])), "2026-11-05 03:00")
+        self.assertIn("rsync error", info["error_text"])
+        self.assertNotIn("/mnt/user/data/", info["error_text"])
+        bs = a.BackupScanner(explicit=[log, f"{self.d}/fehlt"], auto_roots=[], auto=False)
+        bs.refresh()
+        srv = Server115(backups=bs)
+        try:
+            code, body, _ = srv.get("/api/backups")
+            self.assertEqual(code, 200)
+            kinds = {b["kind"] for b in body["backups"]}
+            self.assertEqual(kinds, {"rsync", "unknown"})
+            for b in body["backups"]:
+                self.assertEqual(set(b) >= {"kind", "name", "last_success", "last_error", "source"}, True)
+        finally:
+            srv.close()
+
+    # --- RAID
+    def test_mdstat_zfs_btrfs(self):
+        md = {p["name"]: p for p in a.parse_mdstat(fixture("mdstat_raid.txt"))}
+        self.assertTrue(md["md1"]["degraded"])
+        self.assertEqual(md["md1"]["level"], "raid5")
+        self.assertEqual(md["md1"]["sync"], {"action": "recovery", "percent": 12.6, "finish_min": 284.3})
+        self.assertTrue([d for d in md["md1"]["devices"] if d["name"] == "sdd1"][0]["failed"])
+        self.assertFalse(md["md0"]["degraded"])
+        self.assertEqual((md["md0"]["total"], md["md0"]["active"]), (2, 2))
+        self.assertEqual(md["md2"]["sync"]["waiting"], "pending")
+        self.assertIn("read-only", md["md2"]["state"])
+        self.assertTrue(md["md127"]["degraded"])                     # inaktiv
+        self.assertEqual(a.parse_mdstat("mdState=STARTED\nmdResync=0\n")[0]["kind"], "unraid")
+        proc = f"{self.d}/proc"
+        write(f"{proc}/spl/kstat/zfs/tank/state", "DEGRADED\n")
+        write(f"{proc}/spl/kstat/zfs/backup/state", "ONLINE\n")
+        pools, src = a.zfs_pools(proc)
+        self.assertEqual(src, "kstat")
+        self.assertEqual({p["name"]: p["degraded"] for p in pools}, {"tank": True, "backup": False})
+        pools, src = a.zfs_pools(f"{self.d}/leer", run=lambda: "rpool\tONLINE\n")
+        self.assertEqual((src, pools[0]["name"]), ("zpool", "rpool"))
+        sysd = f"{self.d}/sys"
+        u = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+        write(f"{sysd}/fs/btrfs/{u}/label", "pool")
+        os.makedirs(f"{sysd}/fs/btrfs/{u}/allocation/data/raid1", exist_ok=True)
+        os.makedirs(f"{sysd}/fs/btrfs/{u}/allocation/metadata/raid1c3", exist_ok=True)
+        os.makedirs(f"{sysd}/fs/btrfs/{u}/devices/sdb", exist_ok=True)
+        write(f"{sysd}/fs/btrfs/{u}/devinfo/1/error_stats", "write_errs 0\nread_errs 2\nflush_errs 0\ncorruption_errs 1\ngeneration_errs 0\n")
+        write(f"{sysd}/fs/btrfs/{u}/devinfo/1/missing", "0")
+        write(f"{sysd}/fs/btrfs/{u}/devinfo/2/missing", "1")
+        os.makedirs(f"{sysd}/fs/btrfs/features", exist_ok=True)
+        bt = a.btrfs_pools(sysd)
+        self.assertEqual(len(bt), 1)
+        self.assertEqual(bt[0]["profiles"], {"data": "raid1", "metadata": "raid1c3"})
+        self.assertEqual(bt[0]["errors"], 3)
+        self.assertTrue(bt[0]["degraded"])
+        write(f"{proc}/mdstat", fixture("mdstat_raid.txt"))
+        r = a.raid_status(proc, sysd)
+        self.assertTrue(r["degraded"])
+        self.assertEqual(r["sources"], {"mdadm": True, "zfs": "kstat", "btrfs": True})
+        self.assertEqual(len(r["pools"]), 4 + 2 + 1)
+
+    # --- Logs
+    def test_logs_gefiltert(self):
+        now = int(time.time())
+        lines = fixture("syslog_sample.txt").splitlines()
+        out = [time.strftime("%b %e %H:%M:%S", time.localtime(now - 3600 + i * 10)) + l[15:] for i, l in enumerate(lines)]
+        out.insert(0, time.strftime("%b %e %H:%M:%S", time.localtime(now - 3 * 86400)) + " tower kernel: error: alt")
+        write(f"{self.d}/log/syslog", "\n".join(out) + "\n")
+        r = a.collect_logs(f"{self.d}/log", hours=24, limit=200, now=now)
+        text = json.dumps(r, ensure_ascii=False)
+        for secret in ("203.0.113.77", "192.168.1.20", "2001:db8::42", "00:11:22:33:44:55", "hans.muster@example.com", "hunter2",
+                       "abcdef1234567890", "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg", "eyJhbGciOiJIUzI1NiJ9", "geheim123",
+                       "maria", "Steuern", "admin", "tower", "bob"):
+            self.assertNotIn(secret, text, secret)
+        self.assertNotIn("alt", [l["text"] for l in r["lines"]])          # älter als 24 h
+        self.assertNotIn("CMD", text)                                    # Routine (keine Fehlerzeile)
+        io_err = [l for l in r["lines"] if "I/O error" in l["text"]]
+        self.assertEqual(len(io_err), 1)
+        self.assertEqual(io_err[0]["n"], 2)                               # gleiche Meldung zusammengefasst
+        self.assertEqual(io_err[0]["src"], "kernel")
+        self.assertIn("timed out", text)                                 # Warnung mit Zeit «12:34:56» bleibt lesbar
+        self.assertEqual(a.collect_logs(f"{self.d}/log", 24, 2, now)["lines"].__len__(), 2)
+
+    def test_redaktion(self):
+        r = a.redact_log
+        self.assertEqual(r("um 12:34:56 fertig"), "um 12:34:56 fertig")
+        self.assertEqual(r("from 10.0.0.5 port 22"), "from <ip> port 22")
+        self.assertEqual(r("fe80::1%eth0 up"), "<ip> up")
+        self.assertEqual(r("mac aa:bb:cc:dd:ee:ff"), "mac <mac>")
+        self.assertEqual(r("MAC=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:08:00"), "MAC=<mac>")
+        self.assertEqual(r("a@b.ch"), "<email>")
+        self.assertEqual(r("password: hallo welt"), "password: <redacted> welt")
+        self.assertEqual(r("x api_key=\"a b\" y"), "x api_key=<redacted> y")
+        self.assertIn("<redacted>", r("Authorization: Bearer abcdefghijkl"))
+        self.assertEqual(r("/home/maria/x"), "/home/<user>/x")
+        self.assertNotIn("Ferien", r("/mnt/user/Fotos/Ferien/1.jpg"))
+
+    def test_logs_endpunkt_nur_freiwillig(self):
+        write(f"{self.d}/log/syslog", "")
+        srv = Server115(log_dir=f"{self.d}/log")
+        try:
+            with patch.object(a, "LOGS_ON", False):
+                self.assertEqual(srv.get("/api/logs")[0], 403)
+            with patch.object(a, "LOGS_ON", True):
+                code, body, _ = srv.get("/api/logs?hours=2&max=5")
+                self.assertEqual(code, 200)
+                self.assertTrue(body["redacted"])
+                code, info, _ = srv.get("/api/info")
+                self.assertIn("logs", info["features"])
+        finally:
+            srv.close()
+
+    # --- Sicherheit
+    def test_token_bremse(self):
+        lim = a.AuthLimiter(max_fail=10, window=60, block=300)
+        for i in range(9):
+            self.assertFalse(lim.fail("1.2.3.4", now=100 + i))
+        self.assertEqual(lim.blocked_for("1.2.3.4", now=110), 0)
+        self.assertTrue(lim.fail("1.2.3.4", now=110))
+        self.assertGreater(lim.blocked_for("1.2.3.4", now=111), 0)
+        self.assertEqual(lim.blocked_for("5.6.7.8", now=111), 0)           # andere Adresse nicht betroffen
+        self.assertEqual(lim.blocked_for("1.2.3.4", now=411), 0)           # nach 5 Minuten wieder frei
+        lim2 = a.AuthLimiter(max_fail=10, window=60, block=300)
+        for i in range(20):                                                 # langsam raten (1 pro 10 s) sperrt nicht
+            self.assertFalse(lim2.fail("1.2.3.4", now=i * 10))
+        srv = Server115()
+        try:
+            codes = [srv.get("/api/info", tok="falsch")[0] for _ in range(11)]
+            self.assertEqual(codes[:10], [401] * 10)                       # 10 Fehlversuche, danach gesperrt
+            self.assertEqual(codes[10], 429)
+            code, body, headers = srv.get("/api/info")                     # auch mit richtigem Token gesperrt
+            self.assertEqual(code, 429)
+            self.assertTrue(int(headers["Retry-After"]) > 0)
+            self.assertEqual(srv.get("/api/ping", tok=None)[0], 200)       # Ping bleibt
+            self.assertEqual(srv.get("/api/info", tok=None)[0], 429)
+        finally:
+            srv.close()
+
+    def test_grosse_anfragen_413(self):
+        from http.client import HTTPConnection
+        srv = Server115(crashes=a.CrashStore(f"{self.d}/crashes"))       # Absturzberichte behalten ihr Limit (128 000)
+        try:
+            for method, path, n, status in [("POST", "/api/config", 70000, 413), ("POST", "/api/files/refresh", 65537, 413),
+                                            ("GET", "/api/info", 100000, 413), ("POST", "/api/crash", 100000, 400)]:
+                conn = HTTPConnection("127.0.0.1", srv.port, timeout=3)
+                conn.putrequest(method, path)
+                conn.putheader("Authorization", "Bearer geheim")
+                conn.putheader("Content-Length", str(n))
+                conn.endheaders()
+                if status == 400:
+                    conn.send(b"x" * n)
+                r = conn.getresponse()
+                self.assertEqual(r.status, status, (method, path, n))
+                conn.close()
+            conn = HTTPConnection("127.0.0.1", srv.port, timeout=3)
+            conn.putrequest("POST", "/api/config")
+            conn.putheader("Transfer-Encoding", "chunked")
+            conn.endheaders()
+            self.assertEqual(conn.getresponse().status, 411)
+            conn.close()
+        finally:
+            srv.close()
+
+    def test_gesundheit_und_bind(self):
+        old = a.SAMPLER_STATE["last"]
+        srv = Server115()
+        try:
+            a.SAMPLER_STATE["last"] = time.time()
+            self.assertEqual(srv.get("/api/health", tok=None)[0], 200)
+            a.SAMPLER_STATE["last"] = time.time() - 3 * a.INTERVAL - 30
+            code, body, _ = srv.get("/api/health", tok=None)
+            self.assertEqual(code, 503)
+            self.assertFalse(body["ok"])
+            self.assertFalse(srv.get("/api/ping", tok=None)[1]["sampling_ok"])
+        finally:
+            a.SAMPLER_STATE["last"] = old
+            srv.close()
+        s = a.make_server("127.0.0.1", 0, a.make_handler(a.Store(":memory:"), lambda: {}, "geheim"))
+        self.assertEqual(s.server_address[0], "127.0.0.1")
+        s.server_close()
+        s = a.make_server("kein-ip", 0, a.make_handler(a.Store(":memory:"), lambda: {}, "geheim"))
+        self.assertEqual(s.server_address[0], "0.0.0.0")
+        s.server_close()
+
+    def test_raid_und_netz_endpunkte(self):
+        srv = Server115()
+        try:
+            code, body, _ = srv.get("/api/raid")
+            self.assertEqual(code, 200)
+            self.assertIn("pools", body)
+            with patch.object(a, "NET_ON", False):
+                code, body, _ = srv.get("/api/net?days=3")
+                self.assertEqual((code, body["enabled"], body["res"]), (200, False, "hour"))
+            code, body, _ = srv.get("/api/disktemps?days=1")
+            self.assertEqual((code, body["res"]), (200, "raw"))
+        finally:
+            srv.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

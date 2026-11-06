@@ -1,0 +1,7 @@
+2026-11-04 03:00:01 start rsync /mnt/user/data -> /mnt/disks/usb
+2026-11-04 03:12:45 sent 1,234,567 bytes  received 4,321 bytes  12,345.00 bytes/sec
+2026-11-04 03:12:45 total size is 9,876,543,210  speedup is 7,999.12
+2026-11-05 03:00:01 start rsync /mnt/user/data -> /mnt/disks/usb
+2026-11-05 03:00:09 rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338)
+2026-11-06 03:00:01 start rsync /mnt/user/data -> /mnt/disks/usb
+2026-11-06 03:15:00 sent 2,345,678 bytes  received 5,432 bytes  13,000.00 bytes/sec
