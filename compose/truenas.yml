@@ -29,6 +29,16 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    # Ab 1.16.1: nur die Rechte, die der Start braucht (/config dem Benutzer PUID geben, dann auf PUID/PGID wechseln);
+    # danach hat der Agent gar keine mehr. SMART (Block S): zusätzlich SYS_RAWIO unter cap_add.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m

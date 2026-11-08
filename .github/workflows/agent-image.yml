@@ -2,6 +2,10 @@
 # Build the image and publish it to ghcr.io/tuxxler/nzblab-agent.
 # Auslöser / trigger: Tag «v1.10.0» (Version = Teil nach «v») oder von Hand (Actions › Agent-Image › Run workflow).
 # Erstes Mal: GitHub › Packages › nzblab-agent › Package settings › Change visibility › Public.
+# Ab Agent 1.16.1 (Härtung): Rechte nur im Job und nur so viel wie nötig, Actions auf Commit-SHA festgenagelt (Kommentar =
+# Version, Dependabot/Renovate kann sie aktualisieren), kein pull_request(_target)-Auslöser, Checkout ohne gespeicherte
+# Zugangsdaten. Erst ein lokal gebautes amd64-Image wird mit den Container-Rechten der Vorlagen (read-only, cap-drop ALL,
+# no-new-privileges) gestartet und geprüft; nur wenn das klappt, werden Versions-Tag und «latest» hochgeladen.
 name: Agent-Image
 
 on:
@@ -14,9 +18,7 @@ on:
         required: false
         default: ""
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}               # Standard für alle Jobs: keine Rechte
 
 concurrency:
   group: agent-image-${{ github.ref }}
@@ -29,8 +31,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read            # Code lesen
+      packages: write           # Image nach ghcr.io (nur mit GITHUB_TOKEN dieses Laufs)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Agent-Tests
         run: python3 test_agent.py
@@ -59,18 +66,73 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130   # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f   # v3.12.0
+
+      - name: Für den Test bauen (amd64, nur lokal)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ steps.v.outputs.created }}
+          tags: nzblab-agent:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image gehärtet starten und prüfen (vor dem Hochladen)
+        shell: bash
+        env:
+          WANT_VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Bei einem Fehler die letzten Logzeilen zeigen, nie die Token-Zeile
+          trap 'docker logs agent-smoke 2>&1 | grep -v "Token:" | tail -n 30 || true' ERR
+          # Dieselben Rechte wie in docker-compose.yml und der Unraid-Vorlage (ab 1.16.1)
+          docker run -d --name agent-smoke -p 18099:8099 --read-only --tmpfs /tmp \
+            --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges:true nzblab-agent:smoke
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:18099/api/ping; then break; fi
+            sleep 1
+          done
+          # Antworten erst in Variablen lesen: «curl | grep -q» kann mit pipefail an SIGPIPE scheitern.
+          # GET mit -D statt «curl -I»: der Agent kennt kein HEAD (501).
+          ping=$(curl -fsS http://127.0.0.1:18099/api/ping)
+          grep -q "\"version\": \"${WANT_VERSION}\"" <<<"${ping}"
+          # Sicherheits-Kopfzeilen und CSP ohne 'unsafe-inline' für Skripte
+          api_headers=$(curl -fsS -D - -o /dev/null http://127.0.0.1:18099/api/ping)
+          grep -qi '^cache-control: no-store' <<<"${api_headers}"
+          grep -qi '^x-content-type-options: nosniff' <<<"${api_headers}"
+          page_headers=$(curl -fsS -D - -o /dev/null http://127.0.0.1:18099/)
+          csp=$(grep -i '^content-security-policy:' <<<"${page_headers}")
+          grep -q "script-src 'sha256-" <<<"${csp}"
+          if grep -q "script-src[^;]*unsafe-inline" <<<"${csp}"; then echo "::error::CSP erlaubt Inline-Skripte"; exit 1; fi
+          # Agent läuft nach dem Start als PUID 99, nicht als root
+          uid_line=$(docker exec agent-smoke sh -c 'grep "^Uid:" /proc/1/status')
+          grep -qE '^Uid:\s+99\s' <<<"${uid_line}"
+          # Token-Banner vorhanden (Inhalt nie ausgeben)
+          logs=$(docker logs agent-smoke 2>&1)
+          grep -q "NZBLab-Agent Token:" <<<"${logs}"
+          grep -v "Token:" <<<"${logs}" | tail -n 5 || true
+          unset logs
+          docker rm -f agent-smoke
 
       - name: Anmelden bei ghcr.io (GITHUB_TOKEN)
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9   # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bauen und hochladen (amd64, arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6.19.2
         with:
           context: .
           file: Dockerfile
@@ -89,21 +151,6 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Image kurz starten und /api/ping prüfen (amd64)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run -d --name agent-smoke -p 18099:8099 "${IMAGE}:${{ steps.v.outputs.version }}"
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18099/api/ping; then echo; break; fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:18099/api/ping | grep -q '"version": "${{ steps.v.outputs.version }}"'
-          # Token-Banner vorhanden (Inhalt nicht ausgeben)
-          docker logs agent-smoke 2>&1 | grep -q "NZBLab-Agent Token:"
-          docker logs agent-smoke 2>&1 | grep -v "Token:" | tail -n 5
-          docker rm -f agent-smoke
 
       - name: Zusammenfassung
         run: |

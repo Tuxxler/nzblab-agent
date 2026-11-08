@@ -13,6 +13,7 @@ Optional: Push-Meldung über ntfy, wenn die CPU zu lange zu heiss ist.
 Nur lesen: der Agent ändert nichts am NAS. Nur Python-Standardbibliothek.
 Konfiguration über Umgebungsvariablen (siehe README.md). Anfragen brauchen den Token (Header «Authorization: Bearer …»).
 """
+import base64
 import calendar
 import fnmatch
 import glob
@@ -35,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -192,8 +193,17 @@ def read(path, default=None):
     try:
         with open(path) as f:
             return f.read().strip()
-    except OSError:
+    except (OSError, ValueError):       # ab 1.16.1: auch kaputtes UTF-8 (UnicodeDecodeError) ergibt den Standardwert
         return default
+
+
+def read_head(path, limit=4096):
+    """Ab 1.16.1: nur den Anfang einer Datei aus einer Freigabe lesen (fremde Inhalte: Grösse und Kodierung unbekannt)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 
 # ---------------------------------------------------------------- Messen
@@ -813,6 +823,9 @@ class LanScan:
     danach die ARP-Tabelle des NAS lesen (/proc/1/net/arp des Hosts). Neue Geräte (nach der ersten Suche) → Push."""
 
     LAN_IF = ("br0", "eth0", "eth1", "bond0", "wlan0")
+    MAX_NEW = 64            # ab 1.16.1: höchstens so viele neue Geräte je Durchgang speichern
+    MAX_ALERTS = 5          # … und einzeln melden (danach eine Sammelmeldung)
+    MAX_DEVICES = 2000      # … und insgesamt merken (90 Tage), /api/devices liefert höchstens so viele
 
     def __init__(self, db_path, notify, proc=HOST_PROC):
         self.proc, self.notify = proc, notify
@@ -822,6 +835,7 @@ class LanScan:
             self.db.execute("CREATE TABLE IF NOT EXISTS devices (mac TEXT PRIMARY KEY, ip TEXT, host TEXT, first INTEGER, last INTEGER)")
             self.db.commit()
         self.running = False
+        self._scan_guard = threading.Lock()     # ab 1.16.1 (Audit Restteile): nie zwei Suchen gleichzeitig
 
     def arp_path(self):
         """Geräte-Tabelle des NAS. Über /host/proc/1/net verweigert Docker den Zugriff oft (fehlende Rechte trotz Pfad);
@@ -857,9 +871,18 @@ class LanScan:
         return out
 
     def scan(self):
-        if self.running or not self.available():
+        # Prüfen und Setzen in einem Schritt (vorher zwei Schritte: zwei schnelle POST /api/devices/scan starteten zwei Suchen)
+        if not self._scan_guard.acquire(blocking=False):
             return
-        self.running = True
+        try:
+            if self.running or not self.available():
+                return
+            self.running = True
+            self._scan()
+        finally:
+            self._scan_guard.release()
+
+    def _scan(self):
         try:
             known = self.arp()
             nets = {ip.rsplit(".", 1)[0] for ip in known.values() if ip.count(".") == 3}
@@ -875,23 +898,31 @@ class LanScan:
             now = int(time.time())
             with self.lock:
                 first_scan = self.db.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 0
-                new = []
+                total = self.db.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+                new, skipped = [], 0
                 for mac, ip in found.items():
                     row = self.db.execute("SELECT mac FROM devices WHERE mac=?", (mac,)).fetchone()
                     if row:
                         self.db.execute("UPDATE devices SET ip=?, last=? WHERE mac=?", (ip, now, mac))
-                    else:
+                    # Erster Durchgang (Review 1.16.1): alle bis MAX_DEVICES übernehmen, sonst meldete der zweite Durchgang
+                    # in Netzen mit über 64 Geräten bekannte Geräte als «neu»
+                    elif (first_scan or len(new) < self.MAX_NEW) and total + len(new) < self.MAX_DEVICES:
                         self.db.execute("INSERT INTO devices VALUES (?,?,?,?,?)", (mac, ip, "", now, now))
                         new.append((mac, ip))
+                    else:
+                        skipped += 1            # ab 1.16.1: Flut neuer MACs (gefälschte ARP-Antworten) begrenzen
                 self.db.commit()
-            for mac, ip in new:
+            for n, (mac, ip) in enumerate(new):
                 host = self.lookup(ip)
                 if host:
                     with self.lock:
                         self.db.execute("UPDATE devices SET host=? WHERE mac=?", (host, mac))
                         self.db.commit()
-                if not first_scan:
+                if not first_scan and n < self.MAX_ALERTS:
                     self.notify("Neues Gerät im Heimnetz", f"{host or 'ohne Namen'} · {ip} · {mac}. Kennst du es nicht: im Router nachsehen.")
+            extra = (len(new) - self.MAX_ALERTS if len(new) > self.MAX_ALERTS else 0) + skipped
+            if not first_scan and extra:
+                self.notify("Viele neue Geräte im Heimnetz", f"{extra} weitere neue Geräte in einem Durchgang. Ungewöhnlich: im Router nachsehen.")
         finally:
             self.running = False
 
@@ -906,7 +937,8 @@ class LanScan:
                 pass
         t = threading.Thread(target=run, daemon=True)
         t.start(); t.join(2)
-        return out[0]
+        # ab 1.16.1: Namen aus dem Netz nur druckbar und höchstens 253 Zeichen (gehen in Datenbank und Push-Text)
+        return "".join(c for c in out[0] if c.isprintable())[:253]
 
     def cleanup(self, days):
         """Geräte, die länger als [days] Tage nicht mehr gesehen wurden, vergessen (wechselnde Handy-MACs)."""
@@ -916,7 +948,7 @@ class LanScan:
 
     def devices(self):
         with self.lock:
-            rows = self.db.execute("SELECT mac, ip, host, first, last FROM devices ORDER BY last DESC").fetchall()
+            rows = self.db.execute("SELECT mac, ip, host, first, last FROM devices ORDER BY last DESC LIMIT ?", (self.MAX_DEVICES,)).fetchall()
         return [{"mac": r[0], "ip": r[1], "host": r[2], "first": r[3], "last": r[4]} for r in rows]
 
 
@@ -984,6 +1016,10 @@ def nic_info(sys_dir=None, proc_dir=None):
     drv = os.path.basename(os.path.realpath(f"{net}/{cur}/device/driver")) if os.path.exists(f"{net}/{cur}/device/driver") else ""
     return {"iface": cur, "via": default if default != cur else "", "speed_mbit": speed(cur) or speed(default),
             "model": NIC_MODELS.get((vendor, device)) or NIC_VENDORS.get(vendor, ""), "driver": drv}
+
+
+SPEED_LOCK = threading.Lock()       # ab 1.16.1 (Audit Restteile): höchstens eine Messung gleichzeitig
+NOTIFY_TEST_LOCK = threading.Lock()  # … und höchstens ein Test-Push gleichzeitig
 
 
 def speedtest():
@@ -1082,6 +1118,7 @@ class FileIndex:
         self._cache = {}                   # Name -> {"key": Stand des Index, "value": Ergebnis, "computed_at": Zeit}
         self._calc = {}                    # Name -> laufender Rechen-Thread
         self._calc_guard = threading.Lock()
+        self._build_guard = threading.Lock()  # ab 1.16.1 (Audit Restteile): nie zwei Index-Läufe gleichzeitig
 
     def available(self):
         return os.path.isdir(self.root)
@@ -1092,9 +1129,19 @@ class FileIndex:
         return r[0] if r else default
 
     def build(self):
-        if self.state["running"] or not self.available():
+        # Prüfen und Setzen in einem Schritt: zwei schnelle POST /api/files/refresh liefen sonst gleichzeitig in dieselbe
+        # Tabelle files_new (einer löschte sie dem anderen unter den Händen weg) und lasen alle Platten doppelt
+        if not self._build_guard.acquire(blocking=False):
             return
-        self.state = {"running": True, "dirs": 0, "files": 0, "error": None}
+        try:
+            if self.state["running"] or not self.available():
+                return
+            self.state = {"running": True, "dirs": 0, "files": 0, "error": None}
+            self._build()
+        finally:
+            self._build_guard.release()
+
+    def _build(self):
         started = time.time()
         try:
             with self.lock:
@@ -1399,7 +1446,7 @@ class FileIndex:
             done = []
             for p, size, mtime in items:
                 try:
-                    h = partial_hash(os.path.join(self.root, p), size)
+                    h = partial_hash(os.path.join(self.root, p), size, self.root)
                 except OSError:
                     h = "!"
                 done.append((p, size, mtime, h))
@@ -1485,14 +1532,28 @@ class FileIndex:
         return (last, previous), out
 
 
-def partial_hash(path, size):
-    """sha1 aus erstem und letztem MiB plus Grösse: liest höchstens 2 MiB, egal wie gross die Datei ist."""
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        h.update(f.read(HASH_PART))
-        if size > HASH_PART:
-            f.seek(max(HASH_PART, size - HASH_PART))
+def partial_hash(path, size, root=None):
+    """sha1 aus erstem und letztem MiB plus Grösse: liest höchstens 2 MiB, egal wie gross die Datei ist.
+    Ab 1.16.1 (Audit Restteile): nur echte Dateien innerhalb von [root]. Ein Symlink in einer Freigabe (z. B. auf
+    /config/token.txt oder ausserhalb der Freigaben) oder eine Pipe (open() bliebe für immer hängen) gilt als nicht lesbar."""
+    if root is not None:
+        base = os.path.realpath(root)
+        if not os.path.realpath(path).startswith(base.rstrip(os.sep) + os.sep):
+            raise OSError("ausserhalb der Freigaben")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("keine normale Datei")
+        h = hashlib.sha1()
+        with os.fdopen(fd, "rb") as f:
+            fd = None
             h.update(f.read(HASH_PART))
+            if size > HASH_PART:
+                f.seek(max(HASH_PART, size - HASH_PART))
+                h.update(f.read(HASH_PART))
+    finally:
+        if fd is not None:
+            os.close(fd)
     h.update(str(size).encode())
     return h.hexdigest()
 
@@ -1588,6 +1649,22 @@ def wg_dump():
 
 
 WG_KEY = re.compile(r"^[A-Za-z0-9+/]{42,43}=$")
+WG_CONF_MAX = 256 * 1024        # ab 1.16.1 (Audit Restteile): Konfigurationsdatei höchstens so weit lesen
+# Kommentar sieht nach Schlüssel aus («#PresharedKey = …», auskommentierter Schlüssel): nie als Peer-Name übernehmen
+# Review: nur «Private Key»/«PrivateKey»/«private_key», nicht jedes «privat…» (sonst verschwand «Mein privater Laptop»)
+WG_SECRETISH = re.compile(r"(?i)private[\s_-]*key|preshared|\bpsk\b|[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def _wg_label(c):
+    """Peer-Name aus Kommentar oder NAME-Feld, ohne alles, was nach Schlüssel aussieht."""
+    c = (c or "").strip()
+    return None if not c or WG_SECRETISH.search(c) else c[:60]       # erst prüfen, dann kürzen (kein halber Schlüssel)
+
+
+def _wg_read(path):
+    """Höchstens WG_CONF_MAX Bytes einer Konfigurationsdatei als Text (vorher fh.read() ohne Grenze)."""
+    with open(path, "rb") as fh:
+        return fh.read(WG_CONF_MAX).decode("utf-8", "replace")
 
 
 def wg_names(conf_dir=None):
@@ -1600,8 +1677,7 @@ def wg_names(conf_dir=None):
     names = {}
     for f in sorted(glob.glob(os.path.join(conf_dir, "*.conf"))):
         try:
-            with open(f, encoding="utf-8", errors="replace") as fh:
-                lines = fh.read().splitlines()
+            lines = _wg_read(f).splitlines()
         except OSError:
             continue
         # Kommentar im Peer-Block hat Vorrang, sonst der Kommentar direkt über «[Peer]»
@@ -1613,7 +1689,7 @@ def wg_names(conf_dir=None):
             elif t.startswith("[") and t.endswith("]"):
                 in_peer, inside, last = False, None, None
             elif t.startswith("#"):
-                c = t.lstrip("#").strip()[:60] or None
+                c = _wg_label(t.lstrip("#"))
                 if in_peer and inside is None:
                     inside = c
                 last = c
@@ -1627,18 +1703,17 @@ def wg_names(conf_dir=None):
     for f in sorted(glob.glob(os.path.join(conf_dir, "*.cfg"))):
         slots = {}
         try:
-            with open(f, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    m = re.match(r'^([A-Za-z_]+):(\d+)="?(.*?)"?\s*$', line.strip())
-                    if not m:
-                        continue
-                    k = m.group(1).upper()
-                    if "PRIVATE" in k or "PRESHARED" in k or "PSK" in k:
-                        continue
-                    if "PUBLIC" in k and WG_KEY.match(m.group(3)):
-                        slots.setdefault(m.group(2), {})["pub"] = m.group(3)
-                    elif "NAME" in k or "DESC" in k:
-                        slots.setdefault(m.group(2), {})["name"] = m.group(3)[:60]
+            for line in _wg_read(f).splitlines():
+                m = re.match(r'^([A-Za-z_]+):(\d+)="?(.*?)"?\s*$', line.strip())
+                if not m:
+                    continue
+                k = m.group(1).upper()
+                if "PRIVATE" in k or "PRESHARED" in k or "PSK" in k:
+                    continue
+                if "PUBLIC" in k and WG_KEY.match(m.group(3)):
+                    slots.setdefault(m.group(2), {})["pub"] = m.group(3)
+                elif ("NAME" in k or "DESC" in k) and _wg_label(m.group(3)):
+                    slots.setdefault(m.group(2), {})["name"] = _wg_label(m.group(3))
         except OSError:
             continue
         for v in slots.values():
@@ -1662,8 +1737,14 @@ def wireguard_status(run=None, conf_dir=None, now=None):
         return {"available": False, "reason": "no_permission", "error": type(e).__name__, "interfaces": []}
     if code != 0:
         return {"available": False, "reason": "no_permission", "interfaces": []}
-    now = now or time.time()
-    names = wg_names(conf_dir)
+    try:
+        return _wg_parse(out, now or time.time(), wg_names(conf_dir))
+    except Exception as e:  # noqa: BLE001
+        # Ab 1.16.1 (Audit Restteile): nie den Fehlertext zurückgeben (die Ausgabe von wg enthält private Schlüssel)
+        return {"available": False, "reason": "error", "error": type(e).__name__, "interfaces": []}
+
+
+def _wg_parse(out, now, names):
     num = lambda x: int(x) if x.isdigit() else 0  # noqa: E731
     ifaces = {}
     for line in (out or "").splitlines():
@@ -1709,16 +1790,36 @@ CONFIG_FIX_EN = ("Unraid › Docker › nzblab-agent › Edit › path /config �
 _ANON_VOLUME = re.compile(r"/volumes/[0-9a-f]{64}/_data$")
 
 
-def _token_error(why_de, why_en, path):
+TOKEN_MIN_LEN = 32      # ab 1.16.1: kürzere eigene Tokens lassen sich offline erraten (/api/hello) und werden abgelehnt
+TOKEN_MIN_DISTINCT = 8  # ab 1.16.1 (Härtung): «aaaa…» oder «12341234…» sind trotz 32 Zeichen leicht zu erraten
+
+
+def _token_weak(t):
+    """None = brauchbar, sonst «short» (unter 32 Zeichen), «chars» (Leer- oder Steuerzeichen) oder «simple» (weniger als
+    8 verschiedene Zeichen). Der Standard-Token (token_urlsafe(24)) hat praktisch immer über 20 verschiedene Zeichen."""
+    if any(c.isspace() or not c.isprintable() for c in t):
+        return "chars"
+    if len(t) < TOKEN_MIN_LEN:
+        return "short"
+    return "simple" if len(set(t)) < TOKEN_MIN_DISTINCT else None
+
+
+def _token_error(why_de, why_en, path, env=False):
     """Token-Datei vorhanden, aber nicht nutzbar: nie überschreiben (sonst passt die App nicht mehr), laut melden."""
-    TOKEN_STATE["error"] = f"{why_de} Der Agent erzeugt bewusst keinen neuen Token. Lösung: {path} reparieren " \
-                           "(den alten Token hineinschreiben) oder löschen (dann beim nächsten Start ein neuer Token, " \
-                           "in der App neu eintragen), oder Variable NZBLAB_AGENT_TOKEN setzen."
+    if env:
+        fix_de = ("Variable NZBLAB_AGENT_TOKEN leer lassen (dann erzeugt der Agent einen sicheren Token) oder mindestens "
+                  f"{TOKEN_MIN_LEN} zufällige Zeichen ohne Leerzeichen eintragen.")
+        fix_en = (f"leave the variable NZBLAB_AGENT_TOKEN empty (the agent then creates a secure token) or set at least "
+                  f"{TOKEN_MIN_LEN} random characters without spaces.")
+    else:
+        fix_de = (f"{path} löschen (dann beim nächsten Start ein neuer Token, in der App neu eintragen) oder mindestens "
+                  f"{TOKEN_MIN_LEN} zufällige Zeichen ohne Leerzeichen hineinschreiben, oder Variable NZBLAB_AGENT_TOKEN setzen.")
+        fix_en = (f"delete {path} (a new token is created on the next start, enter it in the app) or write at least "
+                  f"{TOKEN_MIN_LEN} random characters without spaces into it, or set the variable NZBLAB_AGENT_TOKEN.")
+    TOKEN_STATE["error"] = f"{why_de} Der Agent erzeugt bewusst keinen neuen Token. Lösung: {fix_de}"
     line = "!" * 72
     print(f"{line}\nFEHLER: Token nicht nutzbar. {TOKEN_STATE['error']}\n"
-          f"ERROR: token unusable. {why_en} The agent deliberately does not create a new token. Fix: repair {path} "
-          "(write the old token into it) or delete it (a new token is created on the next start, enter it in the app), "
-          "or set the variable NZBLAB_AGENT_TOKEN.\n"
+          f"ERROR: token unusable. {why_en} The agent deliberately does not create a new token. Fix: {fix_en}\n"
           f"Bis dahin antworten alle Abfragen mit Token mit 503 / until then all authenticated requests answer 503.\n{line}",
           flush=True)
     return ""
@@ -1734,6 +1835,18 @@ def token(announce=True):
     TOKEN_STATE.update(error="", source="")
     t = os.environ.get("NZBLAB_AGENT_TOKEN", "").strip()
     if t:
+        weak = _token_weak(t)
+        if weak == "short":
+            return _token_error(f"NZBLAB_AGENT_TOKEN ist zu kurz ({len(t)} Zeichen, nötig sind mindestens {TOKEN_MIN_LEN}).",
+                                f"NZBLAB_AGENT_TOKEN is too short ({len(t)} characters, at least {TOKEN_MIN_LEN} needed).",
+                                "NZBLAB_AGENT_TOKEN", env=True)
+        if weak == "simple":
+            return _token_error(f"NZBLAB_AGENT_TOKEN ist zu einfach (weniger als {TOKEN_MIN_DISTINCT} verschiedene Zeichen).",
+                                f"NZBLAB_AGENT_TOKEN is too simple (fewer than {TOKEN_MIN_DISTINCT} different characters).",
+                                "NZBLAB_AGENT_TOKEN", env=True)
+        if weak:
+            return _token_error("NZBLAB_AGENT_TOKEN enthält Leer- oder Steuerzeichen.",
+                                "NZBLAB_AGENT_TOKEN contains whitespace or control characters.", "NZBLAB_AGENT_TOKEN", env=True)
         TOKEN_STATE["source"] = "env"
         return t
     path = f"{CONFIG}/token.txt"
@@ -1745,7 +1858,9 @@ def token(announce=True):
         return _token_error(f"{path} lässt sich nicht prüfen ({e.strerror or e}).", f"{path} cannot be checked ({e.strerror or e}).", path)
     else:
         try:
-            with open(path, "rb") as f:
+            # O_NOFOLLOW (ab 1.16.1): ein Symlink als token.txt wird nie gelesen
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as f:
                 raw = f.read(4097)
             t = raw.decode("utf-8").strip()
         except UnicodeDecodeError:
@@ -1758,6 +1873,12 @@ def token(announce=True):
         if len(raw) > 4096 or any(c.isspace() or not c.isprintable() for c in t):
             return _token_error(f"{path} ist beschädigt (mehrere Zeilen, Steuerzeichen oder zu lang).",
                                 f"{path} is corrupt (several lines, control characters or too long).", path)
+        if len(t) < TOKEN_MIN_LEN:
+            return _token_error(f"{path} enthält einen zu kurzen Token ({len(t)} Zeichen, nötig sind mindestens {TOKEN_MIN_LEN}).",
+                                f"{path} holds a token that is too short ({len(t)} characters, at least {TOKEN_MIN_LEN} needed).", path)
+        if _token_weak(t) == "simple":
+            return _token_error(f"{path} enthält einen zu einfachen Token (weniger als {TOKEN_MIN_DISTINCT} verschiedene Zeichen).",
+                                f"{path} holds a token that is too simple (fewer than {TOKEN_MIN_DISTINCT} different characters).", path)
         TOKEN_STATE["source"] = "file"
         return t
     t = secrets.token_urlsafe(24)
@@ -2648,18 +2769,96 @@ def cached(name, fn, ttl=None):
         return v
 
 
-def http_get(url, lang="en"):
-    """Eine Seite lesen: (Status, HTML). Höchstens 4 MB, ehrlicher User-Agent, kein Cookie, keine Wiederholung."""
-    req = urllib.request.Request(url, headers={"User-Agent": PRICE_UA, "Accept": "text/html", "Accept-Language": lang})
+PRICE_MAX_BYTES = 4_000_000
+PRICE_DEADLINE_S = 60           # ab 1.16.1: ganze Seite höchstens so lange (Timeout gilt sonst nur je Lesevorgang)
+PRICE_MAX_REDIRECTS = 5
+NAT64_NET = ipaddress.ip_network("64:ff9b::/96")
+
+
+def public_host(host, resolve=None):
+    """True, wenn [host] nur auf öffentliche Adressen zeigt (nicht Heimnetz, Loopback, Link-local, CGNAT, Multicast …)."""
+    if not host:
+        return False
+    resolve = resolve or (lambda h: [i[4][0] for i in socket.getaddrinfo(h, 443, proto=socket.IPPROTO_TCP)])
     try:
-        with urllib.request.urlopen(req, timeout=PRICE_TIMEOUT) as r:
-            return r.status, r.read(4_000_000).decode("utf-8", "replace")
+        addrs = resolve(host.strip("[]"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if not addrs:
+        return False
+    for x in addrs:
+        try:
+            ip = ipaddress.ip_address(str(x).split("%", 1)[0])
+        except ValueError:
+            return False
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        elif ip.version == 6 and ip in NAT64_NET:      # Review: 64:ff9b::/96 trägt eine IPv4 (z. B. 64:ff9b::c0a8:101)
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if not ip.is_global or ip.is_multicast:
+            return False
+    return True
+
+
+def public_https_url(url, resolve=None):
+    """Nur https:// auf öffentliche Hosts (Preis-Abfragen und ihre Weiterleitungen)."""
+    try:
+        u = urlparse(url)
+        host = u.hostname
+    except ValueError:
+        return False
+    return u.scheme == "https" and not u.username and not u.password and public_host(host, resolve)
+
+
+class _PublicRedirect(urllib.request.HTTPRedirectHandler):
+    """Ab 1.16.1 (Audit Restteile): Preis-Seiten dürfen nur auf öffentliche https-Adressen weiterleiten. Vorher folgte urllib
+    jeder Weiterleitung, auch auf http://192.168.1.1/… oder http://127.0.0.1:… (Anfrage vom NAS ins Heimnetz, SSRF)."""
+    max_redirections = PRICE_MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not public_https_url(newurl):
+            raise urllib.error.URLError("Weiterleitung auf eine nicht öffentliche Adresse blockiert")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_PRICE_OPENER = urllib.request.build_opener(_PublicRedirect)
+
+
+def _read_capped(r, limit, deadline):
+    """Höchstens [limit] Bytes, und nur bis [deadline] (time.monotonic); tröpfelnde Server halten den Abruf nicht ewig fest."""
+    buf = bytearray()
+    while len(buf) < limit:
+        if time.monotonic() > deadline:
+            raise TimeoutError("Seite zu langsam")
+        chunk = r.read(min(65536, limit - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
+def http_get(url, lang="en", opener=None):
+    """Eine Seite lesen: (Status, HTML). Höchstens 4 MB in 60 Sekunden, ehrlicher User-Agent, kein Cookie, keine Wiederholung.
+    Ab 1.16.1 nur https auf öffentliche Hosts, auch bei Weiterleitungen (nie ins Heimnetz)."""
+    if not public_https_url(url):
+        raise urllib.error.URLError("nur https auf öffentliche Adressen")
+    req = urllib.request.Request(url, headers={"User-Agent": PRICE_UA, "Accept": "text/html", "Accept-Language": lang})
+    deadline = time.monotonic() + PRICE_DEADLINE_S
+    try:
+        with (opener or _PRICE_OPENER).open(req, timeout=PRICE_TIMEOUT) as r:
+            return r.status, _read_capped(r, PRICE_MAX_BYTES, deadline).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         try:
-            body = e.read(200_000).decode("utf-8", "replace")
+            body = _read_capped(e, 200_000, deadline).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001
             body = ""
         return e.code, body
+
+
+def safe_link(link, fallback):
+    """Link aus einer fremden Seite für die App: nur https://, sonst [fallback] (kein javascript:, intent:, http: …)."""
+    link = (link or "").strip()
+    return link if link.lower().startswith("https://") and len(link) <= 2000 else fallback
 
 
 CHALLENGE = re.compile(r"(?i)Sichere Verbindung wird überprüft|Aufgrund massiver|cf-challenge|challenge-platform|"
@@ -2763,6 +2962,7 @@ def parse_toppreise(html, tb):
         link = (a or {}).get("href", "")
         if link.startswith("/"):
             link = "https://www.toppreise.ch" + link
+        link = safe_link(link, "https://www.toppreise.ch")
         out.append({"name": name[:120], "price": round(price, 2), "per_tb": round(per_tb, 2), "link": link})
     return out
 
@@ -2779,10 +2979,10 @@ def parse_toppreise_product(html, tb):
         m = re.search(rf'<meta\s+property="og:{prop}"\s+content="([^"]*)"', html)
         return htmllib.unescape(m.group(1)) if m else ""
     url = meta("url")
-    if "/preisvergleich/" not in url:
+    if "/preisvergleich/" not in url or not url.startswith("https://"):
         return None
-    title = meta("title")
-    name = re.sub(r"\s+", " ", re.split(r"\s+ab CHF\s", title)[0]).strip()
+    title = meta("title")[:500]       # ab 1.16.1: gekappt und linear geteilt (vorher quadratische Regex bei langen Leerraum-Ketten)
+    name = re.sub(r"\s+", " ", re.split(r"\sab CHF\s", title, maxsplit=1)[0]).strip()
     m = re.search(r"Angebote? ab CHF\s*([0-9'’.,]+)", meta("description")) or re.search(r"\sab CHF\s*([0-9'’.,]+)", title)
     price = money(m.group(1)) if m else None
     if not name or not price or not _size_ok(name, tb):
@@ -2803,7 +3003,7 @@ def parse_geizhals(html, tb, base="https://geizhals.de"):
             continue
         offers = " ".join(_texts(b, "galleryview__offercount"))
         out.append({"name": name[:120], "price": round(price, 2), "per_tb": round(price / tb, 2),
-                    "link": urljoin(base + "/", a.get("href", "")), "shop": f"Geizhals ({offers})" if offers else "Geizhals"})
+                    "link": safe_link(urljoin(base + "/", a.get("href", "")), base), "shop": f"Geizhals ({offers})" if offers else "Geizhals"})
     return out
 
 
@@ -2825,7 +3025,7 @@ def parse_diskprices(html):
         href = (link_el or {}).get("href", "")
         m = re.match(r"(https://www\.amazon\.[a-z.]+/dp/[A-Z0-9]+)", href)
         rows.append({"type": a.get("data-product-type", ""), "gb": gb, "price": price, "name": re.sub(r"\s+", " ", name)[:120],
-                     "link": m.group(1) if m else href.split("?")[0], "condition": a.get("data-condition", "new")})
+                     "link": m.group(1) if m else safe_link(href.split("?")[0], "https://diskprices.com"), "condition": a.get("data-condition", "new")})
     return rows
 
 
@@ -3323,8 +3523,12 @@ class CrashStore:
 
     def add(self, obj):
         # Einzelne Ersatzzeichen (\ud800) sind in UTF-8 nicht schreibbar: durch «?» ersetzen, statt abzubrechen
-        keep = {k: str(obj.get(k, ""))[:CRASH_MAX_BYTES].encode("utf-8", "replace").decode("utf-8")
+        # Kurze Felder (Zeit, Versionen, Art) ab 1.16.1 auf 200 Zeichen begrenzt; nur der Stacktrace darf lang sein
+        keep = {k: str(obj.get(k, ""))[:CRASH_MAX_BYTES if k == "trace" else 200].encode("utf-8", "replace").decode("utf-8")
                 for k in ("time", "version", "android", "device", "screen", "kind", "trace")}
+        # ab 1.16.1: alle Felder auch serverseitig schwärzen (Zugangsdaten in Adressen, Bearer, Cookie-Zeilen,
+        # Schlüssel/Passwörter, lange Zufallsketten); IPs, Hostnamen und Pfade bleiben, sie helfen bei der Fehlersuche
+        keep = {k: redact_secrets(v) for k, v in keep.items()}
         keep["received"] = int(time.time())
         name = f"{int(time.time() * 1000)}-{secrets.token_hex(3)}.json"
         tmp = os.path.join(self.dir, name + ".tmp")
@@ -3602,7 +3806,9 @@ class Today:
                 seen[key]["n"] += 1
                 seen[key]["t"] = t
                 continue
-            seen[key] = {"t": t, "kind": "syslog", "level": "warn", "title": f"Systemprotokoll: {src.split('[')[0]}", "text": msg[:300], "n": 1}
+            seen[key] = {"t": t, "kind": "syslog", "level": "warn", "title": f"Systemprotokoll: {src.split('[')[0]}",
+                         # ab 1.16.1: Geheimnisse (key=wert, Bearer, Cookie …) wie bei den Absturzberichten schwärzen
+                         "text": redact_secrets(msg[:LOG_LINE_MAX])[:300], "n": 1}
         for e in seen.values():
             if e["n"] > 1:
                 e["text"] += f" ({e['n']}×)"
@@ -3669,6 +3875,8 @@ LOGS_ON = _env_on("NZBLAB_LOGS", False)
 BACKUP_PATHS = [x.strip() for x in os.environ.get("NZBLAB_BACKUP_PATHS", "").split(",") if x.strip()]
 BACKUP_AUTO = _env_on("NZBLAB_BACKUP_AUTO", True)
 BIND = os.environ.get("NZBLAB_BIND", "0.0.0.0").strip() or "0.0.0.0"
+MAX_CONN = _env_int("NZBLAB_MAX_CONN", 256, 16, 4096)              # ab 1.16.1: offene Verbindungen insgesamt
+MAX_CONN_PER_IP = _env_int("NZBLAB_MAX_CONN_PER_IP", 32, 4, 1024)   # ab 1.16.1: je Absender-Adresse
 MAX_BODY = 64 * 1024        # grösste Anfrage (Bytes); Absturzberichte behalten ihr eigenes Limit (CRASH_MAX_BYTES * 2)
 AUTH_FAILS = _env_int("NZBLAB_AUTH_FAILS", 10, 3, 1000)
 DISKTEMP_EVERY = 300        # Plattentemperaturen alle 5 Minuten speichern
@@ -4131,7 +4339,7 @@ def detect_repo(path):
         return "kopia"
     if all(os.path.isdir(os.path.join(path, x)) for x in ("snapshots", "data", "keys")) and os.path.isfile(os.path.join(path, "config")):
         return "restic"
-    if os.path.isfile(os.path.join(path, "README")) and "borg backup repository" in (read(os.path.join(path, "README"), "") or "")[:300].lower():
+    if os.path.isfile(os.path.join(path, "README")) and "borg backup repository" in read_head(os.path.join(path, "README"), 300).lower():
         return "borg"
     return None
 
@@ -4192,7 +4400,7 @@ def backup_log_info(path):
         if BACKUP_OK.search(line):
             ok = _log_time(line, mtime)
         elif BACKUP_ERR.search(line):
-            err, err_text = _log_time(line, mtime), redact_log(line.strip())[:200]
+            err, err_text = _log_time(line, mtime), redact_log(line.strip()[:LOG_LINE_MAX])[:200]
     kind = "rsync" if "rsync" in os.path.basename(path).lower() or any("rsync" in l for l in lines[-200:]) else "log"
     return {"kind": kind, "last_success": ok, "last_error": err, "error_text": err_text, "source": "Log-Datei"}
 
@@ -4425,9 +4633,14 @@ def raid_status(proc_dir=None, sys_dir=None):
 _REDACT = [
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,15}://)[^/\s:@]+:[^/\s@]+@"), r"\1<user>:<redacted>@"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{6,}"), "Bearer <redacted>"),
-    (re.compile(r"(?i)\b(pass(?:word|wd|phrase)?|pwd|token|api[_-]?key|apikey|secret|auth[a-z]*|private[_-]?key|access[_-]?key|session(?:id)?|"
-                r"cookie|sig(?:nature)?|key)(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s&,;]+)"), r"\1\2<redacted>"),
-    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<email>"),
+    # ab 1.16.1 (Audit Lauf 2): Cookie-Kopfzeilen ganz schwärzen (vorher nur das erste «a=b» bis zum «;»)
+    (re.compile(r"(?i)\b((?:set-)?cookie)(\s*:\s*)[^\r\n]+"), r"\1\2<redacted>"),
+    # ab 1.16.1: auch nach «_» (access_token, client_secret), mit JSON-Anführungszeichen ("apiKey":"…") und samt Schema
+    # («Authorization: Basic …» schwärzte vorher nur das Wort «Basic»)
+    (re.compile(r"(?i)(?<![a-z0-9])(pass(?:word|wd|phrase)?|pwd|token|api[_-]?key|apikey|secret|auth[a-z]*|private[_-]?key|access[_-]?key|session(?:id)?|"
+                r"cookie|sig(?:nature)?|key)(\"?\s*[=:]\s*)((?:(?:basic|digest|token)\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s&,;]+))"), r"\1\2<redacted>"),
+    # ab 1.16.1 (Audit Lauf 2): Anfang nur am Wortanfang und Länge begrenzt, sonst quadratisch auf langen Wörtern ohne «@»
+    (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}"), "<email>"),
     (re.compile(r"(?i)(?<![0-9a-f:])[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5,}(?![0-9a-f:])"), "<mac>"),
     (re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"), "<ip>"),
     (re.compile(r"(?i)(?<![\w:.])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?:%\w+)?(?![\w:])"), None),      # IPv6, siehe _ipv6
@@ -4443,6 +4656,17 @@ def _ipv6(m):
     return "<ip>" if "::" in s or s.count(":") >= 4 else s       # «12:34:56» (Uhrzeit) bleibt
 
 
+_SECRET_RULES = _REDACT[:4] + _REDACT[-1:]      # Adress-Zugangsdaten, Bearer, Cookie-Zeilen, key=wert, lange Zufallsketten
+
+
+def redact_secrets(s):
+    """Nur Geheimnisse schwärzen (Zugangsdaten in Adressen, Bearer-Tokens, key/passwort=wert, lange Zufallsketten);
+    IPs, E-Mails und Pfade bleiben. Für Absturzberichte (ab 1.16.1)."""
+    for rx, rep in _SECRET_RULES:
+        s = rx.sub(rep, s)
+    return s
+
+
 def redact_log(s):
     """Entfernt IP-Adressen (v4/v6), MAC-Adressen, E-Mails, Tokens, Schlüssel und Passwörter (key=wert, Bearer, user:pass@),
     Benutzernamen, Heimordner und Datei-/Ordnernamen unter den Freigaben, lange Zufallsketten."""
@@ -4451,6 +4675,7 @@ def redact_log(s):
     return s
 
 
+LOG_LINE_MAX = 4000          # ab 1.16.1: längere Logzeilen vor dem Schwärzen kürzen (Rechenzeit bleibt begrenzt)
 LOG_FILES = ("syslog", "messages", "kern.log", "daemon.log", "syslog.1", "messages.1")
 LOG_ERR = re.compile(r"(?i)(i/o error|\berror\b|\berr\b|\bfail(ed|ure)?\b|critical|\bcrit\b|panic|segfault|out of memory|oom-kill|call trace|corrupt|"
                      r"read-only file system|\bemerg|\balert\b)")
@@ -4496,7 +4721,7 @@ def collect_logs(log_dir=None, hours=24, limit=200, now=None):
             src, sep, msg = rest.partition(": ")
             if not sep:
                 src, msg = "", rest
-            msg = redact_log(msg.strip())[:300]
+            msg = redact_log(msg.strip()[:LOG_LINE_MAX])[:300]
             src = re.sub(r"\[\d+\]$", "", src.strip())[:40]
             key = (src, re.sub(r"\d+", "#", msg)[:120])
             if key in seen:
@@ -4537,6 +4762,7 @@ class AuthLimiter:
     def __init__(self, max_fail=None, window=60, block=300):
         self.max_fail, self.window, self.block = max_fail or AUTH_FAILS, window, block
         self.fails, self.blocked, self.lock = {}, {}, threading.Lock()
+        self._pruned = float("-inf")
 
     def blocked_for(self, ip, now=None):
         now = now if now is not None else time.monotonic()
@@ -4552,9 +4778,11 @@ class AuthLimiter:
     def fail(self, ip, now=None):
         now = now if now is not None else time.monotonic()
         with self.lock:
-            if len(self.fails) > 10000:                     # viele Absender: alte Einträge weg, Speicher bleibt klein
+            # Viele Absender: alte Einträge weg, Speicher bleibt klein. Ab 1.16.1 höchstens einmal pro Sekunde aufräumen
+            # (vorher bei über 10000 Einträgen bei jedem Fehlversuch, unter derselben Sperre wie jede Token-Prüfung)
+            if (len(self.fails) > 10000 or len(self.blocked) > 10000) and now - self._pruned >= 1:
+                self._pruned = now
                 self.fails = {k: v for k, v in self.fails.items() if v and v[-1] > now - self.window}
-            if len(self.blocked) > 10000:
                 self.blocked = {k: v for k, v in self.blocked.items() if v > now}
             lst = [x for x in self.fails.get(ip, []) if x > now - self.window] + [now]
             if len(lst) >= self.max_fail:
@@ -4591,11 +4819,23 @@ DISCOVER_DEPTH = 3                  # so viele Ordner-Ebenen unter dem Container
 DISCOVER_MAX_BYTES = 1024 * 1024    # grössere Einstellungsdateien nicht lesen
 DISCOVER_MAX_ENTRIES = 3000         # Einträge pro Container-Ordner (Plex-Bibliotheken sind riesig)
 DISCOVER_MAX_FOLDERS = 500
+DISCOVER_BUDGET_S = 8.0             # ab 1.16.1: so lange höchstens suchen (App-Zeitlimit 10 s), dann partial: true
+DISCOVER_CACHE_S = 60               # ab 1.16.1: Ergebnis ohne Schlüssel (?keys=0) so lange wiederverwenden
 DISCOVER_FILES = {"config.xml", "sabnzbd.ini", "config.ini", "settings.json", "preferences.xml", "network.xml", "system.xml"}
 # Grosse Datenordner gar nicht erst betreten (Vergleich klein geschrieben)
 DISCOVER_SKIP = {"cache", "caches", "logs", "log", "backups", "backup", "mediacover", "metadata", "media", "transcode",
                  "transcodes", "crash reports", "codecs", "plug-in support", "plug-ins", "updates", "drivers", "tmp", "temp",
-                 "node_modules", "diagnostics", "thumbnails", "images", "db", "database", "admin"}
+                 "node_modules", "diagnostics", "thumbnails", "images", "db", "database", "admin",
+                 "pgdata", "postgres", "postgresql", "mysql", "mariadb", "model-cache", "model_cache"}
+# Datenbank-Container (Postgres, MySQL/MariaDB): Ordner mit diesen Einträgen nicht weiter durchsuchen (riesige data-Ordner)
+DISCOVER_DB_MARKERS = {"pg_version", "pgdata", "postgresql.conf", "ibdata1", "mysql", "mariadb", "mysql.ibd", "auto.cnf"}
+# Ordnernamen, die einen Dienst vermuten lassen (für «Ordner nicht lesbar»); Namen mit Zusatzwerkzeugen zählen nicht
+DISCOVER_NAME_HINTS = (("sabnzbd", "sab", 8080, None), ("tautulli", "tautulli", 8181, None), ("jellyseerr", "seerr", 5055, "jellyseerr"),
+                       ("overseerr", "seerr", 5055, "overseerr"), ("seerr", "seerr", 5055, "seerr"), ("plex", "plex", 32400, None),
+                       ("jellyfin", "jellyfin", 8096, "jellyfin"), ("emby", "jellyfin", 8096, "emby"))
+DISCOVER_NAME_NOT = ("meta", "auto", "tauticord", "trakt", "rating", "wrapped", "debrid", "request", "utilit", "kometa", "ombi")
+# Aussehen wie Tautulli ([General] http_root), sind es aber nicht
+DISCOVER_NOT_TAUTULLI = ("headphones", "lazylibrarian", "mylar", "lazy-librarian", "sickchill", "sickgear", "sickrage", "couchpotato")
 DISCOVER_OWN = {"nzblab-agent", "naslab-agent"}
 DISCOVER_KEY_RX = re.compile(r"[A-Za-z0-9_\-+/=]{16,128}")
 DISCOVER_ARR = (("prowlarr", 9696), ("sonarr", 8989), ("radarr", 7878))
@@ -4607,6 +4847,7 @@ DISCOVER_NOTES = {
     "jellyfin_key": "Gefunden; Schlüssel in der Jellyfin-Weboberfläche erstellen (Dashboard › API-Schlüssel)",
     "emby_key": "Gefunden; Schlüssel in der Emby-Weboberfläche erstellen (Einstellungen › API-Schlüssel)",
     "unreadable": "Einstellungsdatei nicht lesbar (Rechte: PUID=0, oder grösser als 1 MB)",
+    "unreadable_dir": "Ordner nicht lesbar (Rechte: PUID=0 setzen und den Container neu starten)",
     "broken": "Einstellungsdatei kaputt oder ohne gültigen Schlüssel",
 }
 DISCOVER_PORTS_NOTE = ("Ports stammen aus den Einstellungsdateien und gelten im Container; im Bridge-Netz kann der Port "
@@ -4705,9 +4946,13 @@ class Discover:
     Dateien bis 1 MB. Liefert pro Dienst Ordnername (ohne Pfad), Port, SSL, URL-Basis und API-Key (Plex und Jellyfin nie).
     Schreibt nichts ins Log, auch nicht im Fehlerfall."""
 
-    def __init__(self, roots=None, limit=10, window=60):
+    def __init__(self, roots=None, limit=10, window=60, budget=None, cache_s=None, clock=None):
         self.explicit = roots
         self.limiter = DiscoverLimiter(limit, window)
+        self.budget = DISCOVER_BUDGET_S if budget is None else budget
+        self.cache_s = DISCOVER_CACHE_S if cache_s is None else cache_s
+        self.clock = clock or time.monotonic
+        self._cache, self._cache_lock = None, threading.Lock()
 
     def roots(self):
         if self.explicit is not None:
@@ -4719,11 +4964,13 @@ class Discover:
             return [main]
         return [p for p in (os.path.join(FILES_ROOT, "apps"), os.path.join(FILES_ROOT, "docker")) if os.path.isdir(p)]
 
-    @staticmethod
-    def _walk(folder):
-        """Breitensuche bis DISCOVER_DEPTH Ebenen: {dateiname klein: [Pfade, flachste zuerst]}, abgebrochen?"""
-        found, queue, seen = {}, [(folder, 0)], 0
+    def _walk(self, folder, deadline=None):
+        """Breitensuche bis DISCOVER_DEPTH Ebenen: ({dateiname klein: [Pfade, flachste zuerst]}, abgebrochen?, Ordner nicht
+        lesbar?). «abgebrochen» = Eintragsgrenze oder Zeitbudget erreicht. Datenbank-Ordner werden nicht durchsucht."""
+        found, queue, seen, denied = {}, [(folder, 0)], 0, False
         while queue:
+            if deadline is not None and self.clock() > deadline:
+                return found, True, denied
             d, lvl = queue.pop(0)
             entries = []
             try:
@@ -4731,10 +4978,15 @@ class Discover:
                     for e in it:
                         seen += 1
                         if seen > DISCOVER_MAX_ENTRIES:
-                            return found, True
+                            return found, True, denied
                         entries.append(e)
+            except PermissionError:
+                denied = True
+                continue
             except OSError:
                 continue
+            if any(e.name.lower() in DISCOVER_DB_MARKERS for e in entries):
+                continue                        # Datenbank-Container (Postgres, MariaDB): dort liegt kein Dienst
             for e in sorted(entries, key=lambda e: e.name):
                 try:
                     if e.is_symlink():
@@ -4746,16 +4998,17 @@ class Discover:
                         found.setdefault(e.name.lower(), []).append(e.path)
                 except OSError:
                     continue
-        return found, False
+        return found, False, denied
 
     @staticmethod
-    def _entry(service, folder, port, ssl=False, base="", key=None, code="ok", variant=None, http_port=None, from_config=True):
+    def _entry(service, folder, port, ssl=False, base="", key=None, code="ok", variant=None, http_port=None, from_config=True,
+               note=None):
         if code == "ok" and not DISCOVER_KEYS:
             code, key = "keys_off", None
         if not DISCOVER_KEYS:
             key = None
         e = {"service": service, "folder": folder, "port": port, "ssl": bool(ssl), "urlBase": base,
-             "apiKey": key, "code": code, "note": DISCOVER_NOTES[code], "portSource": "config" if from_config else "default"}
+             "apiKey": key, "code": code, "note": note or DISCOVER_NOTES[code], "portSource": "config" if from_config else "default"}
         if variant:
             e["variant"] = variant
         if http_port and http_port != port:
@@ -4802,10 +5055,16 @@ class Discover:
     def _tautulli(self, folder, path):
         text = _disc_read(path)
         ini = _disc_ini(text)
+        name = folder.lower()
+        by_name = "tautulli" in name
         if ini is None:
-            return self._entry("tautulli", folder, 8181, code="unreadable", from_config=False) if "tautulli" in folder.lower() else None
+            return self._entry("tautulli", folder, 8181, code="unreadable", from_config=False) if by_name else None
         g = ini.get("general")
-        if g is None or not ("tautulli" in folder.lower() or "pms" in ini or "http_root" in g):
+        # ab 1.16.1: Abschnitt [PMS] (Plex-Verbindung) oder Ordnername «tautulli»; Headphones, LazyLibrarian, Mylar & Co.
+        # haben auch [General] http_root, aber nie [PMS]
+        if g is None or not (by_name or "pms" in ini):
+            return None
+        if not by_name and any(x in name for x in DISCOVER_NOT_TAUTULLI):
             return None
         key = _disc_key(g.get("api_key"))
         port = _disc_port(g.get("http_port")) or 8181
@@ -4838,21 +5097,46 @@ class Discover:
             net = _disc_xml(_disc_read(p), "NetworkConfiguration")
             if net:
                 break
+        # Emby und Jellyfin vor 10.9: Port in system.xml (HttpServerPortNumber), ab 1.16.1 gelesen
+        sysc = None
+        for p in found.get("system.xml", []):
+            sysc = _disc_xml(_disc_read(p), "ServerConfiguration")
+            if sysc:
+                break
         emby = "emby" in name
         if not net and not emby and "jellyfin" not in name:
             return None
         if emby:
-            return self._entry("jellyfin", folder, 8096, code="emby_key", variant="emby", from_config=False)
+            sysc = sysc or {}
+            http = _disc_port(sysc.get("HttpServerPortNumber"))
+            ssl = _disc_bool(sysc.get("EnableHttps")) and _disc_port(sysc.get("HttpsPortNumber")) is not None
+            port = _disc_port(sysc.get("HttpsPortNumber")) if ssl else (http or 8096)
+            return self._entry("jellyfin", folder, port, ssl, code="emby_key", variant="emby", http_port=http,
+                               from_config=http is not None)
         net = net or {}
-        http = _disc_port(net.get("InternalHttpPort") or net.get("HttpServerPortNumber"))
+        http = _disc_port(net.get("InternalHttpPort") or net.get("HttpServerPortNumber") or (sysc or {}).get("HttpServerPortNumber"))
         ssl = _disc_bool(net.get("EnableHttps")) and _disc_port(net.get("InternalHttpsPort")) is not None
         port = _disc_port(net.get("InternalHttpsPort")) if ssl else (http or 8096)
         return self._entry("jellyfin", folder, port, ssl, _disc_base(net.get("BaseUrl")), code="jellyfin_key",
                            variant="jellyfin", http_port=http, from_config=http is not None)
 
-    def _folder(self, folder, path):
-        """Alle erkannten Dienste eines Container-Ordners (meist einer)."""
-        found, partial = self._walk(path)
+    def _hinted(self, folder):
+        """(Dienst, Standard-Port, Variante) nach Ordnername, oder None. Für Ordner, die sich nicht öffnen lassen."""
+        name = folder.lower()
+        for svc, port in DISCOVER_ARR:
+            if svc in name and not any(x in name for x in DISCOVER_OTHER_ARR):
+                return svc, port, None
+        if any(x in name for x in DISCOVER_NAME_NOT) or any(x in name for x in DISCOVER_OTHER_ARR):
+            return None
+        for key, svc, port, variant in DISCOVER_NAME_HINTS:
+            if key in name:
+                return svc, port, variant
+        return None
+
+    def _folder(self, folder, path, deadline=None):
+        """Alle erkannten Dienste eines Container-Ordners (meist einer). Zweiter Wert «partial»: ein Ordner, der nach einem
+        Dienst aussieht, wurde abgebrochen (Eintragsgrenze oder Zeit), bevor eine Einstellungsdatei gefunden war."""
+        found, cut, denied = self._walk(path, deadline)
         out = []
         if found.get("config.xml"):
             e = self._arr(folder, found["config.xml"][0])
@@ -4875,12 +5159,36 @@ class Discover:
             e = self._jellyfin(folder, found)
             if e:
                 out.append(e)
+        hint = self._hinted(folder)
+        if denied and hint and not out:
+            # ab 1.16.1: Ordner (oder ein Unterordner) für den Agent nicht lesbar → melden statt still weglassen
+            svc, port, variant = hint
+            out.append(self._entry(svc, folder, port, code="unreadable", variant=variant, from_config=False,
+                                   note=DISCOVER_NOTES["unreadable_dir"]))
+        partial = bool(cut and not out and hint)
         return out, partial
 
     def scan(self, with_keys=True):
-        """with_keys=False («?keys=0»): gleiche Funde und Codes, aber alle apiKey-Werte null (für reines Zählen auf der Startseite)."""
+        """with_keys=False («?keys=0»): gleiche Funde und Codes, aber alle apiKey-Werte null (für reines Zählen auf der Startseite).
+        «keys» in der Antwort = ob wirklich Schlüssel mitkommen (aus bei DISCOVER_KEYS=0 oder ?keys=0). Das Ergebnis ohne
+        Schlüssel wird DISCOVER_CACHE_S Sekunden wiederverwendet (ab 1.16.1). Höchstens DISCOVER_BUDGET_S Sekunden Suche,
+        danach «partial: true»."""
         roots = self.roots()
-        res = {"available": bool(roots), "keys": bool(DISCOVER_KEYS), "services": [], "partial": False,
+        cache_key = tuple(roots)
+        if not with_keys and self.cache_s > 0:
+            with self._cache_lock:
+                c = self._cache
+                if c and c[0] == cache_key and self.clock() - c[1] < self.cache_s:
+                    return json.loads(json.dumps(c[2]))
+        res = self._scan(roots, with_keys)
+        if not with_keys and self.cache_s > 0:
+            with self._cache_lock:
+                self._cache = (cache_key, self.clock(), json.loads(json.dumps(res)))
+        return res
+
+    def _scan(self, roots, with_keys):
+        deadline = self.clock() + self.budget
+        res = {"available": bool(roots), "keys": bool(DISCOVER_KEYS and with_keys), "services": [], "partial": False,
                "at": int(time.time()), "ports_note": DISCOVER_PORTS_NOTE}
         seen = set()
         for root in roots:
@@ -4890,12 +5198,15 @@ class Discover:
             except OSError:
                 continue
             for e in folders[:DISCOVER_MAX_FOLDERS]:
+                if self.clock() > deadline:
+                    res["partial"] = True           # Zeitbudget aufgebraucht: Rest nicht mehr durchsuchen
+                    break
                 try:
                     if e.is_symlink() or not e.is_dir(follow_symlinks=False):
                         continue
                 except OSError:
                     continue
-                found, partial = self._folder(e.name, e.path)
+                found, partial = self._folder(e.name, e.path, deadline)
                 res["partial"] = res["partial"] or partial
                 for s in found:
                     k = (s["service"], s["folder"])
@@ -4904,11 +5215,15 @@ class Discover:
                         res["services"].append(s)
             if len(folders) > DISCOVER_MAX_FOLDERS:
                 res["partial"] = True
+            if self.clock() > deadline:
+                res["partial"] = True
+                break
         res["services"].sort(key=lambda s: (s["service"], s["folder"].lower()))
         if not with_keys:
             for s in res["services"]:
                 s["apiKey"] = None
         return res
+
 
 def run_extras(store, stop, smart=None):
     """Neustarts (jede Minute) und Plattentemperaturen (alle 5 Minuten)."""
@@ -4931,9 +5246,70 @@ CACHE_SHARES = CacheShares()
 APPDATA_SIZES = AppdataSizes()
 
 
+# ---------------------------------------------------------------- Ab 1.16.1: Sicherheits-Kopfzeilen, Browser-Seite, Bremsen
+
+# Für alle JSON-Antworten: nichts zwischenspeichern (Token-Daten, API-Keys), nie als HTML deuten, nie in einem Rahmen zeigen
+API_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+               "X-Frame-Options": "DENY", "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'"}
+_WEB = {"key": None, "body": b"", "csp": ""}
+_WEB_LOCK = threading.Lock()
+SCRIPT_RX = re.compile(r"<script>(.*?)</script>", re.S)
+
+
+def web_csp(html):
+    """CSP der Browser-Seite: Skripte nur mit genau dem SHA-256 der eigenen Inline-Skripte (kein 'unsafe-inline' mehr).
+    Stile bleiben 'unsafe-inline' (style="…"-Attribute für Balken und Farben; alle Daten laufen durch esc())."""
+    norm = html.replace("\r\n", "\n").replace("\r", "\n")       # der HTML-Parser macht aus CR/CRLF ein LF
+    hashes = ["'sha256-" + base64.b64encode(hashlib.sha256(m.encode("utf-8")).digest()).decode() + "'"
+              for m in SCRIPT_RX.findall(norm)]
+    return ("default-src 'none'; script-src " + (" ".join(hashes) or "'none'") + "; style-src 'unsafe-inline'; img-src data:; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+
+
+def web_page(path=None):
+    """web.html einmal lesen und mit passender CSP im Speicher halten; neu lesen nur, wenn sich die Datei ändert."""
+    path = path or WEB_PAGE
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (path, None, None)
+    with _WEB_LOCK:
+        if _WEB["key"] != key:
+            html = read(path, "") or ""
+            _WEB.update(key=key, body=html.encode() or "Weboberfläche fehlt (web.html)".encode(), csp=web_csp(html))
+        return _WEB["body"], _WEB["csp"]
+
+
+class HelloLimiter:
+    """Höchstens [max_calls] Anfragen an /api/hello pro Minute und Absender (die App braucht wenige pro Prüfung)."""
+
+    def __init__(self, max_calls=30, window=60):
+        self.max_calls, self.window = max_calls, window
+        self.calls, self.lock = {}, threading.Lock()
+        self._pruned = float("-inf")
+
+    def allow(self, ip, now=None):
+        """0 = erlaubt, sonst Sekunden bis zur nächsten freien Anfrage."""
+        now = now if now is not None else time.monotonic()
+        with self.lock:
+            # Viele Absender: abgelaufene weg, Speicher bleibt klein. Höchstens einmal pro Sekunde aufräumen (Review 1.16.1:
+            # sonst bei über 5000 frischen Einträgen bei jeder Anfrage, wie vorher bei der Token-Bremse)
+            if len(self.calls) > 5000 and now - self._pruned >= 1:
+                self._pruned = now
+                self.calls = {k: v for k, v in self.calls.items() if v and v[-1] > now - self.window}
+            lst = [t for t in self.calls.get(ip, []) if t > now - self.window]
+            if len(lst) >= self.max_calls:
+                self.calls[ip] = lst
+                return max(1, int(lst[0] + self.window - now) + 1)
+            self.calls[ip] = lst + [now]
+            return 0
+
+
 def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, today=None, crashes=None, smart=None, backups=None,
-                 limiter=None, log_dir=None, discover=None):
+                 limiter=None, log_dir=None, discover=None, hello_limiter=None):
     limiter = limiter or AuthLimiter()       # je Server eine eigene Token-Bremse (Tests starten viele Server)
+    hello_limiter = hello_limiter or HelloLimiter()
     discover = discover or Discover()        # je Server eine eigene Bremse für /api/discover
     smart = smart or SmartMonitor(store, SmartHelper(), enabled=False)
     backups = backups or BackupScanner(explicit=[], auto_roots=[], auto=False)
@@ -4942,9 +5318,33 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
         # Lese-Timeout je Verbindung: halbe Anfragen (Slowloris) oder eine zu grosse Content-Length halten sonst einen
         # Arbeits-Thread für immer fest (Chaos-Test 28.10.2026)
         timeout = 10
+        server_version = "NASlab-Agent"     # ab 1.16.1: keine Python-Version im Server-Kopf
+        sys_version = ""
 
         def log_message(self, *a):
             pass
+
+        def version_string(self):
+            return self.server_version          # ohne Leerzeichen am Ende (sys_version ist leer)
+
+        def send_response(self, code, message=None):
+            self._sent_headers = set()
+            super().send_response(code, message)
+
+        def send_header(self, keyword, value):
+            getattr(self, "_sent_headers", set()).add(keyword.lower())
+            super().send_header(keyword, value)
+
+        def end_headers(self):
+            # Review 1.16.1: auch Antworten, die nicht über reply() laufen (send_error: 400, 414, 431, 501 für HEAD/PUT …),
+            # bekommen die Sicherheits-Kopfzeilen; was die Antwort schon selbst gesetzt hat, bleibt
+            sent = getattr(self, "_sent_headers", None)
+            if sent is not None:
+                for k, v in API_HEADERS.items():
+                    if k.lower() not in sent:
+                        super().send_header(k, v)
+                self._sent_headers = None
+            super().end_headers()
 
         def authorized(self, tok):
             """Token als Bytes vergleichen (Umlaute im Header würden compare_digest sonst abbrechen lassen)."""
@@ -4982,7 +5382,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
-            for k, v in (headers or {}).items():
+            for k, v in dict(API_HEADERS, **(headers or {})).items():
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
@@ -5008,15 +5408,16 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if u.path in ("/", "/index.html"):
                 # Übersicht im Browser: die Seite selbst ist ohne Token, die Werte holt sie mit dem Token
-                body = read(WEB_PAGE, "").encode() or b"Weboberfl\xc3\xa4che fehlt (web.html)"
+                body, csp = web_page()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")
-                self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                                 "img-src data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+                self.send_header("X-Frame-Options", "DENY")
+                # ab 1.16.1: Skripte nur mit dem Hash der eigenen Seite (kein 'unsafe-inline')
+                self.send_header("Content-Security-Policy", csp)
                 self.end_headers()
                 return self.wfile.write(body)
             if u.path == "/api/ping":
@@ -5035,6 +5436,10 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                     return self.reply(403, {"error": "nur mit IP-Adresse oder lokalem Namen"})
                 if not tok:
                     return self.refuse()
+                wait = hello_limiter.allow(self.client_address[0])   # ab 1.16.1: gegen Massenabfragen ohne Token
+                if wait:
+                    return self.reply(429, {"error": "Zu viele Anfragen, später nochmals versuchen", "retry_after": wait},
+                                      {"Retry-After": str(wait)})
                 nonce = q.get("nonce", "")
                 if not HELLO_NONCE.fullmatch(nonce):
                     return self.reply(400, {"error": "nonce: 32 Zeichen 0-9a-f"})
@@ -5045,10 +5450,11 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                     return self.reply(403, {"error": "nur aus dem Heimnetz"})
                 return self.reply(200, {"queries": price_watchlist()})
             if u.path == "/api/crashes" and crashes:
-                # Absturzberichte lesen: mit Token, oder ohne Token nur aus dem Heimnetz und mit lokalem Host-Namen
-                # (Fehlersuche per curl; die App entfernt Schlüssel vorher)
-                if not self.authorized(tok) and not self.local_request():
-                    return self.reply(403, {"error": "nur aus dem Heimnetz"})
+                # Absturzberichte lesen: ab 1.16.1 immer mit Token (Audit Lauf 2: ein Reverse-Proxy auf dem NAS selbst ohne
+                # Weiterleitungs-Kopf sähe sonst wie Loopback aus). Die App sendet den Token ohnehin; von Hand:
+                # curl -H "Authorization: Bearer $(cat /config/token.txt)" http://127.0.0.1:8099/api/crashes
+                if not self.authorized(tok):
+                    return self.refuse()            # 401 falscher/fehlender Token, 429 Bremse, 503 kein Token geladen
                 try:
                     lim = max(1, min(int(q.get("limit", "50")), CRASH_KEEP))
                 except ValueError:
@@ -5096,7 +5502,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                     return self.reply(429, {"error": "Zu viele Abrufe, später nochmals versuchen", "retry_after": wait},
                                       dict(nostore, **{"Retry-After": str(wait)}))
                 try:
-                    return self.reply(200, discover.scan(with_keys=q.get("keys", "1") != "0"), nostore)
+                    return self.reply(200, discover.scan(with_keys=q.get("keys", "1").strip().lower() not in ("0", "false", "no", "off", "nein")), nostore)
                 except Exception:  # noqa: BLE001
                     return self.reply(500, {"error": "Suche fehlgeschlagen"}, nostore)
             if u.path == "/api/info":
@@ -5265,20 +5671,35 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                     return self.reply(400, {"error": "trace fehlt"})
                 crashes.add(body)
                 return self.reply(200, {"ok": True})
+            # Ab 1.16.1 (Audit Restteile): jeder Auslöser höchstens einmal gleichzeitig. Speedtest und Test-Push melden
+            # 409 «läuft schon» (die App zeigt den Text); Gerätesuche und Index antworten wie bisher 202, aber started=false
             if u.path == "/api/notify/test":
-                ok = ntfy("NZBLab-Agent: Test", "So sehen Alarme vom NAS aus. Kommt diese Meldung an, ist alles eingerichtet.", tags="white_check_mark", priority="default")
+                if not NOTIFY_TEST_LOCK.acquire(blocking=False):
+                    return self.reply(409, {"error": "Test-Meldung läuft schon", "running": True})
+                try:
+                    ok = ntfy("NZBLab-Agent: Test", "So sehen Alarme vom NAS aus. Kommt diese Meldung an, ist alles eingerichtet.", tags="white_check_mark", priority="default")
+                finally:
+                    NOTIFY_TEST_LOCK.release()
                 return self.reply(200 if ok else 409, {"ok": ok} if ok else {"error": "Keine ntfy-Adresse eingerichtet oder ntfy nicht erreichbar"})
             if u.path == "/api/speedtest":
+                if not SPEED_LOCK.acquire(blocking=False):
+                    return self.reply(409, {"error": "Speedtest läuft schon, gleich nochmals versuchen", "running": True})
                 try:
                     return self.reply(200, speedtest())
                 except OSError as e:
-                    return self.reply(502, {"error": f"Speedtest fehlgeschlagen: {e}"})
+                    return self.reply(502, {"error": f"Speedtest fehlgeschlagen: {e}"[:200]})
+                finally:
+                    SPEED_LOCK.release()
             if u.path == "/api/devices/scan" and lan:
+                if lan.running or lan._scan_guard.locked():
+                    return self.reply(202, {"started": False, "running": True})
                 threading.Thread(target=lan.scan, daemon=True).start()
                 return self.reply(202, {"started": True})
             if u.path == "/api/files/refresh" and index:
                 if not index.available():
                     return self.reply(409, {"error": f"{index.root} fehlt: Pfad /mnt/user nur lesen nach /host/mnt/user einbinden"})
+                if index.state.get("running") or index._build_guard.locked():
+                    return self.reply(202, {"started": False, "running": True})
                 threading.Thread(target=index.build, daemon=True).start()
                 return self.reply(202, {"started": True})
             return self.reply(404, {"error": "unbekannt"})
@@ -5286,6 +5707,8 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
 
 
 def main():
+    # Ab 1.16.1: neue Dateien in /config nur für den Agenten lesbar (Datei-Index, Verlauf, Absturzberichte; vorher 644)
+    os.umask(0o077)
     try:
         os.makedirs(CONFIG, exist_ok=True)
     except OSError as e:
@@ -5354,6 +5777,39 @@ def make_server(bind, port, handler):
     class Server(ThreadingHTTPServer):
         address_family = fam
         daemon_threads = True
+
+        def __init__(self, *a, **kw):
+            self._conns, self._conns_lock = {}, threading.Lock()
+            super().__init__(*a, **kw)
+
+        def process_request(self, request, client_address):
+            # Ab 1.16.1: höchstens MAX_CONN_PER_IP offene Verbindungen je Absender und MAX_CONN insgesamt (Slowloris:
+            # der Lese-Timeout gilt je Lesevorgang, ein tröpfelnder Absender hielte sonst beliebig viele Fäden fest)
+            ip = client_address[0]
+            with self._conns_lock:
+                if self._conns.get(ip, 0) >= MAX_CONN_PER_IP or sum(self._conns.values()) >= MAX_CONN:
+                    self.shutdown_request(request)
+                    return
+                self._conns[ip] = self._conns.get(ip, 0) + 1
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self._release(ip)
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self._release(client_address[0])
+
+        def _release(self, ip):
+            with self._conns_lock:
+                n = self._conns.get(ip, 0) - 1
+                if n > 0:
+                    self._conns[ip] = n
+                else:
+                    self._conns.pop(ip, None)
     return Server((bind, port), handler)
 
 

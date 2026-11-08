@@ -20,7 +20,7 @@ services:
       TZ: Europe/Zurich
       PUID: "99"              # Benutzer nach dem Start (Unraid 99 = nobody); TrueNAS 568, Synology 0, Linux 65534; 0 = root
       PGID: "100"             # Gruppe (Unraid 100 = users); TrueNAS 568, Synology 0, Linux 65534
-      # NZBLAB_AGENT_TOKEN: ""        # leer = Agent erzeugt selbst einen
+      # NZBLAB_AGENT_TOKEN: ""        # besser leer lassen (Agent erzeugt selbst einen); eigener: mindestens 32 zufällige Zeichen, sonst Fehler
       # NTFY_URL: "https://ntfy.sh/ein-langes-geheimes-wort"
       # NZBLAB_BIND: "0.0.0.0"        # nur auf dieser Adresse lauschen, z. B. die LAN-Adresse des NAS
       # NZBLAB_NET: "0"               # Netz-/Latenz-Messung aus (Standard an: TCP-Aufbau zu Router und 1.1.1.1:443, jede Minute)
@@ -67,17 +67,26 @@ services:
     # --- S SMART (freiwillig, mit NZBLAB_SMART=1): jede Platte einzeln freigeben (ls /dev/sd? /dev/nvme?), dazu SYS_RAWIO.
     # Nur ein kleiner Helfer-Prozess bleibt dafür root und startet ausschliesslich «smartctl --scan» und «smartctl -a -n standby»
     # (keine Selbsttests, schlafende Platten werden nicht geweckt); der Agent selbst läuft als PUID ohne Rechte.
-    # Nicht zusammen mit «user:» (Linux-Einzeldatei) und nicht mit «cap_drop: ALL» ohne die Rechte unten.
+    # Nicht zusammen mit «user:» (Linux-Einzeldatei).
     # devices:
     #   - /dev/sda:/dev/sda
     #   - /dev/sdb:/dev/sdb
     #   - /dev/nvme0:/dev/nvme0
-    # cap_add:
-    #   - SYS_RAWIO            # SATA/SAS-Platten lesen
-    #   # - SYS_ADMIN          # nur für NVMe-SMART nötig (breites Recht; NVMe-Temperatur geht auch ohne)
+    # Dafür unten bei cap_add ergänzen:  - SYS_RAWIO   (SATA/SAS-Platten lesen)
+    #                                    - SYS_ADMIN   (nur für NVMe-SMART; breites Recht, NVMe-Temperatur geht auch ohne)
     read_only: true
     tmpfs:
       - /tmp
+    # Ab 1.16.1: nur die Rechte, die der Start braucht (/config dem Benutzer PUID geben, dann auf PUID/PGID wechseln);
+    # danach hat der Agent gar keine mehr. SMART (Block S): zusätzlich SYS_RAWIO unter cap_add.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m

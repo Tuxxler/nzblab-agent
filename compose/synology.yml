@@ -32,6 +32,16 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    # Ab 1.16.1: nur diese Rechte statt der Docker-Standardliste. Mit PUID 0 bleibt der Agent root, aber nur mit ihnen
+    # (DAC_OVERRIDE: Ordner anderer Pakete lesen). SMART: zusätzlich SYS_RAWIO unter cap_add.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m

@@ -37,7 +37,9 @@ In der App eintragen: Einstellungen › Server-Verbindungen › NASlab-Agent.
 
 Danach steht er nur noch in der Datei. Wer das Container-Log lesen kann, ist ohnehin Admin des NAS. Bewusst **keine**
 Setup-Seite, die den Token im Browser zeigt: sonst könnte ihn jedes Gerät im Heimnetz abholen. Neuer Token: `token.txt`
-löschen und Container neu starten. Eigener Token: Variable `NZBLAB_AGENT_TOKEN` (dann nichts im Log, sie hat Vorrang).
+löschen und Container neu starten. Eigener Token: Variable `NZBLAB_AGENT_TOKEN` (dann nichts im Log, sie hat Vorrang): **mindestens 32 zufällige Zeichen ohne
+Leerzeichen, besser leer lassen** (ab 1.16.1; kürzere Werte oder Werte mit weniger als 8 verschiedenen Zeichen, z. B.
+`aaaa…`, lehnt der Agent mit `503`/`token_error` ab).
 
 **Pfad `/config` ist Pflicht:** Hier speichert der Agent Token und Verlauf. Ohne eigenen Pfad liegt beides nur im
 Container und ist nach jedem Update weg: Dann gibt es jedes Mal einen neuen Token, die App verbindet sich nicht mehr. Unraid:
@@ -46,7 +48,7 @@ Compose: `- ./nzblab-agent:/config` (bzw. der Pfad in den Vorlagen).
 
 Ab 1.13.0 sichert der Agent das ab:
 
-- Ein neuer Token entsteht **nur**, wenn `token.txt` fehlt. Ist die Datei leer, beschädigt oder nicht lesbar (Rechte),
+- Ein neuer Token entsteht **nur**, wenn `token.txt` fehlt. Ist die Datei leer, beschädigt, zu kurz (unter 32 Zeichen, ab 1.16.1), ein Symlink (ab 1.16.1 mit `O_NOFOLLOW` nie gelesen) oder nicht lesbar (Rechte),
   überschreibt er sie nie: Fehlermeldung im Log, und alle Anfragen mit Token antworten `503` mit dem genauen Grund
   (`{"error": …, "token_error": …}`). Lösung: alten Token in die Datei schreiben, Datei löschen (dann neuer Token) oder
   `NZBLAB_AGENT_TOKEN` setzen.
@@ -220,8 +222,15 @@ Lidarr, Readarr, Whisparr und andere Dienste werden nicht gemeldet.
 
 **Grenzen und Sicherheit:**
 
-- höchstens 3 Ordner-Ebenen unter jedem Container-Ordner, 3000 Einträge pro Ordner, 500 Ordner; grosse Datenordner (Cache,
-  Logs, Backups, MediaCover, Metadata …) und versteckte Ordner werden nicht betreten
+- höchstens 3 Ordner-Ebenen unter jedem Container-Ordner, 3000 Einträge pro Container-Ordner (über alle Ebenen), 500 Ordner
+  unter jeder Wurzel (gleiche Ordnernamen unter einer zweiten Wurzel zählen nur einmal); grosse Datenordner (Cache, Logs,
+  Backups, MediaCover, Metadata, Datenbank-Ordner wie `pgdata`, `mysql`, `model-cache` …) und versteckte Ordner werden nicht
+  betreten; Postgres-/MariaDB-Container werden ganz übersprungen
+- höchstens rund 8 Sekunden Suchzeit (App-Zeitlimit 10 s), danach kommt, was bis dahin gefunden wurde, mit `partial: true`; die
+  Antwort ohne Schlüssel (`?keys=0`) merkt sich der Agent 60 Sekunden
+- `partial: true` heisst ab 1.16.1: Zeitbudget oder Ordnerzahl erreicht, oder ein Ordner, der nach einem bekannten Dienst
+  aussieht, wurde abgebrochen, bevor seine Einstellungsdatei gefunden war. Ein abgebrochener fremder Ordner (z. B. Nextcloud
+  `data`) zählt nicht mehr
 - Symlinks werden nie verfolgt (Ordner nicht, Dateien nicht: `O_NOFOLLOW`), nur normale Dateien bis 1 MB
 - XML mit `DOCTYPE`/`ENTITY` wird nicht ausgewertet; Schlüssel nur, wenn sie wie ein Schlüssel aussehen (16–128 Zeichen
   `A-Z a-z 0-9 _ - + / =`)
@@ -231,7 +240,13 @@ Lidarr, Readarr, Whisparr und andere Dienste werden nicht gemeldet.
   Token-Bremse
 - Schlüssel stehen nie im Log, auch nicht im Fehlerfall (`500 {"error": "Suche fehlgeschlagen"}` ohne Einzelheiten), nicht
   in «Heute», im Verlauf oder in der Weboberfläche
-- liest der Agent als PUID 99 einen Ordner nicht: `code: "unreadable"`, Abhilfe PUID=0
+- liest der Agent als PUID 99 einen Ordner oder eine Datei nicht: `code: "unreadable"` (ab 1.16.1 auch für nicht lesbare
+  Ordner, wenn der Ordnername nach Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Seerr, Plex, Jellyfin oder Emby aussieht), Abhilfe PUID=0
+- Tautulli wird nur erkannt mit Abschnitt `[PMS]` in `config.ini` oder «tautulli» im Ordnernamen (ab 1.16.1; Headphones,
+  LazyLibrarian, Mylar & Co. haben auch `[General] http_root`, sind aber keine); Emby und Jellyfin vor 10.9 lesen den Port aus
+  `system.xml` (`HttpServerPortNumber`)
+- `?keys=` akzeptiert `0`, `false`, `no`, `off`, `nein` (ab 1.16.1, wie die Umgebungsvariablen); `keys` in der Antwort zeigt, ob
+  wirklich Schlüssel mitkommen
 
 **Antwort:**
 
@@ -250,7 +265,73 @@ Lidarr, Readarr, Whisparr und andere Dienste werden nicht gemeldet.
 `code`: `ok`, `keys_off`, `plex_token`, `jellyfin_key`, `emby_key`, `unreadable`, `broken` (Datei kaputt oder ohne gültigen
 Schlüssel). `port` ist bei SSL der HTTPS-Port, `httpPort` dann der unverschlüsselte. **Wichtig:** Die Ports gelten im
 Container. Im Bridge-Netz kann Docker sie am NAS anders abbilden (z. B. 8989 → 18989); das muss die App über die
-Containerliste des NAS (Portzuordnung) lösen. `partial: true` = eine Grenze wurde erreicht.
+Containerliste des NAS (Portzuordnung) lösen. `partial: true` = eine Grenze wurde erreicht (siehe oben).
+
+**Teststand:** nur mit erfundenen Testdaten geprüft (`test_fixtures/discover/`, Unit-Tests), **noch nicht gegen echte appdata**
+und nicht auf echtem Unraid.
+
+## Ab 1.16.1: Korrekturen aus Sicherheitsaudit und Code-Reviews
+
+Gleiche Schnittstelle (`api_level` 16). Geändert:
+
+- **Token:** `NZBLAB_AGENT_TOKEN` und `token.txt` unter 32 Zeichen (oder mit Leer-/Steuerzeichen) lehnt der Agent mit klarer
+  Meldung im Log und `503`/`token_error` ab (nie mit dem Token im Log); `token.txt` wird mit `O_NOFOLLOW` geöffnet.
+- **`/api/crashes`:** nur noch mit Token, auch vom NAS selbst (Audit Lauf 2: ein Reverse-Proxy auf dem NAS ohne
+  Weiterleitungs-Kopf sah sonst wie Loopback aus); alle Felder werden beim Speichern geschwärzt, kurze Felder auf 200 Zeichen gekürzt.
+- **Toppreise:** `og:title` wird auf 500 Zeichen gekappt und linear geteilt (keine quadratische Regex mehr).
+- **Dienste finden:** Tautulli-Erkennung strenger, `partial` nur noch bei abgeschnittenem Dienst-Ordner, Datenbank-Ordner
+  übersprungen, `unreadable` auch für nicht lesbare Ordner, Zeitbudget 8 s, 60-s-Zwischenspeicher ohne Schlüssel, `?keys=0|false|no|off`
+  mit ehrlichem `keys`, Emby-/Jellyfin-Port aus `system.xml`.
+
+### Ab 1.16.1: Härtung (Audit Lauf 2)
+
+- **Kopfzeilen:** Alle Antworten (JSON und Fehlerseiten wie `501` für `HEAD`) mit `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` und
+  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` (die Browser-Seite behält ihre eigene CSP und
+  `no-cache`). Server-Kopf ohne Python-Version.
+- **Browser-Seite:** CSP ohne `'unsafe-inline'` für Skripte; erlaubt ist nur der SHA-256 des eigenen Skripts (beim Start aus
+  `web.html` berechnet). Stile bleiben `'unsafe-inline'` (Balken und Farben über `style="…"`; alle Daten laufen durch `esc()`).
+  `X-Frame-Options: DENY`.
+- **Token:** zusätzlich mindestens 8 verschiedene Zeichen (`aaaa…`, `1234…` sind trotz 32 Zeichen leicht zu erraten).
+- **`/api/hello`:** höchstens 30 Anfragen pro Minute und Absender (danach `429` mit `Retry-After`; die App wertet das als
+  «nicht erkannt», nicht als «fremdes Gerät»). Der Beweis bleibt `HMAC-SHA256(Token, "nzblab-hello:" + Nonce)`: Eine langsame
+  Ableitung (PBKDF2/scrypt) würde alle bisherigen App-Versionen brechen (sie rechnen genau diesen Wert) und hilft nur, wenn der
+  alte Beweis ganz wegfällt. Schutz gegen Offline-Raten sind darum die Mindestlänge, die Zeichenvielfalt und der zufällige
+  Standard-Token (192 Bit).
+- **Verbindungen:** höchstens 32 gleichzeitig offene Verbindungen je Absender und 256 insgesamt (`NZBLAB_MAX_CONN_PER_IP`,
+  `NZBLAB_MAX_CONN`); halbe Anfragen (Slowloris) belegen so nicht beliebig viele Fäden. Token-Bremse räumt höchstens einmal
+  pro Sekunde auf.
+- **Sammler:** `README` in Backup-Ordnern nur die ersten 300 Bytes, kaputtes UTF-8 bricht die Backup-Suche nicht mehr ab;
+  E-Mail-Regel beim Schwärzen linear, Logzeilen vor dem Schwärzen auf 4000 Zeichen gekürzt; Geräteliste: höchstens 64 neue
+  Geräte je Suchlauf (der erste Suchlauf übernimmt alle, ohne Meldung), 5 Einzelmeldungen plus eine Sammelmeldung, höchstens 2000 Geräte, Namen nur druckbar (253 Zeichen);
+  Syslog-Zeilen für «Heute» werden geschwärzt (key=wert, Bearer, Cookie …); Cookie-Zeilen werden ganz geschwärzt.
+- **/config:** neue Dateien nur noch für den Agenten lesbar (`umask 077`: Datei-Index, Verlauf, Absturzberichte).
+  Bestehende Dateien behalten ihre Rechte.
+- **Container:** Vorlagen (Compose, TrueNAS, Synology, Unraid) mit `cap_drop: ALL` und nur `CHOWN`, `DAC_OVERRIDE`, `FOWNER`,
+  `SETUID`, `SETGID` (Start als root für `/config`, dann Wechsel auf PUID ohne Rechte), dazu wie bisher `read_only`,
+  `no-new-privileges`. SMART braucht zusätzlich `SYS_RAWIO`. Kein `USER` im Dockerfile: bestehende Installationen besitzen
+  `/config` noch als root, und der SMART-Helfer braucht root. Basis-Image per Digest festgenagelt.
+- **Workflow:** Rechte nur im Job (`contents: read`, `packages: write`), Actions auf Commit-SHA, Checkout ohne gespeicherte
+  Zugangsdaten, kein `pull_request_target`; das Image wird zuerst lokal gebaut und mit den Rechten der Vorlagen getestet,
+  erst dann werden Versions-Tag und `latest` hochgeladen. Der Token wird im Log nie ausgegeben.
+
+### Ab 1.16.1: Audit Restteile
+
+- **WireGuard:** Konfiguration höchstens 256 KiB je Datei gelesen; Kommentare oder `NAME`-Felder, die nach Schlüssel aussehen
+  («Private Key», «Preshared», «PSK», lange Base64-Folge; «Mein privater Laptop» bleibt ein Name), werden nie Peer-Namen; Fehler beim Auswerten melden nur `reason: "error"`
+  ohne Text. Private und Preshared Keys verlassen den Agent wie bisher nie.
+- **Doppelte Dateien:** Teil-Prüfsummen nur für echte Dateien innerhalb der Freigaben (`O_NOFOLLOW`, kein Symlink, keine Pipe,
+  die `open()` sonst für immer blockierte); solche Einträge gelten als nicht lesbar.
+- **Auslöser:** Speedtest und Test-Push höchstens einmal gleichzeitig (sonst `409` «läuft schon»); Gerätesuche und
+  Index-Neuaufbau prüfen und setzen «läuft» in einem Schritt, ein zweiter Auslöser antwortet `202` mit `started: false`.
+- **Preise:** nur `https` auf öffentliche Adressen, auch bei Weiterleitungen (höchstens 5; nie ins Heimnetz, Loopback,
+  Link-local, CGNAT, auch nicht über NAT64 oder IPv4 in IPv6; DNS-Fehler = blockiert); Seite höchstens 4 MB in 60 Sekunden; Links aus fremden Seiten nur `https://`.
+
+**Bestehende Installationen:** Nichts muss geändert werden. Wer einen eigenen Token mit weniger als 8 verschiedenen Zeichen
+gesetzt hat, bekommt `503` mit Grund und muss ihn ersetzen (oder leer lassen). Wer `/api/crashes` von Hand ohne Token
+abgefragt hat: `curl -H "Authorization: Bearer $(cat /config/token.txt)" http://127.0.0.1:8099/api/crashes`. Die neuen
+Container-Rechte gelten nur für neue Vorlagen; eigene Compose-Dateien und gespeicherte Unraid-Vorlagen bleiben, wie sie sind
+(freiwillig übernehmen: die Zeilen `cap_drop`/`cap_add` bzw. die «Extra Parameters» aus der neuen Vorlage).
 
 ## Übersicht im Browser (ab 1.4.0)
 
@@ -278,15 +359,16 @@ Anzahl Absturzberichte der App, letzte Aktualisierung). Die HTML-Seite selbst en
 
 ## Schnittstelle
 
-Alle Anfragen ausser `/api/ping`, `/api/health` und `/api/hello` mit `Authorization: Bearer <Token>`. Falscher Token: `401`;
+Alle Anfragen ausser `/api/ping`, `/api/health` und `/api/hello` (ab 1.16.1 höchstens 30 pro Minute und Absender) mit `Authorization: Bearer <Token>`. Falscher Token: `401`;
 ab 1.15.0 nach 10 falschen Tokens in einer Minute von derselben Adresse `429` mit `Retry-After` für 5 Minuten
 (`NZBLAB_AUTH_FAILS`). Anfragen über 64 KiB: `413` (Absturzberichte bis 128 000 Bytes), `Transfer-Encoding`: `411`. Konnte der
 Agent selbst keinen Token laden (ab 1.13.0, `token.txt` leer/kaputt/nicht lesbar): `503` mit `token_error`.
 
-Ausnahmen ohne Token: `GET /api/prices/watch` (nur Plattenserien) und `GET /api/crashes` (Absturzberichte der App, ohne
-Schlüssel). Beide nur aus privaten Netzen **und** nur mit IP-Adresse oder lokalem Namen im `Host`-Header (`nas`, `*.local`,
-`*.lan`, `*.home.arpa`, `*.internal`), damit fremde Websites sie nicht über DNS-Rebinding lesen können. Mit Token gehen beide
-immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); `token.txt` und `settings.json` haben Rechte 600.
+Ausnahme ohne Token: `GET /api/prices/watch` (nur Plattenserien), nur aus privaten Netzen **und** nur mit IP-Adresse oder
+lokalem Namen im `Host`-Header (`nas`, `*.local`, `*.lan`, `*.home.arpa`, `*.internal`), damit fremde Websites sie nicht über
+DNS-Rebinding lesen können. `GET /api/crashes` (Absturzberichte der App) braucht ab 1.16.1 immer den Token, auch vom NAS
+selbst. Die App sendet den Token ohnehin. Neue Berichte schwärzt der Agent beim Speichern (Zugangsdaten in Adressen,
+Bearer-Tokens, Cookie-Zeilen, Schlüssel und Passwörter, lange Zufallsketten). Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); `token.txt` und `settings.json` haben Rechte 600.
 
 | Pfad | Inhalt |
 |---|---|

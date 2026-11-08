@@ -124,7 +124,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.16.0")
+        self.assertEqual(info["version"], "1.16.1")
         srv.shutdown()
 
 
@@ -160,7 +160,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.16.0")
+            self.assertEqual(r["version"], "1.16.1")
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents
@@ -446,15 +446,22 @@ class MoverUndAbstuerzeTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 401)
         req = urllib.request.Request(base + "/api/crash", data=body, method="POST", headers={"Authorization": "Bearer geheim", "Content-Type": "application/json"})
         self.assertTrue(json.load(urllib.request.urlopen(req))["ok"])
-        # Lesen aus dem Heimnetz (127.0.0.1) ohne Token
-        got = json.load(urllib.request.urlopen(base + "/api/crashes"))["crashes"]
+        # Lesen: ab 1.16.1 (Audit Lauf 2) immer mit Token, auch vom NAS selbst (Loopback) und hinter einem Proxy
+        for hdr in ({}, {"Host": "127.0.0.1:8099"}, {"Host": "evil.example:8099"}, {"X-Forwarded-For": "203.0.113.9"}):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(urllib.request.Request(base + "/api/crashes", headers=hdr))
+            self.assertEqual(e.exception.code, 401, hdr)
+            self.assertNotIn("IllegalStateException", e.exception.read().decode())
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(urllib.request.Request(base + "/api/crashes", headers={"Authorization": "Bearer falsch"}))
+        self.assertEqual(e.exception.code, 401)
+        got = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/crashes", headers={"Authorization": "Bearer geheim"})))["crashes"]
         self.assertEqual(got[0]["version"], "2.18.14")
         self.assertIn("IllegalStateException", got[0]["trace"])
-        # DNS-Rebinding: fremder Name im Host-Header ohne Token → abgelehnt, mit Token erlaubt
-        for path in ("/api/crashes", "/api/prices/watch"):
-            with self.assertRaises(urllib.error.HTTPError) as e:
-                urllib.request.urlopen(urllib.request.Request(base + path, headers={"Host": "evil.example:8099"}))
-            self.assertEqual(e.exception.code, 403)
+        # Preis-Beobachtungsliste bleibt ohne Token aus dem Heimnetz, aber nicht mit fremdem Host-Namen (DNS-Rebinding)
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(urllib.request.Request(base + "/api/prices/watch", headers={"Host": "evil.example:8099"}))
+        self.assertEqual(e.exception.code, 403)
         ok = urllib.request.Request(base + "/api/crashes", headers={"Host": "evil.example", "Authorization": "Bearer geheim"})
         self.assertEqual(json.load(urllib.request.urlopen(ok))["crashes"][0]["version"], "2.18.14")
         srv.shutdown()
@@ -1152,8 +1159,8 @@ class InstallTest(unittest.TestCase):
             t2 = a.token()
         self.assertEqual(t1, t2)
         self.assertNotIn(t1, out2.getvalue())       # zweiter Start: Token nicht nochmals im Log
-        os.environ["NZBLAB_AGENT_TOKEN"] = "vorgegeben"
-        self.assertEqual(a.token(), "vorgegeben")
+        os.environ["NZBLAB_AGENT_TOKEN"] = "vorgegeben-" + "x" * 24
+        self.assertEqual(a.token(), "vorgegeben-" + "x" * 24)
 
     def test_ohne_puid_bleibt_alles(self):
         self.assertIsNone(a.drop_privileges())
@@ -1406,7 +1413,7 @@ class ConfigPersistTest(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "fork") and os.geteuid() == 0, "nur als root prüfbar")
     def test_unlesbare_datei_nie_ueberschrieben(self):
-        write(f"{self.d}/token.txt", "alter-token")
+        write(f"{self.d}/token.txt", "alter-token-" + "a" * 24)
         os.chmod(f"{self.d}/token.txt", 0o000)
         os.chmod(self.d, 0o777)
         r, w = os.pipe()
@@ -1429,7 +1436,7 @@ class ConfigPersistTest(unittest.TestCase):
         self.assertIn("nicht lesbar", res)
         os.chmod(f"{self.d}/token.txt", 0o600)
         with open(f"{self.d}/token.txt") as f:
-            self.assertEqual(f.read(), "alter-token")
+            self.assertEqual(f.read(), "alter-token-" + "a" * 24)
 
     def test_verzeichnis_statt_datei(self):
         os.makedirs(f"{self.d}/token.txt")
@@ -1439,12 +1446,12 @@ class ConfigPersistTest(unittest.TestCase):
 
     def test_variable_gewinnt(self):
         write(f"{self.d}/token.txt", "aus-datei")
-        os.environ["NZBLAB_AGENT_TOKEN"] = "  aus-variable "
-        self.assertEqual(a.token(), "aus-variable")
+        os.environ["NZBLAB_AGENT_TOKEN"] = "  aus-variable-" + "v" * 20 + " "
+        self.assertEqual(a.token(), "aus-variable-" + "v" * 20)
         self.assertEqual(a.TOKEN_STATE["source"], "env")
         # auch bei leerer Datei: Variable gilt, Datei bleibt, kein Fehler
         write(f"{self.d}/token.txt", "")
-        self.assertEqual(a.token(), "aus-variable")
+        self.assertEqual(a.token(), "aus-variable-" + "v" * 20)
         self.assertEqual(a.TOKEN_STATE["error"], "")
         self.assertFalse(os.path.getsize(f"{self.d}/token.txt"))
 
@@ -2240,6 +2247,14 @@ class Agent115Test(unittest.TestCase):
         self.assertEqual(r("password: hallo welt"), "password: <redacted> welt")
         self.assertEqual(r("x api_key=\"a b\" y"), "x api_key=<redacted> y")
         self.assertIn("<redacted>", r("Authorization: Bearer abcdefghijkl"))
+        # Review 1.16.1: nach «_», JSON-Schlüssel und Basic-Anmeldung samt Wert
+        s = a.redact_secrets
+        self.assertEqual(s("access_token=abc123&x=1"), "access_token=<redacted>&x=1")
+        self.assertEqual(s("client_secret: xyz"), "client_secret: <redacted>")
+        self.assertEqual(s('{"apiKey":"abcdef1234"}'), '{"apiKey":<redacted>}')
+        self.assertEqual(s("Authorization: Basic dXNlcjpwYXNz"), "Authorization: <redacted>")
+        self.assertNotIn("abcdefghijkl", s("Authorization: Bearer abcdefghijkl"))
+        self.assertEqual(s("monkey=banana at 10.0.0.5"), "monkey=banana at 10.0.0.5")    # IPs bleiben, kein Treffer in Wörtern
         self.assertEqual(r("/home/maria/x"), "/home/<user>/x")
         self.assertNotIn("Ferien", r("/mnt/user/Fotos/Ferien/1.jpg"))
 
@@ -2537,6 +2552,731 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(lim.allow(now=100.0 + 61), 0)                 # nach einer Minute wieder frei
         self.assertEqual(a.Discover().limiter.max_calls, 10)           # Standard: 10 pro Minute
 
+
+class Agent1161Test(unittest.TestCase):
+    """1.16.1: Korrekturen aus dem Sicherheitsaudit und den Code-Reviews zu 1.16.0 (alles mit erfundenen Testdaten)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = a.CONFIG, os.environ.pop("NZBLAB_AGENT_TOKEN", None)
+        a.CONFIG = self.d
+
+    def tearDown(self):
+        import shutil
+        a.CONFIG = self.old[0]
+        os.environ.pop("NZBLAB_AGENT_TOKEN", None)
+        if self.old[1] is not None:
+            os.environ["NZBLAB_AGENT_TOKEN"] = self.old[1]
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def quiet(self, fn, *args):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            r = fn(*args)
+        return r, out.getvalue()
+
+    # --- Token
+    def test_token_zu_kurz_oder_unbrauchbar(self):
+        for bad in ("nas123", "x" * 31, "mit leerzeichen " + "y" * 30, "tab\there" + "z" * 30):
+            os.environ["NZBLAB_AGENT_TOKEN"] = bad
+            t, log = self.quiet(a.token)
+            self.assertEqual(t, "", bad)
+            self.assertIn("NZBLAB_AGENT_TOKEN", a.TOKEN_STATE["error"])
+            self.assertEqual(a.TOKEN_STATE["source"], "")
+            self.assertIn("FEHLER: Token nicht nutzbar", log)
+            self.assertIn("mindestens 32", log)
+            self.assertNotIn(bad, log)                                 # nie den Token ins Log
+        os.environ["NZBLAB_AGENT_TOKEN"] = "abcdefgh" * 4             # genau 32 (8 verschiedene Zeichen): erlaubt
+        self.assertEqual(self.quiet(a.token)[0], "abcdefgh" * 4)
+        self.assertEqual(a.TOKEN_STATE["source"], "env")
+        self.assertFalse(os.path.exists(f"{self.d}/token.txt"))        # nichts angelegt, auch bei Fehlern nicht
+
+    def test_token_datei_zu_kurz_bleibt_unangetastet(self):
+        write(f"{self.d}/token.txt", "kurz123")
+        t, log = self.quiet(a.token)
+        self.assertEqual(t, "")
+        self.assertIn("zu kurz", a.TOKEN_STATE["error"])
+        self.assertNotIn("kurz123", log)
+        with open(f"{self.d}/token.txt") as f:
+            self.assertEqual(f.read(), "kurz123")                      # nie überschrieben
+        # Der Server antwortet dann mit 503 und dem Grund
+        srv = Server115()
+        srv.srv.shutdown()
+        srv.srv.server_close()
+        h = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(a.Store(":memory:"), lambda: {}, t))
+        threading.Thread(target=h.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{h.server_port}/api/info", headers={"Authorization": "Bearer "})
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req)
+            self.assertEqual(e.exception.code, 503)
+            self.assertIn("zu kurz", json.loads(e.exception.read())["token_error"])
+        finally:
+            h.shutdown()
+            h.server_close()
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "kein O_NOFOLLOW")
+    def test_token_datei_symlink_wird_nicht_gelesen(self):
+        write(f"{self.d}/echt.txt", "e" * 40)
+        os.symlink(f"{self.d}/echt.txt", f"{self.d}/token.txt")
+        t, log = self.quiet(a.token)
+        self.assertEqual(t, "")
+        self.assertIn("nicht lesbar", a.TOKEN_STATE["error"])
+        self.assertTrue(os.path.islink(f"{self.d}/token.txt"))         # nicht ersetzt
+        with patch.object(a.os, "open", wraps=os.open) as op:
+            os.unlink(f"{self.d}/token.txt")
+            write(f"{self.d}/token.txt", "ghijklmn" * 5)
+            self.assertEqual(self.quiet(a.token)[0], "ghijklmn" * 5)
+        flags = [c.args[1] for c in op.call_args_list if str(c.args[0]).endswith("token.txt")]
+        self.assertTrue(flags and all(f & os.O_NOFOLLOW for f in flags))
+
+    # --- Absturzberichte
+    def test_absturzbericht_wird_serverseitig_geschwaerzt(self):
+        cs = a.CrashStore(f"{self.d}/crashes")
+        cs.add({"version": "2.54.0", "kind": "crash", "screen": "https://admin:geheim1@example.com/x?apikey=ABCDEF123456",
+                "device": "Pixel password=hunter2",
+                "trace": "java.io.IOException: GET https://u:pw@192.168.1.5:8989/api\nAuthorization: Bearer abcdef0123456789xyz\n"
+                         "api_key=0000sonarrfixture000000000000aaa\nsecret=" + "Zz9" * 20 + "\n"
+                         "at ch.nzblab.app.data.Foo.bar(Foo.kt:12)\nkey " + "A1" * 30})
+        c = cs.list(1)[0]
+        txt = json.dumps(c)
+        for leak in ("geheim1", "ABCDEF123456", "hunter2", "pw@", "abcdef0123456789xyz", "0000sonarrfixture", "Zz9Zz9Zz9", "A1" * 30):
+            self.assertNotIn(leak, txt)
+        self.assertIn("<redacted>", c["trace"])
+        self.assertIn("Foo.kt:12", c["trace"])                          # Fehlersuche bleibt möglich
+        self.assertIn("192.168.1.5", c["trace"])                        # IPs und Pfade bleiben (nur Geheimnisse weg)
+        self.assertEqual(c["version"], "2.54.0")
+        # auch die Datei auf der Platte enthält nichts davon
+        for n in os.listdir(cs.dir):
+            with open(os.path.join(cs.dir, n)) as f:
+                self.assertNotIn("hunter2", f.read())
+
+    # --- Toppreise
+    def test_toppreise_titel_linear(self):
+        def page(title):
+            return ('<meta property="og:url" content="https://www.toppreise.ch/preisvergleich/x-p1"><meta property="og:title" content="'
+                    + title + '"><meta property="og:description" content="3 Angebote ab CHF 955.00 (Stand)">')
+        good = a.parse_toppreise_product(page("SEAGATE IronWolf Pro, 28 TB (ST28000NT000)   ab CHF 955.00 bei Toppreise.ch"), 28)
+        self.assertEqual((good["name"], good["price"]), ("SEAGATE IronWolf Pro, 28 TB (ST28000NT000)", 955.0))
+        t0 = time.monotonic()
+        self.assertIsNone(a.parse_toppreise_product(page("X" + " " * 1_000_000 + "Y"), 28))
+        self.assertIsNone(a.parse_toppreise_product(page(" " * 1_000_000), 28))
+        self.assertLess(time.monotonic() - t0, 2.0)
+        # ein langer Titel wird auf 500 Zeichen gekappt
+        got = a.parse_toppreise_product(page("28 TB " + "N" * 700 + " ab CHF 955.00"), 28)
+        self.assertLessEqual(len(got["name"]), 120)
+
+    # --- Discover
+    def disc(self, files, **kw):
+        import shutil
+        root = os.path.join(self.d, "appdata")
+        shutil.rmtree(root, ignore_errors=True)
+        for rel, content in files.items():
+            write(os.path.join(root, rel), content)
+        return a.Discover(roots=[root], **kw)
+
+    def test_tautulli_nur_mit_pms_oder_namen(self):
+        gen = "[General]\nhttp_port = 8181\nhttp_root = /x\napi_key = 0000lookalike0000000000000aaaa\n"
+        d = self.disc({"headphones/config.ini": gen, "lazylibrarian/config.ini": gen, "mylar3/config.ini": gen,
+                       "irgendwas/config.ini": gen,
+                       "tt/config.ini": gen + "[PMS]\npms_ip = x\n",
+                       "tautulli-alt/config.ini": gen,
+                       "headphones-mit-pms/config.ini": gen + "[PMS]\n"})
+        got = {(s["service"], s["folder"]) for s in d.scan()["services"]}
+        self.assertEqual(got, {("tautulli", "tt"), ("tautulli", "tautulli-alt")})
+        # Ordnername «headphones» auch mit [PMS]: ausgeschlossen (kein Tautulli-Ordnername)
+        self.assertNotIn("headphones-mit-pms", {f for _, f in got})
+
+    def test_partial_nur_bei_abgeschnittenem_dienstordner(self):
+        key = "<Config><Port>8989</Port><ApiKey>0000sonarrfixture000000000000aaa</ApiKey><InstanceName>Sonarr</InstanceName></Config>"
+        files = {f"nextcloud/data/f{i}.txt": "x" for i in range(30)}
+        files.update({f"gross-sonarr/zz{i}.txt": "x" for i in range(30)})
+        with patch.object(a, "DISCOVER_MAX_ENTRIES", 10):
+            res = self.disc(files).scan()
+        self.assertEqual(res["services"], [])
+        self.assertTrue(res["partial"])                                 # «gross-sonarr» sieht nach Dienst aus und wurde abgeschnitten
+        # Nur ein fremder Ordner (nextcloud) abgeschnitten: kein partial
+        with patch.object(a, "DISCOVER_MAX_ENTRIES", 10):
+            res = self.disc({f"nextcloud/data/f{i}.txt": "x" for i in range(30)}, cache_s=0).scan()
+        self.assertFalse(res["partial"])
+        # Gefundener Dienst, Rest des Ordners gross: kein partial
+        one = {"sonarr/config.xml": key}
+        one.update({f"sonarr/gross/zz{i}": "x" for i in range(200)})
+        with patch.object(a, "DISCOVER_MAX_ENTRIES", 50):
+            res = self.disc(one).scan()
+        self.assertFalse(res["partial"])
+        self.assertEqual([s["code"] for s in res["services"]], ["ok"])
+
+    def test_datenbank_ordner_werden_nicht_durchsucht(self):
+        files = {"postgres14/PG_VERSION": "14", "postgres14/pgdata/config.xml": "<Config><Port>8989</Port></Config>",
+                 "maria/mysql/x": "x", "maria/data/config.xml": "<Config/>",
+                 "immich/model-cache/config.xml": "<Config/>"}
+        files.update({f"postgres14/base/{i}/f": "x" for i in range(40)})
+        with patch.object(a, "DISCOVER_MAX_ENTRIES", 10):
+            res = self.disc(files).scan()
+        self.assertEqual(res["services"], [])
+        self.assertFalse(res["partial"])
+
+    def test_ordner_nicht_lesbar(self):
+        d = self.disc({"sonarr/config/config.xml": "<Config/>", "radarr/config.xml": "<Config/>", "tautulli/config.ini": "x",
+                       "fremd/config.xml": "<Config/>", "seerr-x/settings.json": "{}", "plex-meta-manager/a": "x"})
+        real = os.scandir
+
+        def deny(path="."):
+            if os.path.basename(str(path)) in ("sonarr", "tautulli", "seerr-x", "plex-meta-manager", "fremd"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+        with patch.object(a.os, "scandir", deny):
+            res = d.scan()
+        by = {(s["service"], s["folder"]): s for s in res["services"]}
+        for k in (("sonarr", "sonarr"), ("tautulli", "tautulli"), ("seerr", "seerr-x")):
+            self.assertEqual(by[k]["code"], "unreadable", k)
+            self.assertIsNone(by[k]["apiKey"])
+            self.assertIn("PUID=0", by[k]["note"])
+        self.assertNotIn("fremd", {f for _, f in by})                   # unbekannter Name: nichts erfunden
+        self.assertNotIn("plex-meta-manager", {f for _, f in by})       # Zusatzwerkzeug, kein Plex
+        self.assertEqual(by[("radarr", "radarr")]["code"], "broken")    # lesbar, aber ohne Schlüssel
+        self.assertNotIn(self.d, json.dumps(res))
+
+    def test_zeitbudget(self):
+        files = {f"sonarr{i:02d}/config.xml": "<Config><Port>8989</Port><ApiKey>0000sonarrfixture000000000000aaa</ApiKey></Config>"
+                 for i in range(20)}
+        tick = {"t": 0.0}
+
+        def clock():
+            tick["t"] += 1.0
+            return tick["t"]
+        res = self.disc(files, budget=8.0, clock=clock).scan()
+        self.assertTrue(res["partial"])
+        self.assertTrue(0 < len(res["services"]) < 20)
+        self.assertEqual(a.DISCOVER_BUDGET_S, 8.0)
+        full = self.disc(files, budget=100.0).scan()                    # genug Zeit: vollständig
+        self.assertFalse(full["partial"])
+        self.assertEqual(len(full["services"]), 20)
+
+    def test_ergebnis_ohne_schluessel_wird_60_s_gemerkt(self):
+        d = self.disc({"sonarr/config.xml": "<Config><Port>8989</Port><ApiKey>0000sonarrfixture000000000000aaa</ApiKey></Config>"})
+        first = d.scan(with_keys=False)
+        write(os.path.join(self.d, "appdata", "radarr", "config.xml"), "<Config><Port>7878</Port><ApiKey>0000radarrfixture000000000000bbb</ApiKey></Config>")
+        self.assertEqual(d.scan(with_keys=False)["services"], first["services"])    # aus dem Zwischenspeicher
+        self.assertEqual(len(d.scan(with_keys=True)["services"]), 2)               # mit Schlüsseln immer frisch
+        self.assertEqual(len(a.Discover(roots=d.explicit).scan(with_keys=False)["services"]), 2)
+        self.assertEqual(a.DISCOVER_CACHE_S, 60)
+
+    def test_keys_parameter_und_wirksamer_zustand(self):
+        d = self.disc({"sonarr/config.xml": "<Config><Port>8989</Port><ApiKey>0000sonarrfixture000000000000aaa</ApiKey></Config>"})
+        srv = Server115(discover=d)
+        try:
+            for off in ("0", "false", "no", "off", "FALSE", "Nein"):
+                code, body, _ = srv.get(f"/api/discover?keys={off}")
+                self.assertEqual(code, 200)
+                self.assertFalse(body["keys"], off)
+                self.assertNotIn("0000sonarr", json.dumps(body))
+            code, body, _ = srv.get("/api/discover?keys=1")
+            self.assertTrue(body["keys"])
+            self.assertIn("0000sonarrfixture000000000000aaa", json.dumps(body))
+            code, body, _ = srv.get("/api/discover")
+            self.assertTrue(body["keys"])
+            with patch.object(a, "DISCOVER_KEYS", False):
+                code, body, _ = srv.get("/api/discover")
+            self.assertFalse(body["keys"])
+        finally:
+            srv.close()
+
+    def test_emby_und_altes_jellyfin_port_aus_system_xml(self):
+        d = self.disc({"emby/config/system.xml": "<ServerConfiguration><HttpServerPortNumber>8920</HttpServerPortNumber></ServerConfiguration>",
+                       "emby2/config/system.xml": "<ServerConfiguration/>",
+                       "jellyfin-alt/config/system.xml": "<ServerConfiguration><HttpServerPortNumber>8097</HttpServerPortNumber></ServerConfiguration>"})
+        by = {s["folder"]: s for s in d.scan()["services"]}
+        self.assertEqual((by["emby"]["port"], by["emby"]["variant"], by["emby"]["portSource"]), (8920, "emby", "config"))
+        self.assertEqual((by["emby2"]["port"], by["emby2"]["portSource"]), (8096, "default"))
+        self.assertEqual((by["jellyfin-alt"]["port"], by["jellyfin-alt"]["variant"], by["jellyfin-alt"]["code"]),
+                         (8097, "jellyfin", "jellyfin_key"))
+        self.assertIsNone(by["emby"]["apiKey"])
+
+
+class Haertung1161Test(unittest.TestCase):
+    """1.16.1 Härtung: Sicherheits-Kopfzeilen, CSP mit Skript-Hash, /api/hello-Bremse, einfache Tokens, Cookie-Schwärzung,
+    Verbindungsgrenze je Absender (alles lokal mit erfundenen Daten)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = a.CONFIG, os.environ.pop("NZBLAB_AGENT_TOKEN", None)
+        a.CONFIG = self.d
+        a.AGENT_ID["v"] = None
+
+    def tearDown(self):
+        import shutil
+        a.CONFIG = self.old[0]
+        a.AGENT_ID["v"] = None
+        os.environ.pop("NZBLAB_AGENT_TOKEN", None)
+        if self.old[1] is not None:
+            os.environ["NZBLAB_AGENT_TOKEN"] = self.old[1]
+        shutil.rmtree(self.d, ignore_errors=True)
+    def test_json_kopfzeilen(self):
+        srv = Server115()
+        try:
+            for path, tok in (("/api/ping", None), ("/api/info", "geheim"), ("/api/now", "falsch")):
+                code, _, h = srv.get(path, tok=tok)
+                self.assertEqual(h["Cache-Control"], "no-store", path)
+                self.assertEqual(h["X-Content-Type-Options"], "nosniff", path)
+                self.assertEqual(h["X-Frame-Options"], "DENY", path)
+                self.assertEqual(h["Referrer-Policy"], "no-referrer", path)
+                self.assertIn("frame-ancestors 'none'", h["Content-Security-Policy"], path)
+                self.assertNotIn("Python", h["Server"], path)
+                self.assertEqual(h.get_all("Cache-Control"), ["no-store"], path)
+            code, _, h = srv.get("/api/discover")                       # eigener no-store: nur einmal gesendet
+            self.assertEqual(h.get_all("Cache-Control"), ["no-store"])
+        finally:
+            srv.close()
+
+    def test_csp_mit_skript_hash_statt_unsafe_inline(self):
+        import base64, hashlib, re
+        srv = Server115()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/") as r:
+                csp, html, xfo = r.headers["Content-Security-Policy"], r.read().decode(), r.headers["X-Frame-Options"]
+        finally:
+            srv.close()
+        self.assertEqual(xfo, "DENY")
+        script_src = re.search(r"script-src ([^;]+);", csp).group(1)
+        self.assertNotIn("unsafe-inline", script_src)
+        scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+        self.assertEqual(len(scripts), 1)
+        want = "'sha256-" + base64.b64encode(hashlib.sha256(scripts[0].encode()).digest()).decode() + "'"
+        self.assertEqual(script_src.strip(), want)
+        self.assertNotRegex(html, r"<[^>]+\son[a-z]+\s*=")              # keine Inline-Handler (würde die CSP blockieren)
+        self.assertNotIn("javascript:", html.replace('kein «javascript:»', ""))
+        for part in ("default-src 'none'", "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'"):
+            self.assertIn(part, csp)
+
+    def test_csp_hash_folgt_der_datei_und_crlf(self):
+        p = os.path.join(self.d, "w.html")
+        write(p, "<p>x</p><script>let a = 1;\r\nlet b = 2;</script>")
+        body, csp = a.web_page(p)
+        import base64, hashlib
+        h = base64.b64encode(hashlib.sha256(b"let a = 1;\nlet b = 2;").digest()).decode()
+        self.assertIn(f"'sha256-{h}'", csp)
+        write(p, "<p>ohne Skript</p>")
+        os.utime(p, ns=(1, 2))                                          # andere Zeit: neu lesen
+        body, csp = a.web_page(p)
+        self.assertIn("script-src 'none'", csp)
+        self.assertIn(b"ohne Skript", body)
+
+    def test_hello_bremse(self):
+        srv = Server115(hello_limiter=a.HelloLimiter(max_calls=3))
+        try:
+            codes = [srv.get("/api/hello?nonce=" + "0" * 32, tok=None)[0] for _ in range(4)]
+            self.assertEqual(codes, [200, 200, 200, 429])
+            code, body, h = srv.get("/api/hello?nonce=" + "0" * 32, tok=None)
+            self.assertEqual(code, 429)
+            self.assertGreaterEqual(int(h["Retry-After"]), 1)
+            self.assertNotIn("proof", body)
+        finally:
+            srv.close()
+        lim = a.HelloLimiter(max_calls=2, window=60)
+        self.assertEqual([lim.allow("x", now=0), lim.allow("x", now=1), lim.allow("y", now=1)], [0, 0, 0])
+        self.assertGreater(lim.allow("x", now=2), 0)
+        self.assertEqual(lim.allow("x", now=61), 0)                     # nach einer Minute wieder frei
+        # Review 1.16.1: bei sehr vielen Absendern höchstens einmal pro Sekunde aufräumen (nicht bei jeder Anfrage)
+        lim = a.HelloLimiter(max_calls=2, window=60)
+        lim.calls = {f"ip{i}": [100.0] for i in range(5001)}
+        lim.allow("neu", now=100.5)
+        self.assertEqual(lim._pruned, 100.5)
+        lim.calls["alt"] = [0.0]                                        # abgelaufen, aber erst nach einer Sekunde weg
+        lim.allow("neu2", now=101.0)
+        self.assertIn("alt", lim.calls)
+        lim.allow("neu3", now=101.6)
+        self.assertNotIn("alt", lim.calls)
+
+    def test_sicherheits_kopfzeilen_auch_bei_send_error(self):
+        srv = Server115()
+        try:
+            for method in ("HEAD", "PUT"):
+                req = urllib.request.Request(f"http://127.0.0.1:{srv.port}/api/ping", method=method)
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req, timeout=5)
+                h = cm.exception.headers
+                self.assertEqual(cm.exception.code, 501)
+                self.assertEqual(h["Cache-Control"], "no-store")
+                self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+                self.assertEqual(h["X-Frame-Options"], "DENY")
+                self.assertIn("default-src 'none'", h["Content-Security-Policy"])
+                self.assertEqual(h["Server"], "NASlab-Agent")
+                cm.exception.close()
+            # Browser-Seite: eigene CSP und Cache-Control, keine doppelten Kopfzeilen
+            with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/", timeout=5) as r:
+                self.assertEqual(len(r.headers.get_all("Content-Security-Policy")), 1)
+                self.assertEqual(r.headers.get_all("Cache-Control"), ["no-cache"])
+                self.assertIn("script-src 'sha256-", r.headers["Content-Security-Policy"])
+        finally:
+            srv.close()
+
+    def test_einfacher_token_abgelehnt(self):
+        import contextlib, io
+        for bad in ("ab" * 16, "1234" * 8, "a" * 40):
+            os.environ["NZBLAB_AGENT_TOKEN"] = bad
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(a.token(), "", bad)
+            self.assertIn("zu einfach", a.TOKEN_STATE["error"])
+            self.assertNotIn(bad, out.getvalue())
+        os.environ.pop("NZBLAB_AGENT_TOKEN")
+        write(f"{self.d}/token.txt", "xy" * 20)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(a.token(), "")
+        self.assertIn("zu einfach", a.TOKEN_STATE["error"])
+        with open(f"{self.d}/token.txt") as f:
+            self.assertEqual(f.read(), "xy" * 20)                       # nie überschrieben
+        # Erzeugte Standard-Tokens bestehen die Prüfung immer
+        for _ in range(200):
+            self.assertIsNone(a._token_weak(a.secrets.token_urlsafe(24)))
+
+    def test_verbindungsgrenze_je_absender(self):
+        import socket
+        with patch.object(a, "MAX_CONN_PER_IP", 3):
+            s = a.make_server("127.0.0.1", 0, a.make_handler(a.Store(":memory:"), lambda: {}, "geheim"))
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+            port = s.server_address[1]
+            held = []
+            try:
+                for _ in range(3):                                      # drei halbe Anfragen halten je einen Faden
+                    c = socket.create_connection(("127.0.0.1", port), timeout=5)
+                    c.sendall(b"GET /api/ping HTTP/1.1\r\n")
+                    held.append(c)
+                time.sleep(0.3)
+                extra = socket.create_connection(("127.0.0.1", port), timeout=5)
+                extra.sendall(b"GET /api/ping HTTP/1.0\r\n\r\n")
+                self.assertEqual(extra.recv(100), b"")                  # sofort geschlossen
+                extra.close()
+                held.pop().close()
+                time.sleep(0.3)
+                ok = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=5))
+                self.assertTrue(ok["ok"])
+            finally:
+                for c in held:
+                    c.close()
+                s.shutdown()
+                s.server_close()
+
+
+class AuditLauf2Test(unittest.TestCase):
+    """1.16.1 Befunde aus Audit Lauf 2 (needs_validation, vorsorglich behoben): Sammler und Absturzberichte."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = a.CONFIG, os.environ.pop("NZBLAB_AGENT_TOKEN", None)
+        a.CONFIG = self.d
+        a.AGENT_ID["v"] = None
+
+    def tearDown(self):
+        import shutil
+        a.CONFIG = self.old[0]
+        a.AGENT_ID["v"] = None
+        os.environ.pop("NZBLAB_AGENT_TOKEN", None)
+        if self.old[1] is not None:
+            os.environ["NZBLAB_AGENT_TOKEN"] = self.old[1]
+        shutil.rmtree(self.d, ignore_errors=True)
+    def test_cookie_zeile_ganz_geschwaerzt(self):
+        out = a.redact_secrets("Cookie: sid=AAAA; csrftoken=BBBB; theme=dark\nnaechste Zeile")
+        self.assertNotIn("AAAA", out)
+        self.assertNotIn("BBBB", out)
+        self.assertIn("naechste Zeile", out)
+        self.assertNotIn("CCCC", a.redact_secrets("set-cookie: x=CCCC; Path=/"))
+        self.assertNotIn("DDDD", a.redact_log("Cookie: a=DDDD; b=EEEE"))
+
+    def test_absturzbericht_alle_felder_geschwaerzt_und_kurz(self):
+        st = a.CrashStore(os.path.join(self.d, "crashes"))
+        st.add({"trace": "boom", "kind": "crash token=GEHEIM123", "version": "v" * 5000, "android": "Bearer abcdefghijkl",
+                "time": "2026-11-08", "device": "Cookie: sid=XYZ; b=QQQ"})
+        r = st.list(1)[0]
+        dump = json.dumps(r)
+        for secret in ("GEHEIM123", "abcdefghijkl", "XYZ", "QQQ"):
+            self.assertNotIn(secret, dump)
+        self.assertEqual(len(r["version"]), 200)
+        self.assertEqual(r["trace"], "boom")
+
+    def test_readme_in_freigabe_begrenzt_und_kaputtes_utf8(self):
+        d = os.path.join(self.d, "share", "backup")
+        os.makedirs(d)
+        with open(os.path.join(d, "README"), "wb") as f:
+            f.write(b"\xff\xfe" * 10 + b"x" * 100)
+        self.assertIsNone(a.detect_repo(d))                              # kein UnicodeDecodeError mehr
+        with open(os.path.join(d, "README"), "wb") as f:
+            f.write(b"This is a Borg Backup repository.\n")
+            f.truncate(256 * 1024 * 1024)                               # dünn besetzt, 256 MiB
+        with patch.object(a, "read", side_effect=AssertionError("ganze Datei gelesen")):
+            self.assertEqual(a.detect_repo(d), "borg")
+        bad = os.path.join(self.d, "kaputt.txt")
+        with open(bad, "wb") as f:
+            f.write(b"\xff\xff")
+        self.assertEqual(a.read(bad, "std"), "std")
+
+    def test_email_regel_linear(self):
+        t0 = time.monotonic()
+        a.redact_log("error " + "a" * 200000)
+        a.redact_log("error " + "a." * 100000)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(a.redact_log("mail an max.muster@example.com ging"), "mail an <email> ging")
+
+    def test_lan_flut_neuer_macs_begrenzt(self):
+        lan = a.LanScan(os.path.join(self.d, "dev.db"), lambda *x: None)
+        msgs = []
+        lan.notify = lambda t, x: msgs.append(t)
+        rounds = iter([{"aa:00:00:00:00:01": "192.168.1.2"}] * 2 +
+                      [{f"02:00:00:00:{i // 256:02x}:{i % 256:02x}": f"192.168.1.{i % 250 + 2}" for i in range(300)}] * 2)
+        with patch.object(lan, "available", return_value=True), patch.object(lan, "arp", side_effect=lambda: next(rounds)), \
+                patch.object(a.time, "sleep"), patch.object(lan, "lookup", return_value=""), patch.object(a.socket, "socket"):
+            lan.scan()                                                  # erster Durchgang: ein Gerät, keine Meldung
+            lan.scan()                                                  # 300 gefälschte MACs
+        self.assertEqual(len(lan.devices()), 1 + lan.MAX_NEW)
+        self.assertEqual(msgs.count("Neues Gerät im Heimnetz"), lan.MAX_ALERTS)
+        self.assertEqual(msgs.count("Viele neue Geräte im Heimnetz"), 1)
+
+    def test_lan_erster_durchgang_ohne_grenze_von_64(self):
+        # Review 1.16.1: Netz mit 100 Geräten. Der erste Durchgang merkt sich alle, der zweite meldet nichts als «neu»
+        lan = a.LanScan(os.path.join(self.d, "dev2.db"), lambda *x: None)
+        msgs = []
+        lan.notify = lambda t, x: msgs.append(t)
+        net = {f"02:00:00:00:00:{i:02x}": f"192.168.1.{i + 2}" for i in range(100)}
+        rounds = iter([net] * 4)
+        with patch.object(lan, "available", return_value=True), patch.object(lan, "arp", side_effect=lambda: next(rounds)), \
+                patch.object(a.time, "sleep"), patch.object(lan, "lookup", return_value=""), patch.object(a.socket, "socket"):
+            lan.scan()
+            lan.scan()
+        self.assertEqual(len(lan.devices()), 100)
+        self.assertEqual(msgs, [])
+
+
+
+class AuditRestteileTest(unittest.TestCase):
+    """1.16.1 Audit Restteile: WireGuard, Duplikate, Auslöser ohne Sperre, Preis-Abrufe (Weiterleitungen, Grösse, Links)."""
+    PRIV = "cPrIvAtEkEyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    PSK = "pReShArEdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    PUB1 = "HaNdYpUbLiCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def server(self, **kw):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(a.Store(":memory:"), lambda: {}, "geheim", **kw))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    @staticmethod
+    def post(base, path, token="geheim"):
+        req = urllib.request.Request(base + path, data=b"", method="POST",
+                                     headers={"Authorization": f"Bearer {token}"} if token else {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    # --- WireGuard
+
+    def test_wg_kommentar_mit_schluessel_wird_kein_name(self):
+        dump = "\t".join(["wg0", self.PUB1, self.PSK, "(none)", "10.8.0.2/32", "0", "0", "0", "off"]) + "\n"
+        write(f"{self.d}/wg0.conf", f"[Interface]\nPrivateKey={self.PRIV}\n[Peer]\n#PresharedKey={self.PSK}\n"
+                                    f"PublicKey={self.PUB1}\n")
+        write(f"{self.d}/wg1.conf", f"#alt {self.PRIV}\n[Peer]\nPublicKey={self.PUB1}\n")
+        write(f"{self.d}/wg0.cfg", f'PUBLIC:1="{self.PUB1}"\nNAME:1="{self.PRIV}"\nPRIVATE:1="{self.PRIV}"\n')
+        r = a.wireguard_status(run=lambda: (0, dump), conf_dir=self.d, now=1)
+        text = json.dumps(r)
+        for secret in (self.PRIV, self.PSK, self.PRIV[:20], self.PSK[:20]):
+            self.assertNotIn(secret, text)
+        self.assertIsNone(r["interfaces"][0]["peers"][0]["name"])
+
+    def test_wg_gewoehnliche_namen_bleiben(self):
+        # Review 1.16.1: «privat…» oder «Upskill» sind keine Schlüssel; nur «Private Key», «Preshared», «PSK», Base64-Folgen
+        for name in ("Mein privater Laptop", "Private Handy", "Upskill-PC", "Handy Anna"):
+            self.assertEqual(a._wg_label(name), name, name)
+        for name in ("PrivateKey = x", "private_key", "PSK Handy", f"alt {self.PRIV}"):
+            self.assertIsNone(a._wg_label(name), name)
+
+    def test_wg_konfiguration_begrenzt_gelesen(self):
+        with open(f"{self.d}/gross.conf", "wb") as f:
+            f.write(b"[Peer]\n#Handy\nPublicKey=" + self.PUB1.encode() + b"\n")
+            f.truncate(64 * 1024 * 1024)                                   # dünn besetzt, 64 MiB
+        self.assertEqual(len(a._wg_read(f"{self.d}/gross.conf")), a.WG_CONF_MAX)
+        self.assertEqual(a.wg_names(self.d), {self.PUB1: "Handy"})
+
+    def test_wg_fehler_ohne_ausgabe_im_text(self):
+        class Boom(str):
+            def splitlines(self):
+                raise ValueError(f"kaputt {a_priv}")
+        a_priv = self.PRIV
+        r = a.wireguard_status(run=lambda: (0, Boom("x")), conf_dir=self.d)
+        self.assertEqual((r["available"], r["reason"]), (False, "error"))
+        self.assertNotIn(self.PRIV, json.dumps(r))
+
+    # --- Duplikate
+
+    def test_pruefsumme_folgt_keinem_symlink_und_keiner_pipe(self):
+        root = os.path.join(self.d, "root")
+        os.makedirs(root)
+        secret = os.path.join(self.d, "token.txt")
+        write(secret, "GEHEIM" * 10)
+        write(os.path.join(root, "echt.bin"), "GEHEIM" * 10)
+        os.symlink(secret, os.path.join(root, "link.bin"))
+        with self.assertRaises(OSError):
+            a.partial_hash(os.path.join(root, "link.bin"), 60, root)
+        with self.assertRaises(OSError):
+            a.partial_hash(secret, 60, root)                              # ausserhalb der Freigaben
+        os.mkfifo(os.path.join(root, "pipe.bin"))
+        t0 = time.monotonic()
+        with self.assertRaises(OSError):
+            a.partial_hash(os.path.join(root, "pipe.bin"), 60, root)      # vorher: open() hing für immer
+        self.assertLess(time.monotonic() - t0, 2)
+        self.assertTrue(a.partial_hash(os.path.join(root, "echt.bin"), 60, root))
+        # Über den Index: Symlink und Pipe gelten als nicht lesbar («!»), keine Gruppe mit der echten Datei
+        ix = a.FileIndex(os.path.join(self.d, "i.db"), root=root, exclude=set())
+        ix.build()
+        with ix.lock:
+            rows = ix.db.execute("SELECT p, size, mtime FROM files WHERE dir=0").fetchall()
+        self.assertEqual({r[0] for r in rows}, {"echt.bin", "link.bin", "pipe.bin"})
+        ix._hash_run(rows)
+        with ix.lock:
+            hs = dict(ix.db.execute("SELECT p, h FROM hashes").fetchall())
+        self.assertEqual((hs["link.bin"], hs["pipe.bin"]), ("!", "!"))
+        self.assertNotEqual(hs["echt.bin"], "!")
+        self.assertIsNone(ix.hash_error)
+
+    # --- Auslöser
+
+    def test_speedtest_nur_einmal_gleichzeitig(self):
+        base = self.server()
+        started, release = threading.Event(), threading.Event()
+
+        def slow():
+            started.set()
+            release.wait(5)
+            return {"t": 1, "ping_ms": 1, "down_mbit": 1.0, "up_mbit": 1.0}
+        res = {}
+        with patch.object(a, "speedtest", side_effect=slow):
+            t = threading.Thread(target=lambda: res.update(first=self.post(base, "/api/speedtest")))
+            t.start()
+            self.assertTrue(started.wait(5))
+            code, body = self.post(base, "/api/speedtest")
+            release.set()
+            t.join(10)
+        self.assertEqual(code, 409)
+        self.assertIn("läuft schon", body["error"])
+        self.assertEqual(res["first"][0], 200)
+        self.assertEqual(self.post(base, "/api/speedtest", token=None)[0], 401)
+        self.assertFalse(a.SPEED_LOCK.locked())
+
+    def test_index_und_geraetesuche_nie_doppelt(self):
+        root = os.path.join(self.d, "root")
+        os.makedirs(root)
+        ix = a.FileIndex(os.path.join(self.d, "i.db"), root=root, exclude=set())
+        calls, gate = [], threading.Event()
+        with patch.object(ix, "_build", side_effect=lambda: (calls.append(1), gate.wait(5))):
+            ts = [threading.Thread(target=ix.build) for _ in range(5)]
+            for t in ts:
+                t.start()
+            time.sleep(0.2)
+            gate.set()
+            for t in ts:
+                t.join(5)
+        self.assertEqual(len(calls), 1)
+        lan = a.LanScan(os.path.join(self.d, "dev.db"), lambda *x: None)
+        scans, gate2 = [], threading.Event()
+        with patch.object(lan, "available", return_value=True), \
+                patch.object(lan, "_scan", side_effect=lambda: (scans.append(1), gate2.wait(5))):
+            ts = [threading.Thread(target=lan.scan) for _ in range(5)]
+            for t in ts:
+                t.start()
+            time.sleep(0.2)
+            gate2.set()
+            for t in ts:
+                t.join(5)
+        self.assertEqual(len(scans), 1)
+        # HTTP: läuft schon → 202 mit started=false (die App zeigt weiter «Suche gestartet»)
+        lan.running = True
+        ix.state["running"] = True
+        base = self.server(index=ix, lan=lan)
+        self.assertEqual(self.post(base, "/api/devices/scan"), (202, {"started": False, "running": True}))
+        self.assertEqual(self.post(base, "/api/files/refresh"), (202, {"started": False, "running": True}))
+        self.assertEqual(self.post(base, "/api/files/refresh", token="falsch")[0], 401)
+
+    # --- Preise
+
+    def test_nur_oeffentliche_https_adressen(self):
+        pub = lambda h: ["93.184.216.34"]                                   # noqa: E731
+        self.assertTrue(a.public_https_url("https://www.toppreise.ch/x", resolve=pub))
+        self.assertFalse(a.public_https_url("http://www.toppreise.ch/x", resolve=pub))
+        self.assertFalse(a.public_https_url("https://" + "user:pw" + "@" + "www.toppreise.ch/x", resolve=pub))
+        for ip in ("192.168.1.1", "127.0.0.1", "10.0.0.5", "169.254.169.254", "100.64.0.1", "::1", "fe80::1", "::ffff:192.168.1.1", "0.0.0.0",
+                   "64:ff9b::c0a8:101", "64:ff9b::7f00:1"):                     # NAT64 mit privater IPv4 (Review)
+            self.assertFalse(a.public_host("x", resolve=lambda h, ip=ip: [ip]), ip)
+        self.assertFalse(a.public_host("x", resolve=lambda h: ["93.184.216.34", "192.168.1.2"]))   # eine private reicht
+        self.assertTrue(a.public_host("x", resolve=lambda h: ["64:ff9b::5db8:d822"]))           # NAT64 auf öffentliche IPv4
+        self.assertFalse(a.public_host("x", resolve=lambda h: (_ for _ in ()).throw(OSError("dns"))))  # DNS-Fehler: zu
+        self.assertFalse(a.public_host("localhost"))
+        with self.assertRaises(urllib.error.URLError):
+            a.http_get("http://127.0.0.1:1/robots.txt")
+        with self.assertRaises(urllib.error.URLError):
+            a._PublicRedirect().redirect_request(urllib.request.Request("https://www.toppreise.ch/"), None, 302, "Found", {},
+                                                 "http://192.168.1.1/admin")
+
+    def test_weiterleitung_ins_heimnetz_blockiert(self):
+        from http.server import BaseHTTPRequestHandler
+        hits = []
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *x):
+                pass
+
+            def do_GET(self):
+                hits.append(self.path)
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{self.server.server_address[1]}/intern")
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"intern")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/start"
+            with patch.object(a, "public_https_url", side_effect=lambda u, resolve=None: u.endswith("/start")):
+                with self.assertRaises(urllib.error.URLError):
+                    a.http_get(url)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(hits, ["/start"])
+
+    def test_seite_begrenzt_und_mit_frist(self):
+        import io
+        self.assertEqual(len(a._read_capped(io.BytesIO(b"x" * 5_000_000), 4_000_000, time.monotonic() + 10)), 4_000_000)
+
+        class Slow:
+            def read(self, n):
+                return b"x"
+        with self.assertRaises(TimeoutError):
+            a._read_capped(Slow(), 4_000_000, time.monotonic() - 1)
+
+    def test_links_aus_fremden_seiten_nur_https(self):
+        self.assertEqual(a.safe_link("javascript:alert(1)", "https://f"), "https://f")
+        self.assertEqual(a.safe_link("intent://x#Intent;end", "https://f"), "https://f")
+        self.assertEqual(a.safe_link("https://geizhals.de/a.html", "https://f"), "https://geizhals.de/a.html")
+        html = ('<article class="galleryview__item"><a class="galleryview__name-link" title="WD Red Plus 8TB" '
+                'href="javascript:alert(1)">x</a><span class="galleryview__price-link">€ 200,00</span></article>')
+        self.assertEqual(a.parse_geizhals(html, 8)[0]["link"], "https://geizhals.de")
+        page = ('<meta property="og:url" content="javascript:/preisvergleich/x">'
+                '<meta property="og:title" content="Seagate IronWolf 8 TB ab CHF 200.00 bei Toppreise.ch">')
+        self.assertIsNone(a.parse_toppreise_product(page, 8))
 
 if __name__ == "__main__":
     unittest.main()

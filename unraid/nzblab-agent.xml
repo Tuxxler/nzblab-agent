@@ -22,7 +22,7 @@ Deutsch: Misst Temperaturen, CPU, Grafikchip, RAM und Plattenzugriffe rund um di
   <WebUI>http://[IP]:[PORT:8099]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/nzblab-agent.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/icons/nzblab-agent.png</Icon>
-  <ExtraParams>--memory=512m --cpus=1 --read-only --tmpfs /tmp --security-opt no-new-privileges:true</ExtraParams>
+  <ExtraParams>--memory=512m --cpus=1 --read-only --tmpfs /tmp --security-opt no-new-privileges:true --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=SETUID --cap-add=SETGID</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DonateText/>
@@ -40,7 +40,7 @@ Deutsch: Misst Temperaturen, CPU, Grafikchip, RAM und Plattenzugriffe rund um di
   <Config Name="Time zone" Target="TZ" Default="Europe/Zurich" Mode="" Description="e.g. Europe/Berlin, America/New_York" Type="Variable" Display="always" Required="false" Mask="false">Europe/Zurich</Config>
   <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User the agent runs as after start (99 = nobody). 0 = root: needed only for container names and appdata folders of other containers with strict permissions." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group (100 = users)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
-  <Config Name="Token (optional)" Target="NZBLAB_AGENT_TOKEN" Default="" Mode="" Description="Leave empty: the agent creates a random token on first start (container log and appdata/nzblab-agent/token.txt)." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="Token (optional)" Target="NZBLAB_AGENT_TOKEN" Default="" Mode="" Description="Best leave empty: the agent creates a random token on first start (container log and appdata/nzblab-agent/token.txt). If you set your own: at least 32 random characters, no spaces (shorter values are refused)." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
   <Config Name="Heat alert (°C)" Target="HEAT_ALERT_C" Default="95" Mode="" Description="Push via ntfy when the CPU stays above this for 5 minutes" Type="Variable" Display="advanced" Required="false" Mask="false">95</Config>
   <Config Name="ntfy URL (optional)" Target="NTFY_URL" Default="" Mode="" Description="e.g. https://ntfy.sh/a-long-secret-topic for push alerts while away" Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
   <Config Name="SMART (optional)" Target="NZBLAB_SMART" Default="0" Mode="" Description="1 = read SMART values of the disks (model, serial, power-on hours, reallocated/pending sectors, CRC/media errors, wear, temperature). Read-only: smartctl --scan and smartctl -a -n standby only, never self-tests, never writes, sleeping disks stay asleep. Needs the disks as devices and SYS_RAWIO, e.g. Extra Parameters: --cap-add=SYS_RAWIO --device=/dev/sdb (NVMe also --cap-add=SYS_ADMIN). Leave PUID as is: a small root helper only runs smartctl. 0 = off." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
