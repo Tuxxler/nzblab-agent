@@ -22,7 +22,8 @@ LABEL org.opencontainers.image.title="NZBLab-Agent" \
       org.opencontainers.image.url="https://tuxxler.github.io/nzblab/agent.html" \
       org.opencontainers.image.documentation="https://tuxxler.github.io/nzblab/en/agent.html" \
       org.opencontainers.image.vendor="NZBLab" \
-      org.opencontainers.image.licenses="PolyForm-Shield-1.0.0"
+      org.opencontainers.image.licenses="PolyForm-Shield-1.0.0" \
+      net.unraid.docker.icon="https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/icons/nzblab-agent.png"
 
 # PUID/PGID: Der Agent legt beim Start als root /config an, gibt den Ordner diesem Benutzer und läuft dann ohne
 # root-Rechte weiter (99:100 = nobody:users wie bei Unraid-Freigaben). Standard ist also «ohne root»; kein «USER» hier, weil

@@ -124,7 +124,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.16.1")
+        self.assertEqual(info["version"], "1.16.2")
         srv.shutdown()
 
 
@@ -160,7 +160,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.16.1")
+            self.assertEqual(r["version"], "1.16.2")
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents

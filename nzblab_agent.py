@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.16.1"
+VERSION = "1.16.2"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
