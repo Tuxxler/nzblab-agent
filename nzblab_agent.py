@@ -25,15 +25,17 @@ import re
 import secrets
 import socket
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
+import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -3641,7 +3643,7 @@ class Today:
 # ---------------------------------------------------------------- Ab 1.15.0: Neustarts, Plattentemperaturen, Netz, SMART,
 # Backups, RAID, Log-Auszüge. Alles nur lesen; was Geräte oder Logs braucht, ist freiwillig (Umgebungsvariable + Compose-Block).
 
-API_LEVEL = 15              # steigt mit jeder Agent-Version, die neue Endpunkte bringt; die App vergleicht mit ihrem Minimum
+API_LEVEL = 16              # steigt mit jeder Agent-Version, die neue Endpunkte bringt; die App vergleicht mit ihrem Minimum
 
 
 def _env_int(name, default, lo, hi):
@@ -3670,6 +3672,11 @@ BIND = os.environ.get("NZBLAB_BIND", "0.0.0.0").strip() or "0.0.0.0"
 MAX_BODY = 64 * 1024        # grösste Anfrage (Bytes); Absturzberichte behalten ihr eigenes Limit (CRASH_MAX_BYTES * 2)
 AUTH_FAILS = _env_int("NZBLAB_AUTH_FAILS", 10, 3, 1000)
 DISKTEMP_EVERY = 300        # Plattentemperaturen alle 5 Minuten speichern
+# Ab 1.16.0: Dienste in appdata finden und ihre API-Keys auslesen (Standard an, aus mit DISCOVER_KEYS=0).
+# DISCOVER_ROOTS: Container-Pfade der appdata-Ordner, durch Komma getrennt; leer = <FILES_ROOT>/appdata (Unraid),
+# sonst <FILES_ROOT>/apps (TrueNAS) und <FILES_ROOT>/docker (Synology).
+DISCOVER_KEYS = _env_on("DISCOVER_KEYS", True)
+DISCOVER_ROOTS = [x.strip() for x in os.environ.get("DISCOVER_ROOTS", "").split(",") if x.strip()]
 SAMPLER_STATE = {"last": time.time()}   # letzte fertige Messung (Gesundheitsprüfung: hängt die Messschleife?)
 
 
@@ -4518,6 +4525,9 @@ def agent_features(smart=None, backups=None, log_dir=None):
         feats.append("net")
     if LOGS_ON and os.path.isdir(log_dir or LOG_DIR):
         feats.append("logs")
+    feats.append("discover")                 # ab 1.16.0: /api/discover; «discover_keys» = liefert auch API-Keys
+    if DISCOVER_KEYS:
+        feats.append("discover_keys")
     return feats
 
 
@@ -4556,6 +4566,350 @@ class AuthLimiter:
             return False
 
 
+
+# ---------------------------------------------------------------- Ab 1.16.0: Dienste finden («Alles in einer Minute verbunden»)
+
+class DiscoverLimiter:
+    """Höchstens [max_calls] Abrufe von /api/discover pro [window] Sekunden, für alle Absender zusammen (gegen Durchprobieren)."""
+
+    def __init__(self, max_calls=10, window=60):
+        self.max_calls, self.window = max_calls, window
+        self.calls, self.lock = [], threading.Lock()
+
+    def allow(self, now=None):
+        """0 = erlaubt (und gezählt), sonst Sekunden bis zum nächsten freien Abruf."""
+        now = now if now is not None else time.monotonic()
+        with self.lock:
+            self.calls = [t for t in self.calls if t > now - self.window]
+            if len(self.calls) >= self.max_calls:
+                return max(1, int(self.calls[0] + self.window - now) + 1)
+            self.calls.append(now)
+            return 0
+
+
+DISCOVER_DEPTH = 3                  # so viele Ordner-Ebenen unter dem Container-Ordner
+DISCOVER_MAX_BYTES = 1024 * 1024    # grössere Einstellungsdateien nicht lesen
+DISCOVER_MAX_ENTRIES = 3000         # Einträge pro Container-Ordner (Plex-Bibliotheken sind riesig)
+DISCOVER_MAX_FOLDERS = 500
+DISCOVER_FILES = {"config.xml", "sabnzbd.ini", "config.ini", "settings.json", "preferences.xml", "network.xml", "system.xml"}
+# Grosse Datenordner gar nicht erst betreten (Vergleich klein geschrieben)
+DISCOVER_SKIP = {"cache", "caches", "logs", "log", "backups", "backup", "mediacover", "metadata", "media", "transcode",
+                 "transcodes", "crash reports", "codecs", "plug-in support", "plug-ins", "updates", "drivers", "tmp", "temp",
+                 "node_modules", "diagnostics", "thumbnails", "images", "db", "database", "admin"}
+DISCOVER_OWN = {"nzblab-agent", "naslab-agent"}
+DISCOVER_KEY_RX = re.compile(r"[A-Za-z0-9_\-+/=]{16,128}")
+DISCOVER_ARR = (("prowlarr", 9696), ("sonarr", 8989), ("radarr", 7878))
+DISCOVER_OTHER_ARR = ("lidarr", "readarr", "whisparr", "mylar", "bazarr")
+DISCOVER_NOTES = {
+    "ok": "Schlüssel gefunden",
+    "keys_off": "Auslesen im Agent ausgeschaltet (DISCOVER_KEYS=0)",
+    "plex_token": "Gefunden; Plex-Token selbst eintragen (Konto-Schlüssel, der Agent liest ihn nie aus)",
+    "jellyfin_key": "Gefunden; Schlüssel in der Jellyfin-Weboberfläche erstellen (Dashboard › API-Schlüssel)",
+    "emby_key": "Gefunden; Schlüssel in der Emby-Weboberfläche erstellen (Einstellungen › API-Schlüssel)",
+    "unreadable": "Einstellungsdatei nicht lesbar (Rechte: PUID=0, oder grösser als 1 MB)",
+    "broken": "Einstellungsdatei kaputt oder ohne gültigen Schlüssel",
+}
+DISCOVER_PORTS_NOTE = ("Ports stammen aus den Einstellungsdateien und gelten im Container; im Bridge-Netz kann der Port "
+                       "am NAS anders sein (Docker-Portzuordnung).")
+
+
+def _disc_read(path):
+    """Datei lesen, ohne einem Symlink zu folgen (O_NOFOLLOW), nur normale Dateien bis 1 MB. None = nicht lesbar."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > DISCOVER_MAX_BYTES:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(DISCOVER_MAX_BYTES + 1)
+        if len(data) > DISCOVER_MAX_BYTES:
+            return None
+        return data.decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _disc_xml(text, root_tag):
+    """Einfaches XML (Kinder ohne Namensraum) → {Name: Text}. Kein DOCTYPE/ENTITY (keine Entity-Tricks)."""
+    if text is None:
+        return None
+    if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
+        return {}
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError):
+        return {}
+    if root.tag != root_tag:
+        return {}
+    return {c.tag: (c.text or "").strip() for c in root if isinstance(c.tag, str)}
+
+
+def _disc_ini(text):
+    """ConfigObj-Datei (SABnzbd, Tautulli) → {abschnitt: {schlüssel: wert}}, nur oberste Abschnitte ([[…]] wird übersprungen)."""
+    if text is None:
+        return None
+    out, sec = {}, None
+    for line in text.splitlines():
+        t = line.strip()
+        if not t or t.startswith(("#", ";")):
+            continue
+        if t.startswith("[["):
+            sec = None
+            continue
+        if t.startswith("[") and t.endswith("]"):
+            sec = t[1:-1].strip().lower()
+            out.setdefault(sec, {})
+            continue
+        if sec is not None and "=" in t:
+            k, v = t.split("=", 1)
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            out[sec][k.strip().lower()] = v
+    return out
+
+
+def _disc_port(v):
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if 0 < n < 65536 else None
+
+
+def _disc_bool(v):
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _disc_base(v):
+    """URL-Basis «/radarr» (ohne Schrägstrich am Ende, nur harmlose Zeichen), sonst leer."""
+    v = str(v or "").strip().strip("/")
+    if not v or len(v) > 100 or not re.fullmatch(r"[A-Za-z0-9._~\-/]+", v):
+        return ""
+    return "/" + v
+
+
+def _disc_key(v):
+    v = str(v or "").strip()
+    return v if DISCOVER_KEY_RX.fullmatch(v) else None
+
+
+class Discover:
+    """Sucht nur lesend unter appdata nach bekannten Diensten (Ordnernamen beliebig), max. 3 Ebenen tief, ohne Symlinks,
+    Dateien bis 1 MB. Liefert pro Dienst Ordnername (ohne Pfad), Port, SSL, URL-Basis und API-Key (Plex und Jellyfin nie).
+    Schreibt nichts ins Log, auch nicht im Fehlerfall."""
+
+    def __init__(self, roots=None, limit=10, window=60):
+        self.explicit = roots
+        self.limiter = DiscoverLimiter(limit, window)
+
+    def roots(self):
+        if self.explicit is not None:
+            return [r for r in self.explicit if os.path.isdir(r)]
+        if DISCOVER_ROOTS:
+            return [r for r in DISCOVER_ROOTS if os.path.isdir(r)]
+        main = os.path.join(FILES_ROOT, "appdata")
+        if os.path.isdir(main):
+            return [main]
+        return [p for p in (os.path.join(FILES_ROOT, "apps"), os.path.join(FILES_ROOT, "docker")) if os.path.isdir(p)]
+
+    @staticmethod
+    def _walk(folder):
+        """Breitensuche bis DISCOVER_DEPTH Ebenen: {dateiname klein: [Pfade, flachste zuerst]}, abgebrochen?"""
+        found, queue, seen = {}, [(folder, 0)], 0
+        while queue:
+            d, lvl = queue.pop(0)
+            entries = []
+            try:
+                with os.scandir(d) as it:      # nicht ganz einlesen: riesige Ordner brechen bei der Grenze ab
+                    for e in it:
+                        seen += 1
+                        if seen > DISCOVER_MAX_ENTRIES:
+                            return found, True
+                        entries.append(e)
+            except OSError:
+                continue
+            for e in sorted(entries, key=lambda e: e.name):
+                try:
+                    if e.is_symlink():
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        if lvl < DISCOVER_DEPTH and not e.name.startswith(".") and e.name.lower() not in DISCOVER_SKIP:
+                            queue.append((e.path, lvl + 1))
+                    elif e.name.lower() in DISCOVER_FILES and e.is_file(follow_symlinks=False):
+                        found.setdefault(e.name.lower(), []).append(e.path)
+                except OSError:
+                    continue
+        return found, False
+
+    @staticmethod
+    def _entry(service, folder, port, ssl=False, base="", key=None, code="ok", variant=None, http_port=None, from_config=True):
+        if code == "ok" and not DISCOVER_KEYS:
+            code, key = "keys_off", None
+        if not DISCOVER_KEYS:
+            key = None
+        e = {"service": service, "folder": folder, "port": port, "ssl": bool(ssl), "urlBase": base,
+             "apiKey": key, "code": code, "note": DISCOVER_NOTES[code], "portSource": "config" if from_config else "default"}
+        if variant:
+            e["variant"] = variant
+        if http_port and http_port != port:
+            e["httpPort"] = http_port
+        return e
+
+    def _arr(self, folder, path):
+        name = folder.lower()
+        cfg = _disc_xml(_disc_read(path), "Config")
+        inst = (cfg or {}).get("InstanceName", "").lower()
+        if any(x in inst or (not inst and x in name) for x in DISCOVER_OTHER_ARR):
+            return None
+        svc = next((s for s, _ in DISCOVER_ARR if s in inst), None) or next((s for s, _ in DISCOVER_ARR if s in name), None)
+        if svc is None and cfg:
+            svc = next((s for s, p in DISCOVER_ARR if _disc_port(cfg.get("Port")) == p), None)
+        if svc is None:
+            return None
+        default = dict(DISCOVER_ARR)[svc]
+        if cfg is None:
+            return self._entry(svc, folder, default, code="unreadable", from_config=False)
+        key = _disc_key(cfg.get("ApiKey"))
+        if not key:
+            return self._entry(svc, folder, _disc_port(cfg.get("Port")) or default, code="broken", from_config=False)
+        http = _disc_port(cfg.get("Port")) or default
+        ssl = _disc_bool(cfg.get("EnableSsl")) and _disc_port(cfg.get("SslPort")) is not None
+        port = _disc_port(cfg.get("SslPort")) if ssl else http
+        return self._entry(svc, folder, port, ssl, _disc_base(cfg.get("UrlBase")), key, http_port=http,
+                           from_config=_disc_port(cfg.get("Port")) is not None)
+
+    def _sab(self, folder, path):
+        ini = _disc_ini(_disc_read(path))
+        if ini is None:
+            return self._entry("sab", folder, 8080, code="unreadable", from_config=False)
+        m = ini.get("misc", {})
+        key = _disc_key(m.get("api_key"))
+        http = _disc_port(m.get("port")) or 8080
+        ssl = _disc_bool(m.get("enable_https"))
+        port = (_disc_port(m.get("https_port")) or http) if ssl else http
+        if not key:
+            return self._entry("sab", folder, port, ssl, code="broken", from_config=False)
+        return self._entry("sab", folder, port, ssl, _disc_base(m.get("url_base")), key, http_port=http,
+                           from_config=_disc_port(m.get("port")) is not None)
+
+    def _tautulli(self, folder, path):
+        text = _disc_read(path)
+        ini = _disc_ini(text)
+        if ini is None:
+            return self._entry("tautulli", folder, 8181, code="unreadable", from_config=False) if "tautulli" in folder.lower() else None
+        g = ini.get("general")
+        if g is None or not ("tautulli" in folder.lower() or "pms" in ini or "http_root" in g):
+            return None
+        key = _disc_key(g.get("api_key"))
+        port = _disc_port(g.get("http_port")) or 8181
+        ssl = _disc_bool(g.get("enable_https"))
+        if not key:
+            return self._entry("tautulli", folder, port, ssl, code="broken", from_config=False)
+        return self._entry("tautulli", folder, port, ssl, _disc_base(g.get("http_root")), key,
+                           from_config=_disc_port(g.get("http_port")) is not None)
+
+    def _seerr(self, folder, path):
+        name = folder.lower()
+        variant = next((v for v in ("jellyseerr", "overseerr") if v in name), "seerr")
+        text = _disc_read(path)
+        if text is None:
+            return self._entry("seerr", folder, 5055, code="unreadable", variant=variant, from_config=False) if "seerr" in name else None
+        try:
+            js = json.loads(text)
+        except ValueError:
+            js = None
+        main = js.get("main") if isinstance(js, dict) else None
+        if not isinstance(main, dict) or "apiKey" not in main:
+            return self._entry("seerr", folder, 5055, code="broken", variant=variant, from_config=False) if "seerr" in name else None
+        key = _disc_key(main.get("apiKey"))
+        return self._entry("seerr", folder, 5055, key=key, code="ok" if key else "broken", variant=variant, from_config=False)
+
+    def _jellyfin(self, folder, found):
+        name = folder.lower()
+        net = None
+        for p in found.get("network.xml", []):
+            net = _disc_xml(_disc_read(p), "NetworkConfiguration")
+            if net:
+                break
+        emby = "emby" in name
+        if not net and not emby and "jellyfin" not in name:
+            return None
+        if emby:
+            return self._entry("jellyfin", folder, 8096, code="emby_key", variant="emby", from_config=False)
+        net = net or {}
+        http = _disc_port(net.get("InternalHttpPort") or net.get("HttpServerPortNumber"))
+        ssl = _disc_bool(net.get("EnableHttps")) and _disc_port(net.get("InternalHttpsPort")) is not None
+        port = _disc_port(net.get("InternalHttpsPort")) if ssl else (http or 8096)
+        return self._entry("jellyfin", folder, port, ssl, _disc_base(net.get("BaseUrl")), code="jellyfin_key",
+                           variant="jellyfin", http_port=http, from_config=http is not None)
+
+    def _folder(self, folder, path):
+        """Alle erkannten Dienste eines Container-Ordners (meist einer)."""
+        found, partial = self._walk(path)
+        out = []
+        if found.get("config.xml"):
+            e = self._arr(folder, found["config.xml"][0])
+            if e:
+                out.append(e)
+        if found.get("sabnzbd.ini"):
+            out.append(self._sab(folder, found["sabnzbd.ini"][0]))
+        if found.get("config.ini"):
+            e = self._tautulli(folder, found["config.ini"][0])
+            if e:
+                out.append(e)
+        if found.get("settings.json"):
+            e = self._seerr(folder, found["settings.json"][0])
+            if e:
+                out.append(e)
+        # Plex: nur ob Preferences.xml im Ordner «Plex Media Server» liegt; die Datei wird nie geöffnet (Konto-Token)
+        if any(os.path.basename(os.path.dirname(p)) == "Plex Media Server" for p in found.get("preferences.xml", [])):
+            out.append(self._entry("plex", folder, 32400, code="plex_token", from_config=False))
+        if found.get("network.xml") or found.get("system.xml"):
+            e = self._jellyfin(folder, found)
+            if e:
+                out.append(e)
+        return out, partial
+
+    def scan(self, with_keys=True):
+        """with_keys=False («?keys=0»): gleiche Funde und Codes, aber alle apiKey-Werte null (für reines Zählen auf der Startseite)."""
+        roots = self.roots()
+        res = {"available": bool(roots), "keys": bool(DISCOVER_KEYS), "services": [], "partial": False,
+               "at": int(time.time()), "ports_note": DISCOVER_PORTS_NOTE}
+        seen = set()
+        for root in roots:
+            try:
+                with os.scandir(root) as it:
+                    folders = sorted((e for e in it if not e.name.startswith(".") and e.name.lower() not in DISCOVER_OWN), key=lambda e: e.name)
+            except OSError:
+                continue
+            for e in folders[:DISCOVER_MAX_FOLDERS]:
+                try:
+                    if e.is_symlink() or not e.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                found, partial = self._folder(e.name, e.path)
+                res["partial"] = res["partial"] or partial
+                for s in found:
+                    k = (s["service"], s["folder"])
+                    if k not in seen:
+                        seen.add(k)
+                        res["services"].append(s)
+            if len(folders) > DISCOVER_MAX_FOLDERS:
+                res["partial"] = True
+        res["services"].sort(key=lambda s: (s["service"], s["folder"].lower()))
+        if not with_keys:
+            for s in res["services"]:
+                s["apiKey"] = None
+        return res
+
 def run_extras(store, stop, smart=None):
     """Neustarts (jede Minute) und Plattentemperaturen (alle 5 Minuten)."""
     try:
@@ -4578,8 +4932,9 @@ APPDATA_SIZES = AppdataSizes()
 
 
 def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, today=None, crashes=None, smart=None, backups=None,
-                 limiter=None, log_dir=None):
+                 limiter=None, log_dir=None, discover=None):
     limiter = limiter or AuthLimiter()       # je Server eine eigene Token-Bremse (Tests starten viele Server)
+    discover = discover or Discover()        # je Server eine eigene Bremse für /api/discover
     smart = smart or SmartMonitor(store, SmartHelper(), enabled=False)
     backups = backups or BackupScanner(explicit=[], auto_roots=[], auto=False)
 
@@ -4732,6 +5087,18 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                     return self.reply(200, collect_logs(log_dir, max(1, min(hours, 168)), max(1, min(int(q.get("max", "200")), 1000))))
             except Exception as e:  # noqa: BLE001
                 return self.reply(500, {"error": f"{type(e).__name__}: {e}"[:150]})
+            if u.path == "/api/discover":
+                # Ab 1.16.0: Dienste und API-Keys aus appdata (nur mit Token). Nie zwischenspeichern, nie loggen, höchstens
+                # 10 Abrufe pro Minute; Fehlertext ohne Einzelheiten (könnte sonst Dateiinhalt enthalten)
+                nostore = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+                wait = discover.limiter.allow()
+                if wait:
+                    return self.reply(429, {"error": "Zu viele Abrufe, später nochmals versuchen", "retry_after": wait},
+                                      dict(nostore, **{"Retry-After": str(wait)}))
+                try:
+                    return self.reply(200, discover.scan(with_keys=q.get("keys", "1") != "0"), nostore)
+                except Exception:  # noqa: BLE001
+                    return self.reply(500, {"error": "Suche fehlgeschlagen"}, nostore)
             if u.path == "/api/info":
                 return self.reply(200, {"version": VERSION, "hostname": socket.gethostname(), "interval": INTERVAL,
                                         "heat_alert": HEAT_ALERT, "push": bool(NTFY_URL), "since": store.first_t() or now,

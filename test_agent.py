@@ -10,6 +10,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 import nzblab_agent as a
+import unittest.mock
 from unittest.mock import patch
 
 
@@ -108,12 +109,12 @@ class AgentTest(unittest.TestCase):
         self.assertIn("text/html", page.headers["Content-Type"])
         self.assertIn("connect-src 'self'", page.headers["Content-Security-Policy"])
         html = page.read().decode()
-        self.assertIn("NZBLab", html)
+        self.assertIn("NASlab", html)
         self.assertNotIn("geheim", html)
         # 1.9.0: Token nur im Tab (sessionStorage), keine NAS-Werte in der Seite, Seite holt alles per Token
         self.assertIn("sessionStorage", html)
         self.assertNotIn("localStorage.setItem", html)
-        self.assertNotIn(a.socket.gethostname(), html.replace("NZBLab", ""))
+        self.assertNotIn(a.socket.gethostname(), html.replace("NASlab", "").replace("NZBLab", ""))
         self.assertIn("Authorization", html)
         self.assertIn("/api/cache/shares", html)
         page2 = urllib.request.urlopen(base + "/index.html")
@@ -123,7 +124,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.15.0")
+        self.assertEqual(info["version"], "1.16.0")
         srv.shutdown()
 
 
@@ -159,7 +160,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.15.0")
+            self.assertEqual(r["version"], "1.16.0")
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents
@@ -1931,7 +1932,7 @@ class Agent115Test(unittest.TestCase):
             code, info, _ = srv.get("/api/info")
             for k in ("api_level", "features", "last_boot", "boots_7d", "sampling_ok"):
                 self.assertIn(k, info)
-            self.assertEqual(info["api_level"], 15)
+            self.assertEqual(info["api_level"], 16)
             self.assertIn("boots", info["features"])
             self.assertNotIn("smart", info["features"])
             self.assertNotIn("logs", info["features"])
@@ -2342,6 +2343,199 @@ class Agent115Test(unittest.TestCase):
             self.assertEqual((code, body["res"]), (200, "raw"))
         finally:
             srv.close()
+
+
+FIXTURE_APPDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixtures", "discover", "appdata")
+# Alle Geheimnisse in den Beispiel-Konfigs, die nie in einer Antwort oder im Log stehen dürfen (ausser den API-Keys selbst)
+NEVER_LEAK = ("FIXTURE-POSTGRES-PASSWORT", "FIXTURE-NZB-KEY", "FIXTURE-SAB-PASSWORT", "FIXTURE-USENET-PASSWORT",
+              "FIXTURE-PLEX-TOKEN-TAUTULLI", "FIXTURE-MAIL-PASSWORT", "FIXTURE-JELLYFIN-KEY-IN-SEERR",
+              "FIXTURE-PLEX-ONLINE-TOKEN", "FIXTURE-NEXTCLOUD", "fixture-token-nicht-lesen", "192.168.1.2")
+FIXTURE_KEYS = ("0000sonarrfixture000000000000aaa", "0000radarrfixture000000000000bbb", "0000prowlarrfixture0000000000ccc",
+                "0000sonarr4kfixture0000000000ddd", "0000sabfixture000000000000000eee", "0000tautullifixture00000000ffff",
+                "MDAwMG92ZXJzZWVycmZpeHR1cmUwMDA=", "MDAwMGplbGx5c2VlcnJmaXh0dXJlMDA=")
+
+
+class DiscoverTest(unittest.TestCase):
+    """1.16.0: /api/discover findet Dienste in appdata und liest ihre API-Keys (nur lesend, ohne Symlinks, max. Tiefe 3)."""
+
+    def setUp(self):
+        import shutil
+        self.tmp = tempfile.mkdtemp()
+        self.root = os.path.join(self.tmp, "appdata")
+        shutil.copytree(FIXTURE_APPDATA, self.root, symlinks=True)
+        # Symlinks: ganzer Ordner und einzelne Datei zeigen nach aussen → nie folgen
+        outside = os.path.join(self.tmp, "aussen")
+        write(f"{outside}/config.xml", "<Config><Port>7878</Port><ApiKey>0000symlinkfixture00000000000777</ApiKey>"
+                                       "<InstanceName>Radarr</InstanceName></Config>")
+        os.symlink(outside, os.path.join(self.root, "link-radarr"))
+        os.makedirs(os.path.join(self.root, "sym-sonarr"))
+        os.symlink(f"{outside}/config.xml", os.path.join(self.root, "sym-sonarr", "config.xml"))
+        # zu gross (über 1 MB): nicht lesen
+        write(f"{self.root}/riesen-radarr/config.xml",
+              "<Config><Port>7878</Port><ApiKey>0000riesenfixture000000000000666</ApiKey>" + " " * (1024 * 1024 + 10) + "</Config>")
+        # Entity-Trick (Billion Laughs / externe Datei): verweigern
+        write(f"{self.root}/entity-sonarr/config.xml",
+              '<?xml version="1.0"?><!DOCTYPE c [<!ENTITY x SYSTEM "file:///etc/passwd">]><Config><Port>8989</Port>'
+              "<ApiKey>&x;</ApiKey></Config>")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def scan(self, **kw):
+        return a.Discover(roots=[self.root], **kw).scan()
+
+    def by(self, res):
+        return {(s["service"], s["folder"]): s for s in res["services"]}
+
+    def test_findet_jede_dienstart(self):
+        res = self.scan()
+        d = self.by(res)
+        self.assertEqual(d[("sonarr", "binhex-sonarr")]["apiKey"], "0000sonarrfixture000000000000aaa")
+        self.assertEqual((d[("sonarr", "binhex-sonarr")]["port"], d[("sonarr", "binhex-sonarr")]["ssl"],
+                          d[("sonarr", "binhex-sonarr")]["urlBase"]), (8989, False, ""))
+        r = d[("radarr", "radarr")]                                    # Typ nur über den Ordnernamen, SSL an
+        self.assertEqual((r["apiKey"], r["port"], r["ssl"], r["urlBase"], r["httpPort"]),
+                         ("0000radarrfixture000000000000bbb", 9899, True, "/radarr", 7878))
+        self.assertEqual(d[("prowlarr", "binhex-prowlarr")]["port"], 9696)
+        s4 = d[("sonarr", "tv4k")]                                     # beliebiger Ordnername, Typ aus <InstanceName>
+        self.assertEqual((s4["apiKey"], s4["port"], s4["urlBase"]), ("0000sonarr4kfixture0000000000ddd", 8990, "/4k"))
+        sab = d[("sab", "sabnzbd")]                                    # Datei eine Ebene tiefer (config/)
+        self.assertEqual((sab["apiKey"], sab["port"], sab["ssl"], sab["urlBase"]),
+                         ("0000sabfixture000000000000000eee", 8080, False, "/sabnzbd"))
+        t = d[("tautulli", "tautulli")]
+        self.assertEqual((t["apiKey"], t["port"], t["ssl"], t["urlBase"]), ("0000tautullifixture00000000ffff", 8181, True, "/tautulli"))
+        o = d[("seerr", "overseerr")]
+        self.assertEqual((o["apiKey"], o["port"], o["variant"]), ("MDAwMG92ZXJzZWVycmZpeHR1cmUwMDA=", 5055, "overseerr"))
+        self.assertEqual(d[("seerr", "jellyseerr")]["variant"], "jellyseerr")
+        p = d[("plex", "plex")]                                        # Plex: nie ein Token, nur «gefunden»
+        self.assertEqual((p["apiKey"], p["port"], p["code"]), (None, 32400, "plex_token"))
+        j = d[("jellyfin", "jellyfin")]
+        self.assertEqual((j["apiKey"], j["port"], j["urlBase"], j["code"]), (None, 8096, "/jf", "jellyfin_key"))
+        e = d[("jellyfin", "emby")]
+        self.assertEqual((e["apiKey"], e["port"], e["variant"]), (None, 8096, "emby"))
+        for s in res["services"]:
+            self.assertEqual(set(s) - {"variant", "httpPort"},
+                             {"service", "folder", "port", "ssl", "urlBase", "apiKey", "code", "note", "portSource"}, s)
+            self.assertNotIn("/", s["folder"])
+        self.assertTrue(res["keys"])
+
+    def test_kaputt_fehlend_tief_fremd(self):
+        d = self.by(self.scan())
+        k = d[("sonarr", "sonarr-kaputt")]                             # kaputte Datei: gefunden, aber ohne Schlüssel
+        self.assertEqual((k["apiKey"], k["code"]), (None, "broken"))
+        self.assertEqual(d[("sonarr", "entity-sonarr")]["apiKey"], None)   # DOCTYPE/ENTITY wird nicht ausgewertet
+        self.assertEqual(d[("radarr", "riesen-radarr")]["code"], "unreadable")
+        self.assertIsNone(d[("radarr", "riesen-radarr")]["apiKey"])
+        folders = {f for _, f in d}
+        for f in ("lidarr", "nextcloud", "nzblab-agent", "tiefer-sonarr"):  # fremde Dienste, eigener Ordner, zu tief
+            self.assertNotIn(f, folders)
+        self.assertEqual(a.Discover(roots=[os.path.join(self.tmp, "fehlt")]).scan(),
+                         {"available": False, "keys": True, "services": [], "partial": False,
+                          "at": unittest.mock.ANY, "ports_note": unittest.mock.ANY})
+
+    def test_symlink_wird_nicht_verfolgt(self):
+        res = self.scan()
+        folders = {s["folder"] for s in res["services"]}
+        self.assertNotIn("link-radarr", folders)
+        self.assertNotIn("sym-sonarr", folders)
+        self.assertNotIn("0000symlinkfixture00000000000777", json.dumps(res))
+
+    def test_keine_anderen_inhalte_oder_pfade(self):
+        txt = json.dumps(self.scan())
+        for x in NEVER_LEAK:
+            self.assertNotIn(x, txt)
+        self.assertNotIn(self.tmp, txt)
+
+    def test_auslesen_ausgeschaltet(self):
+        with patch.object(a, "DISCOVER_KEYS", False):
+            res = self.scan()
+        self.assertFalse(res["keys"])
+        self.assertGreater(len(res["services"]), 5)
+        for s in res["services"]:
+            self.assertIsNone(s["apiKey"])
+        txt = json.dumps(res)
+        for k in FIXTURE_KEYS:
+            self.assertNotIn(k, txt)
+        self.assertEqual(self.by(res)[("sonarr", "binhex-sonarr")]["code"], "keys_off")
+        self.assertIn("ausgeschaltet", self.by(res)[("sonarr", "binhex-sonarr")]["note"])
+
+    def server(self, **kw):
+        return Server115(discover=a.Discover(roots=[self.root], **kw))
+
+    def test_endpunkt_token_header_und_log(self):
+        import contextlib
+        import io
+        srv = self.server()
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code, body, _ = srv.get("/api/discover", tok=None)
+                self.assertEqual(code, 401)
+                self.assertNotIn("services", body)
+                code, body, _ = srv.get("/api/discover", tok="falsch")
+                self.assertEqual(code, 401)
+                code, body, hdr = srv.get("/api/discover")
+                self.assertEqual(code, 200)
+                self.assertIn("no-store", hdr.get("Cache-Control", ""))
+                self.assertIn("0000sonarrfixture000000000000aaa", json.dumps(body))
+                # Fehlerfall: Lesen bricht ab → kein Schlüssel und keine Ausnahme im Log oder in der Antwort
+                with patch.object(a.Discover, "_folder", side_effect=RuntimeError("0000sonarrfixture000000000000aaa")):
+                    code, body, _ = srv.get("/api/discover")
+                self.assertEqual(code, 500)
+                self.assertNotIn("0000sonarr", json.dumps(body))
+                code, info, _ = srv.get("/api/info")
+                self.assertIn("discover", info["features"])
+                self.assertIn("discover_keys", info["features"])
+                self.assertEqual(info["api_level"], 16)
+                with patch.object(a, "DISCOVER_KEYS", False):
+                    code, info, _ = srv.get("/api/info")
+                self.assertIn("discover", info["features"])
+                self.assertNotIn("discover_keys", info["features"])
+        finally:
+            srv.close()
+        log = out.getvalue() + err.getvalue()
+        for k in FIXTURE_KEYS + NEVER_LEAK:
+            self.assertNotIn(k, log)
+
+    def test_keys_null_ohne_schluessel(self):
+        """?keys=0 (Zählen für die Startseite): gleiche Funde und Codes, aber nie ein Schlüssel in der Antwort."""
+        srv = self.server()
+        try:
+            code, full, _ = srv.get("/api/discover")
+            code2, lean, _ = srv.get("/api/discover?keys=0")
+            self.assertEqual((code, code2), (200, 200))
+            self.assertTrue(any(s["apiKey"] for s in full["services"]))
+            self.assertEqual([(s["service"], s["folder"], s["code"], s["port"]) for s in full["services"]],
+                             [(s["service"], s["folder"], s["code"], s["port"]) for s in lean["services"]])
+            for s in lean["services"]:
+                self.assertIsNone(s["apiKey"])
+            txt = json.dumps(lean)
+            for k in FIXTURE_KEYS:
+                self.assertNotIn(k, txt)
+            code, again, _ = srv.get("/api/discover?keys=1")
+            self.assertTrue(any(s["apiKey"] for s in again["services"]))
+        finally:
+            srv.close()
+
+    def test_rate_limit(self):
+        srv = self.server(limit=3)
+        try:
+            codes = [srv.get("/api/discover")[0] for _ in range(3)]
+            self.assertEqual(codes, [200, 200, 200])
+            code, body, hdr = srv.get("/api/discover")
+            self.assertEqual(code, 429)
+            self.assertNotIn("services", body)
+            self.assertTrue(int(hdr.get("Retry-After")) >= 1)
+            self.assertEqual(srv.get("/api/info")[0], 200)              # andere Endpunkte bleiben frei
+        finally:
+            srv.close()
+        lim = a.DiscoverLimiter(max_calls=10, window=60)
+        waits = [lim.allow(now=100.0 + i) for i in range(11)]       # 0 = erlaubt, sonst Sekunden bis wieder frei
+        self.assertEqual(waits.count(0), 10)
+        self.assertGreaterEqual(waits[-1], 1)
+        self.assertEqual(lim.allow(now=100.0 + 61), 0)                 # nach einer Minute wieder frei
+        self.assertEqual(a.Discover().limiter.max_calls, 10)           # Standard: 10 pro Minute
 
 
 if __name__ == "__main__":

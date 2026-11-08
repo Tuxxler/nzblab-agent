@@ -18,6 +18,8 @@ services:
       PGID: "568"
       FILES_EXCLUDE: "ix-applications,.ix-apps,.system,apps"
       CACHE_ROOTS: ""       # TrueNAS hat keinen Unraid-Cache
+      # DISCOVER_KEYS: "0"   # ab 1.16.0: API-Keys der Dienste nicht aus appdata lesen (Standard an, nur lesend, nur mit Token)
+      # DISCOVER_ROOTS: ""  # leer = /host/mnt/user/apps (eigene Datasets); Katalog-Apps: /mnt/.ix-apps/app_mounts zusätzlich :ro einbinden und DISCOVER_ROOTS setzen
     volumes:
       # Pflicht: hier speichert der Agent Token und Verlauf, sonst gibt es nach jedem Update einen neuen Token
       - /mnt/tank/apps/nzblab-agent:/config             # Verlauf, Datei-Index, token.txt (lesen/schreiben)

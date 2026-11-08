@@ -25,6 +25,9 @@ services:
       # NZBLAB_BIND: "0.0.0.0"        # nur auf dieser Adresse lauschen, z. B. die LAN-Adresse des NAS
       # NZBLAB_NET: "0"               # Netz-/Latenz-Messung aus (Standard an: TCP-Aufbau zu Router und 1.1.1.1:443, jede Minute)
       # NZBLAB_NET_TARGET: "1.1.1.1:443"
+      # DISCOVER_KEYS: "0"            # ab 1.16.0: API-Keys von Sonarr, Radarr, SABnzbd … NICHT aus appdata lesen (Standard an,
+      #                               # nur lesend, nur mit Token; Plex-Token nie). 0 = nur melden, welche Dienste es gibt
+      # DISCOVER_ROOTS: ""            # appdata-Ordner im Container, Komma; leer = /host/mnt/user/appdata, sonst …/apps, …/docker
       # --- B (Linux, Debian/Ubuntu): Freigaben unter /host/fs statt /host/mnt/user
       # FILES_ROOT: "/host/fs"
       # CACHE_ROOTS: ""

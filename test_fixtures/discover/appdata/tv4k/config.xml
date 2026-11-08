@@ -1,0 +1,6 @@
+<Config>
+  <Port>8990</Port>
+  <ApiKey>0000sonarr4kfixture0000000000ddd</ApiKey>
+  <UrlBase>/4k</UrlBase>
+  <InstanceName>Sonarr 4K</InstanceName>
+</Config>

@@ -1,6 +1,8 @@
-# NZBLab-Agent
+# NASlab-Agent (früher NZBLab-Agent)
 
-Kleiner Dienst auf dem NAS, der rund um die Uhr misst und die Werte der NZBLab-App liefert:
+Container, Image (`ghcr.io/tuxxler/nzblab-agent`), Ordner und Pfade heissen weiter `nzblab-agent`; die Log-Zeile mit dem Token lautet weiterhin «NZBLab-Agent Token: …».
+
+Kleiner Dienst auf dem NAS, der rund um die Uhr misst und die Werte der NASlab-App liefert:
 Temperaturen aller Sensoren, CPU-Last (gesamt und pro Kern), Grafikchip (Grafik- und Medien-Einheit, die Medien-Einheit
 rechnet Videos für Plex um), Arbeitsspeicher, Plattenzugriffe (wann eine Platte nach einer Pause anläuft) und welche
 Programme die meiste CPU brauchen. 8 Tage volle Auflösung (alle 30 s), 2 Jahre Stundenwerte.
@@ -12,12 +14,12 @@ Programme die meiste CPU brauchen. 8 Tage volle Auflösung (alle 30 s), 2 Jahre 
 Fertiges Image: **`ghcr.io/tuxxler/nzblab-agent:latest`** (amd64 und arm64, gebaut von `.github/workflows/agent-image.yml`,
 Grundlage `python:3.12-alpine3.22`, nur Python-Standardbibliothek). Kostenlos, Quellcode öffentlich einsehbar:
 <https://github.com/Tuxxler/nzblab-agent> (Lizenz siehe unten).
-Gleiche Anleitung in der App (Einstellungen › Server-Verbindungen › NZBLab-Agent › «Agent installieren») und auf der
+Gleiche Anleitung in der App (Einstellungen › Server-Verbindungen › NASlab-Agent › «Agent installieren») und auf der
 Website <https://tuxxler.github.io/nzblab/agent.html>.
 
 | System | Datei | Kurz |
 |---|---|---|
-| Unraid | `unraid/nzblab-agent.xml` | Apps › «NZBLab-Agent» › Install; bis zur Aufnahme in CA: Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent` |
+| Unraid | `unraid/nzblab-agent.xml` | Apps › «NASlab-Agent» › Install; bis zur Aufnahme in CA: Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent` |
 | TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = eigener Pool |
 | Synology DSM 7.2+ | `compose/synology.yml` | Ordner `docker/nzblab-agent` anlegen; Container Manager › Projekt › Erstellen |
 | Linux (Debian, Ubuntu …, ab 1.14.0) | `compose/linux.yml` | Ordner anlegen, Datei als `docker-compose.yml` speichern, `docker compose up -d`; siehe unten |
@@ -29,7 +31,7 @@ Website <https://tuxxler.github.io/nzblab/agent.html>.
 ```
 ================================================================
 NZBLab-Agent Token: …
-In der App eintragen: Einstellungen › Server-Verbindungen › NZBLab-Agent.
+In der App eintragen: Einstellungen › Server-Verbindungen › NASlab-Agent.
 ================================================================
 ```
 
@@ -87,7 +89,7 @@ Vorlage `compose/linux.yml`:
    `mkdir -p ~/nzblab-agent/nzblab-agent-config && sudo chown 65534:65534 ~/nzblab-agent/nzblab-agent-config`,
    dann in `~/nzblab-agent` die Datei als `docker-compose.yml` speichern.
 2. Ordner mit Daten anpassen (siehe unten), dann `docker compose up -d`.
-3. Token: `docker logs nzblab-agent 2>&1 | grep "NZBLab-Agent Token"`. In der App den Dienst «NZBLab-Agent» eintragen und
+3. Token: `docker logs nzblab-agent 2>&1 | grep "NZBLab-Agent Token"`. In der App den Dienst «NASlab-Agent» eintragen und
    beim NAS-Server den Typ «Linux (Beta)» wählen.
 
 **Sicherheit zuerst: nie das ganze System (`/`) einbinden.** Der Agent braucht es nicht. Er liest:
@@ -190,6 +192,66 @@ sie mit Token.
 Unraid 7.x (amd64). 1.15.0 ist mit den Tests und einem Probelauf auf Unraid (amd64) geprüft, noch nicht als Image. arm64 (Raspberry Pi 4/5 mit 64-Bit-System) wird gebaut, aber nicht auf echter
 Hardware geprüft; 32-Bit-ARM (armv7) gibt es nicht.
 
+## Ab 1.16.0: Dienste finden («Alles in einer Minute verbunden»)
+
+`GET /api/discover` (nur mit Token) sucht **nur lesend** in den appdata-Ordnern nach bekannten Diensten und liest ihre
+API-Keys aus den Einstellungsdateien. Die App kann damit «7 Dienste gefunden, alle verbinden?» anbieten. Der Ordnername ist
+egal (`binhex-sonarr`, `sonarr`, `tv4k` …), erkannt wird über den Inhalt und den Namen.
+
+**Standard an.** `DISCOVER_KEYS=0` schaltet das Auslesen der Schlüssel aus: Der Endpunkt meldet dann nur, welche Dienste
+es gibt (`apiKey: null`, `code: "keys_off"`), `features` enthält nur `discover`, nicht `discover_keys`.
+
+| Dienst (`service`) | Datei | Gelesen | Port ohne Angabe |
+|---|---|---|---|
+| `sonarr`, `radarr`, `prowlarr` | `config.xml` | `ApiKey`, `Port`, `SslPort`/`EnableSsl`, `UrlBase`; Typ aus `<InstanceName>`, sonst Ordnername, sonst Standard-Port | 8989, 7878, 9696 |
+| `sab` (SABnzbd) | `sabnzbd.ini` | `[misc]` `api_key`, `port`, `https_port`/`enable_https`, `url_base` | 8080 |
+| `tautulli` | `config.ini` | `[General]` `api_key`, `http_port`, `http_root`, `enable_https` | 8181 |
+| `seerr` (`variant` overseerr, jellyseerr, seerr) | `settings.json` | nur `main.apiKey` | 5055 |
+| `plex` | `Preferences.xml` im Ordner «Plex Media Server» | **nichts**: die Datei wird nie geöffnet (Konto-Token) → «Token selbst eintragen» | 32400 |
+| `jellyfin` (`variant` jellyfin, emby) | `network.xml` (oder Ordnername) | `InternalHttpPort`, `BaseUrl`, `EnableHttps`; ein API-Key steht in keiner Datei → «in der Weboberfläche erstellen» | 8096 |
+
+Lidarr, Readarr, Whisparr und andere Dienste werden nicht gemeldet.
+
+**Wo gesucht wird:** `DISCOVER_ROOTS` (Container-Pfade, Komma), sonst `<FILES_ROOT>/appdata` (Unraid: `/mnt/user` →
+`/host/mnt/user`, schon in der Vorlage), wenn es den nicht gibt `<FILES_ROOT>/apps` (TrueNAS, eigene Datasets wie in
+`compose/truenas.yml`) und `<FILES_ROOT>/docker` (Synology `/volume1/docker`). TrueNAS-Katalog-Apps liegen unter
+`/mnt/.ix-apps/app_mounts`: bei Bedarf zusätzlich nur lesend einbinden und `DISCOVER_ROOTS` setzen. Der Agent hat kein
+`docker.sock` und braucht keins.
+
+**Grenzen und Sicherheit:**
+
+- höchstens 3 Ordner-Ebenen unter jedem Container-Ordner, 3000 Einträge pro Ordner, 500 Ordner; grosse Datenordner (Cache,
+  Logs, Backups, MediaCover, Metadata …) und versteckte Ordner werden nicht betreten
+- Symlinks werden nie verfolgt (Ordner nicht, Dateien nicht: `O_NOFOLLOW`), nur normale Dateien bis 1 MB
+- XML mit `DOCTYPE`/`ENTITY` wird nicht ausgewertet; Schlüssel nur, wenn sie wie ein Schlüssel aussehen (16–128 Zeichen
+  `A-Z a-z 0-9 _ - + / =`)
+- Antwort nur mit diesen Feldern, keine anderen Dateiinhalte (Passwörter, Plex-Token, Usenet-Zugänge bleiben liegen), kein
+  Pfad ausser dem Ordnernamen; `Cache-Control: no-store`
+- höchstens 10 Abrufe pro Minute (für alle zusammen), danach `429` mit `Retry-After`; falsche Tokens bremst weiterhin die
+  Token-Bremse
+- Schlüssel stehen nie im Log, auch nicht im Fehlerfall (`500 {"error": "Suche fehlgeschlagen"}` ohne Einzelheiten), nicht
+  in «Heute», im Verlauf oder in der Weboberfläche
+- liest der Agent als PUID 99 einen Ordner nicht: `code: "unreadable"`, Abhilfe PUID=0
+
+**Antwort:**
+
+```json
+{"available": true, "keys": true, "partial": false, "at": 1762500000,
+ "ports_note": "Ports stammen aus den Einstellungsdateien und gelten im Container; …",
+ "services": [
+  {"service": "sonarr", "folder": "binhex-sonarr", "port": 8989, "ssl": false, "urlBase": "", "apiKey": "<32 Zeichen>",
+   "code": "ok", "note": "Schlüssel gefunden", "portSource": "config"},
+  {"service": "radarr", "folder": "radarr", "port": 9899, "httpPort": 7878, "ssl": true, "urlBase": "/radarr",
+   "apiKey": "<32 Zeichen>", "code": "ok", "note": "Schlüssel gefunden", "portSource": "config"},
+  {"service": "plex", "folder": "plex", "port": 32400, "ssl": false, "urlBase": "", "apiKey": null,
+   "code": "plex_token", "note": "Gefunden; Plex-Token selbst eintragen …", "portSource": "default"}]}
+```
+
+`code`: `ok`, `keys_off`, `plex_token`, `jellyfin_key`, `emby_key`, `unreadable`, `broken` (Datei kaputt oder ohne gültigen
+Schlüssel). `port` ist bei SSL der HTTPS-Port, `httpPort` dann der unverschlüsselte. **Wichtig:** Die Ports gelten im
+Container. Im Bridge-Netz kann Docker sie am NAS anders abbilden (z. B. 8989 → 18989); das muss die App über die
+Containerliste des NAS (Portzuordnung) lösen. `partial: true` = eine Grenze wurde erreicht.
+
 ## Übersicht im Browser (ab 1.4.0)
 
 `http://<NAS-IP>:8099` (z. B. `http://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
@@ -230,7 +292,7 @@ immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); 
 |---|---|
 | `GET /api/ping` | lebt der Agent? Ab 1.13.0 dazu `config_persistent` (`false` = `/config` geht beim Update verloren), ab 1.15.0 `api_level` und `sampling_ok`, sonst nichts |
 | `GET /api/hello?nonce=<32 Hex-Zeichen>` | ohne Token, ab 1.11.0: Heimnetz-Prüfung der App, siehe unten |
-| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung); ab 1.14.0 `host_os` (os-release eingebunden) und `host_fs` (Ordner unter `/host/fs`); ab 1.15.0 `api_level` (Zahl, 15), `features` (eingeschaltete Zusätze: `boots`, `disktemps`, `health`, `smart`, `backups`, `raid`, `net`, `logs`), `last_boot`, `boots_7d`, `sampling_ok` |
+| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung); ab 1.14.0 `host_os` (os-release eingebunden) und `host_fs` (Ordner unter `/host/fs`); ab 1.15.0 `api_level` (Zahl, 15), `features` (eingeschaltete Zusätze: `boots`, `disktemps`, `health`, `smart`, `backups`, `raid`, `net`, `logs`; ab 1.16.0 `discover` und `discover_keys`, `api_level` 16), `last_boot`, `boots_7d`, `sampling_ok` |
 | `GET /api/now` | aktuelle Werte (höchstens alle 2 s neu gemessen) |
 | `GET /api/history?hours=24` | bis 192 h alle Messungen, darüber Stundenwerte (`res=hour` erzwingt Stundenwerte) |
 | `GET /api/today?hours=24` | «Heute»: Ereignisse aller Quellen, neueste zuerst, mit Zusammenfassung und welche Quellen fehlen |
@@ -242,6 +304,7 @@ immer. Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); 
 | `GET /api/files/duplicates?min_mb=100&limit=100` | doppelte Dateien (ab 1.8.0), siehe unten |
 | `GET /api/inventory` | Medien-Bestand: Filme, Serien, Lücken, neu seit dem letzten Index (ab 1.8.0) |
 | `GET /api/cache/shares` | Belegung jeder Freigabe auf dem Cache (ab 1.8.1; Pfad `/mnt/cache` → `/host/mnt/cache` nur lesen, mehrere Pools mit `CACHE_ROOTS`) |
+| `GET /api/discover` | ab 1.16.0: gefundene Dienste mit Port, SSL, URL-Basis und API-Key (siehe «Ab 1.16.0»); `DISCOVER_KEYS=0` oder Abfrage `?keys=0` ohne Schlüssel (`apiKey: null`, Codes unverändert; die App zählt so nur), `Cache-Control: no-store`, höchstens 10 Abrufe pro Minute (`429`) |
 | `GET /api/appdata` | Grösse jedes Container-Ordners unter appdata (ab 1.8.2; misst im Hintergrund höchstens alle 6 Std., braucht `/mnt/user` → `/host/mnt/user` nur lesen) |
 | `GET /api/wireguard` | WireGuard-Tunnel und Geräte, ohne Schlüssel (ab 1.8.0) |
 | `GET /api/host` | Linux-Server (ab 1.14.0): `hostname`, `os` (aus `/host/os-release`: `name`, `version`, `id`, `pretty`, `available`), `kernel`, `uptime_s`, `boot_time`, `cpu` (`model`, `cores`, `threads`), `load` (1/5/15 Min.), `mem` (Bytes), `net` (Schnittstellen mit MAC, Zustand, Tempo, IPv4) |
@@ -417,7 +480,7 @@ Kostenlos, Quellcode öffentlich einsehbar, unter der **PolyForm Shield License 
 
 - **Erlaubt:** den Agenten kostenlos nutzen, auch geschäftlich; den Code ansehen, ändern und weitergeben (mit Lizenztext
   und der Zeile «Required Notice»).
-- **Verboten:** den Agenten oder Teile davon für ein Produkt verwenden, das mit ihm oder mit NZBLab konkurriert.
+- **Verboten:** den Agenten oder Teile davon für ein Produkt verwenden, das mit ihm oder mit NASlab (früher NZBLab) konkurriert.
 
 English: free to use, also commercially, and you may read and change the code; you may not use it to build a competing
 product. Full text: [`LICENSE`](LICENSE).

@@ -21,6 +21,8 @@ services:
       PGID: "0"
       FILES_EXCLUDE: "@*,#*,docker"
       CACHE_ROOTS: ""
+      # DISCOVER_KEYS: "0"   # ab 1.16.0: API-Keys der Dienste nicht aus appdata lesen (Standard an, nur lesend, nur mit Token)
+      # DISCOVER_ROOTS: ""  # leer = /host/mnt/user/docker (= /volume1/docker)
     volumes:
       # Pflicht: hier speichert der Agent Token und Verlauf, sonst gibt es nach jedem Update einen neuen Token
       - /volume1/docker/nzblab-agent:/config            # Verlauf, Datei-Index, token.txt (lesen/schreiben)

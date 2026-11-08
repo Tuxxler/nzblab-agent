@@ -1,0 +1,2 @@
+{"clientId": "fixture-client", "main": {"apiKey": "MDAwMG92ZXJzZWVycmZpeHR1cmUwMDA=", "applicationTitle": "Overseerr"},
+ "plex": {"name": "Tux", "ip": "192.168.1.2", "port": 32400}, "notifications": {"agents": {"email": {"options": {"authPass": "FIXTURE-MAIL-PASSWORT"}}}}}

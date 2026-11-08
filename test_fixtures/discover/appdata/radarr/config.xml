@@ -1,0 +1,7 @@
+<Config>
+  <Port>7878</Port>
+  <SslPort>9899</SslPort>
+  <EnableSsl>True</EnableSsl>
+  <ApiKey>0000radarrfixture000000000000bbb</ApiKey>
+  <UrlBase>radarr/</UrlBase>
+</Config>

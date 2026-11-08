@@ -1,0 +1,14 @@
+<Config>
+  <BindAddress>*</BindAddress>
+  <Port>8989</Port>
+  <SslPort>9898</SslPort>
+  <EnableSsl>False</EnableSsl>
+  <LaunchBrowser>True</LaunchBrowser>
+  <ApiKey>0000sonarrfixture000000000000aaa</ApiKey>
+  <AuthenticationMethod>Forms</AuthenticationMethod>
+  <Branch>main</Branch>
+  <LogLevel>info</LogLevel>
+  <UrlBase></UrlBase>
+  <InstanceName>Sonarr</InstanceName>
+  <PostgresPassword>FIXTURE-POSTGRES-PASSWORT</PostgresPassword>
+</Config>

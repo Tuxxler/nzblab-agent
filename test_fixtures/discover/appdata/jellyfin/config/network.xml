@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<NetworkConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <BaseUrl>/jf</BaseUrl>
+  <EnableHttps>false</EnableHttps>
+  <InternalHttpPort>8096</InternalHttpPort>
+  <InternalHttpsPort>8920</InternalHttpsPort>
+</NetworkConfiguration>
