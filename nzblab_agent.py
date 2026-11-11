@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.16.2"
+VERSION = "1.17.0"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -261,6 +261,32 @@ class Sampler:
                 res[key] = max(res.get(key, -1000), int(v) / 1000.0)
         return {k: round(v, 1) for k, v in res.items() if -40 < v < 150}
 
+    # --- Grenzwerte der Sensoren (2.63): temp*_crit (Abschaltgrenze), sonst temp*_max; je Sensorname der höchste Wert.
+    # Die App zeigt daraus die CPU-Grenze «laut Server» (Startseite, Wärmekarte, Warnschwelle).
+    def limits(self):
+        res = {}
+        base = f"{self.sys}/class/hwmon"
+        for h in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+            d = f"{base}/{h}"
+            name = read(f"{d}/name", h)
+            for f in sorted(os.listdir(d)):
+                m = re.match(r"temp(\d+)_input$", f)
+                if not m:
+                    continue
+                # crit zuerst; ist er unbrauchbar (fehlt, Unsinn, ausserhalb 40–150 °C), dann max
+                v = None
+                for kind in ("crit", "max"):
+                    raw = read(f"{d}/temp{m.group(1)}_{kind}")
+                    if raw is not None and raw.lstrip("-").isdigit() and 40 < int(raw) / 1000.0 < 150:
+                        v = int(raw) / 1000.0
+                        break
+                if v is None:
+                    continue
+                label = read(f"{d}/temp{m.group(1)}_label", "")
+                key = friendly_sensor(name, label, h)
+                res[key] = max(res.get(key, -1000), v)
+        return {k: round(v, 1) for k, v in res.items()}
+
     def fans(self):
         res = {}
         base = f"{self.sys}/class/hwmon"
@@ -318,12 +344,15 @@ class Sampler:
         return {"total": tot, "used": max(0, tot - avail), "percent": round(100.0 * (tot - avail) / tot, 1) if tot else None}
 
     # --- Plattenzugriffe (Sektoren gelesen/geschrieben seit Start; Differenz in KiB/s)
+    # Ganze Platten, keine Partitionen: sd*, nvme*n*, und ab 1.17.0 die Namen von Synology DSM 7 (sata1, sas1, usb1; Prüfung 10.11.2026)
+    DISKSTATS_DEV = re.compile(r"^(sd[a-z]+|nvme\d+n\d+|(?:sata|sas|usb)\d{1,3})$")
+
     def disks(self, now):
         out = {}
         rw = {}
         for l in (read(f"{self.proc}/diskstats", "") or "").splitlines():
             p = l.split()
-            if len(p) < 10 or not re.match(r"^(sd[a-z]+|nvme\d+n\d+)$", p[2]):
+            if len(p) < 10 or not self.DISKSTATS_DEV.match(p[2]):
                 continue
             name, rd, wr = p[2], int(p[5]), int(p[9])
             prev = self.last_disk.get(name)
@@ -384,6 +413,7 @@ class Sampler:
             "t": int(now), "cpu": total, "cores": cores, "temps": self.temps(), "fans": self.fans(),
             "gpu": self.gpu(now), "mem": self.memory(), "disks": self.disks(now), "top": self.top(now),
             "net": self.net(now), "mover": getattr(self, "mover", False), "disk_rw": getattr(self, "disk_rw", {}),
+            "limits": self.limits(),
         }
 
     # Netz des NAS (nicht des Containers): /proc/1/net/dev des Hosts. Nur echte Schnittstellen, Bytes pro Sekunde
@@ -3929,7 +3959,8 @@ def check_boot(store, proc_dir=None, now=None):
 
 # --- Plattentemperaturen pro Gerät
 
-DISK_DEV = re.compile(r"(sd[a-z]{1,3}|hd[a-z]|nvme\d+n\d+|vd[a-z]{1,2})$")
+# Blockgeräte für Temperaturen: klassische Namen und ab 1.17.0 Synology DSM 7 (sata1…, sas1…, usb1…)
+DISK_DEV = re.compile(r"(sd[a-z]{1,3}|hd[a-z]|nvme\d+n\d+|vd[a-z]{1,2}|(?:sata|sas|usb)\d{1,3})$")
 
 
 def disk_temps(sys_root=None, smart_latest=None):
@@ -4074,7 +4105,8 @@ def run_net(store, stop):
 
 # --- SMART (freiwillig, nur lesen: smartctl --scan und smartctl -a, nie Selbsttests, nie Schreiben)
 
-SMART_DEV = re.compile(r"/dev/(sd[a-z]{1,3}|hd[a-z]|nvme\d{1,3}(n\d{1,3})?|sg\d{1,3}|bus/\d{1,3})")
+# ab 1.17.0 auch /dev/sata1, /dev/sas1, /dev/usb1 (Synology DSM 7)
+SMART_DEV = re.compile(r"/dev/(sd[a-z]{1,3}|hd[a-z]|nvme\d{1,3}(n\d{1,3})?|sg\d{1,3}|bus/\d{1,3}|(?:sata|sas|usb)\d{1,3})")
 SMART_TYPE = re.compile(r"[a-z0-9][a-z0-9,+_-]{0,31}")
 SMART_TIMEOUT = 60
 
@@ -4731,7 +4763,50 @@ def collect_logs(log_dir=None, hours=24, limit=200, now=None):
             seen[key] = {"t": t, "level": "err" if err else "warn", "src": redact_log(src), "text": msg, "n": 1}
     lines = sorted(seen.values(), key=lambda e: -e["t"])[:limit]
     return {"enabled": True, "hours": hours, "files": files, "lines": lines, "redacted": True,
+            "mover": mover_log(log_dir, now),
             "note": "IP, MAC, E-Mail, Tokens/Passwörter, Benutzer und Pfade sind entfernt"}
+
+
+# Mover-Zeilen von Unraid im Systemprotokoll (ab 1.17.0, für «Mover hängt» ohne Raten): das Skript schreibt «mover: started»
+# und «mover: finished», «mover stop» meldet «mover: stopped». Unraid leitet es mit Kennzeichen «move» weiter («move: mover: started»).
+MOVER_LINE = re.compile(r"(?i)\bmove(?:r)?:\s*(?:mover:\s*)?(started|finished|completed|done|stopped|not running|exit(?:ed|ing)?)\b")
+
+
+def mover_log(log_dir=None, now=None, max_age=12 * 3600):
+    """Letzter Mover-Start und -Ende aus syslog/messages. {"state": "running"|"finished"|None, "started": t, "ended": t}.
+    «running» = Start ohne Ende-Zeile danach und nicht älter als 12 Stunden. Keine Dateinamen, nichts Geschwärztes nötig."""
+    log_dir = log_dir or LOG_DIR
+    now = int(now or time.time())
+    started = ended = None
+    for name in ("syslog", "messages"):
+        path = os.path.join(log_dir, name)
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 4_000_000))
+                lines = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if "move" not in line.lower() or "file:" in line:
+                continue
+            m = MOVER_LINE.search(line)
+            if not m:
+                continue
+            t = _log_time(line, None)
+            if t is None or t > now + 300:
+                continue
+            if m.group(1).lower() == "started":
+                if started is None or t > started:      # gleiche Sekunde (doppelte Zeile in syslog und messages) setzt das Ende nicht zurück
+                    started, ended = t, None
+            elif started is not None and t >= started and ended is None:
+                ended = t
+    if started is None:
+        return {"state": None, "started": None, "ended": None}
+    state = "finished" if ended is not None else ("running" if now - started <= max_age else None)
+    return {"state": state, "started": started, "ended": ended}
 
 
 def agent_features(smart=None, backups=None, log_dir=None):

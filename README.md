@@ -270,6 +270,24 @@ Containerliste des NAS (Portzuordnung) lösen. `partial: true` = eine Grenze wur
 **Teststand:** nur mit erfundenen Testdaten geprüft (`test_fixtures/discover/`, Unit-Tests), **noch nicht gegen echte appdata**
 und nicht auf echtem Unraid.
 
+## Ab 1.17.0: Grenzwerte, Synology-Plattennamen, Mover-Stand aus dem Protokoll
+
+Gleiche Schnittstelle (`api_level` 16), drei Ergänzungen:
+
+- **`limits` in `/api/now`:** Grenzwert je Sensor laut hwmon (`temp*_crit`, sonst `temp*_max`, nur 40–150 °C). Die App
+  nimmt daraus die Grenze der CPU (vor der Hersteller-Tabelle); fehlt der Wert, bleibt alles wie vorher.
+- **Synology DSM 7:** Platten heissen dort `sata1…`, `sas1…` oder `usb1…` statt `sda`. Der Agent erkennt diese Namen jetzt bei
+  Plattenzugriffen (`disks`, `disk_rw`, Platten-Wecker), Plattentemperaturen (`/api/disktemps`) und als SMART-Gerät
+  (`/dev/sata1`). Nur mit erfundenen Testdaten geprüft, noch nicht auf einem echten Synology.
+- **`mover` in `/api/logs`** (nur mit `NZBLAB_LOGS=1` und eingebundenem `/var/log`): letzter Mover-Start und letztes Ende aus
+  syslog/messages (`{"state": "running"|"finished"|null, "started": t, "ended": t}`, Start ohne Ende höchstens 12 Stunden
+  alt). Die App meldet «Mover hängt» nur, wenn das Protokoll den Lauf noch offen zeigt und 30 Minuten nichts verschoben wurde;
+  ohne Protokoll bleibt es eine beschriftete Schätzung. Keine Dateinamen, keine Pfade.
+
+**Teststand:** Unit-Tests mit Testdaten (`test_agent.py`); nicht auf echtem Unraid oder Synology geprüft. Sicherheits-Audit und
+Code-Review des Diffs seit 1.16.2 am 11.11.2026: zwei kleine Fehler behoben (Grenzwert: `max`, wenn `crit` unbrauchbar ist;
+Mover: doppelte Startzeile in syslog und messages setzt das Ende nicht zurück).
+
 ## Ab 1.16.1: Korrekturen aus Sicherheitsaudit und Code-Reviews
 
 Gleiche Schnittstelle (`api_level` 16). Geändert:

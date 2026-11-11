@@ -6,6 +6,9 @@
 # Mehrere Volumes: weitere Zeilen wie «/volume2:/host/mnt/volume2:ro» sind möglich, der Index sieht aber nur /host/mnt/user.
 # Code und Anleitung (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
 # Ab 1.15.0 freiwillige Zusätze (SMART, Log-Auszüge, Backups, Netz-Messung aus): Blöcke S, L, B2 in ../docker-compose.yml.
+# Was auf Synology geht (Prüfung 10.11.2026): System, RAM, Netz, Neustarts, RAID (mdadm/btrfs), Datei-Index, Dienste finden.
+# Temperaturen und Lüfter sind modellabhängig (DSM ohne hwmon, meist leer). Platten (sata1…, sas1…) erst ab Agent 1.17.0.
+# Hyper Backup wird nicht erkannt (eigenes Format). Virtual DSM hat keine Sensoren.
 services:
   nzblab-agent:
     image: ghcr.io/tuxxler/nzblab-agent:latest

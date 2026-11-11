@@ -28,6 +28,8 @@ class FakeHost:
         write(f"{self.sys}/class/hwmon/hwmon5/name", "coretemp")
         write(f"{self.sys}/class/hwmon/hwmon5/temp1_label", "Package id 0")
         write(f"{self.sys}/class/hwmon/hwmon5/temp1_input", "71000")
+        write(f"{self.sys}/class/hwmon/hwmon5/temp1_crit", "100000")
+        write(f"{self.sys}/class/hwmon/hwmon5/temp1_max", "95000")
         write(f"{self.sys}/class/hwmon/hwmon5/temp2_label", "Core 0")
         write(f"{self.sys}/class/hwmon/hwmon5/temp2_input", "69000")
         write(f"{self.sys}/class/hwmon/hwmon0/name", "nvme")
@@ -66,6 +68,9 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(r["temps"]["CPU"], 71.0)
         self.assertEqual(r["temps"]["CPU Kern 0"], 69.0)
         self.assertIn("NVMe 0", r["temps"])
+        # 2.63: Grenzwert laut hwmon (crit vor max), nur für Sensoren, die einen melden
+        self.assertEqual(r["limits"]["CPU"], 100.0)
+        self.assertNotIn("NVMe 0", r["limits"])
         self.assertTrue(60 < r["gpu"]["Medien"] < 80, r["gpu"])
         self.assertEqual(r["gpu"]["Medien MHz"], 900)
         self.assertGreater(r["disks"]["sdb"], 500)
@@ -124,7 +129,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.16.2")
+        self.assertEqual(info["version"], "1.17.0")
         srv.shutdown()
 
 
@@ -160,7 +165,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.16.2")
+            self.assertEqual(r["version"], "1.17.0")
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents
@@ -2024,6 +2029,30 @@ class Agent115Test(unittest.TestCase):
         free.close()
         self.assertIsNotNone(a.tcp_probe("127.0.0.1", port, 1))      # abgelehnt (RST) = Antwort
 
+    # --- Synology DSM 7 (ab 1.17.0, Prüfung 10.11.2026): Platten heissen sata1…, sas1…, usb1… statt sda
+    def test_synology_plattennamen(self):
+        h = FakeHost()
+        s = a.Sampler(h.sys, h.proc)
+        write(f"{h.proc}/diskstats", "   8       0 sata1 0 0 0 0 0 0 0 0 0 0 0\n   8      16 sata1p1 0 0 0 0 0 0 0 0 0 0 0\n"
+                                     "   8      32 sas1 0 0 0 0 0 0 0 0 0 0 0\n   8      48 usb1 0 0 0 0 0 0 0 0 0 0 0\n"
+                                     "   8      64 sdb 0 0 0 0 0 0 0 0 0 0 0\n   7       0 loop0 0 0 0 0 0 0 0 0 0 0 0\n")
+        s.sample()
+        time.sleep(1.1)
+        write(f"{h.proc}/diskstats", "   8       0 sata1 0 0 2048 0 0 0 0 0 0 0 0\n   8      16 sata1p1 0 0 2048 0 0 0 0 0 0 0 0\n"
+                                     "   8      32 sas1 0 0 1024 0 0 0 0 0 0 0 0\n   8      48 usb1 0 0 512 0 0 0 0 0 0 0 0\n"
+                                     "   8      64 sdb 0 0 1024 0 0 0 0 0 0 0 0\n   7       0 loop0 0 0 9999 0 0 0 0 0 0 0 0\n")
+        r = s.sample()
+        self.assertEqual(set(r["disks"]), {"sata1", "sas1", "usb1", "sdb"})      # Partition sata1p1 und loop0 nicht
+        # Temperaturen: drivetemp unter /sys/block/sata1
+        write(f"{h.sys}/block/sata1/device/hwmon/hwmon5/temp1_input", "41000")
+        write(f"{h.sys}/block/sata1/size", "100")
+        self.assertEqual(a.disk_temps(h.sys).get("sata1"), 41.0)
+        # SMART: /dev/sata1 ist ein erlaubtes Gerät, Unsinn weiterhin nicht
+        self.assertEqual(a.smartctl_args("read", "/dev/sata1", "sat")[-1], "/dev/sata1")
+        self.assertIsNotNone(a.smartctl_args("read", "/dev/usb1", None))
+        self.assertIsNone(a.smartctl_args("read", "/dev/sata1; reboot", None))
+        self.assertIsNone(a.smartctl_args("read", "/dev/sata", None))
+
     # --- SMART
     def test_smart_befehle_nur_lesen(self):
         self.assertEqual(a.smartctl_args("scan"), ["smartctl", "--scan", "--json=c"])
@@ -2235,6 +2264,48 @@ class Agent115Test(unittest.TestCase):
         self.assertEqual(io_err[0]["src"], "kernel")
         self.assertIn("timed out", text)                                 # Warnung mit Zeit «12:34:56» bleibt lesbar
         self.assertEqual(a.collect_logs(f"{self.d}/log", 24, 2, now)["lines"].__len__(), 2)
+
+    def test_mover_log(self):
+        now = int(time.time())
+        def st(dt):
+            return time.strftime("%b %e %H:%M:%S", time.localtime(now - dt))
+        # Start ohne Ende: läuft laut Protokoll
+        write(f"{self.d}/log/syslog", f"{st(1800)} nas move: mover: started\n{st(1700)} nas move: file: /mnt/cache/a/finished.mkv\n")
+        r = a.mover_log(f"{self.d}/log", now)
+        self.assertEqual(r["state"], "running")
+        self.assertEqual(r["started"], now - 1800)
+        self.assertIsNone(r["ended"])
+        # Ende-Zeile danach: fertig
+        write(f"{self.d}/log/syslog", f"{st(1800)} nas move: mover: started\n{st(600)} nas move: mover: finished\n")
+        r = a.mover_log(f"{self.d}/log", now)
+        self.assertEqual(r["state"], "finished")
+        self.assertEqual(r["ended"], now - 600)
+        # Neuer Start nach dem Ende: läuft wieder; «mover: stopped» zählt als Ende
+        write(f"{self.d}/log/syslog", f"{st(1800)} nas move: mover: started\n{st(600)} nas move: mover: finished\n{st(300)} nas root: mover: started\n")
+        self.assertEqual(a.mover_log(f"{self.d}/log", now)["state"], "running")
+        write(f"{self.d}/log/syslog", f"{st(1800)} nas move: mover: started\n{st(60)} nas move: mover: stopped\n")
+        self.assertEqual(a.mover_log(f"{self.d}/log", now)["state"], "finished")
+        # Gross geschrieben («Move: Mover: started») zählt genauso (Review 2.64)
+        write(f"{self.d}/log/syslog", f"{st(900)} nas Move: Mover: started\n")
+        self.assertEqual(a.mover_log(f"{self.d}/log", now)["state"], "running")
+        # Start älter als 12 Stunden ohne Ende: kein Urteil; keine Zeilen: alles None
+        write(f"{self.d}/log/syslog", f"{st(13 * 3600)} nas move: mover: started\n")
+        self.assertIsNone(a.mover_log(f"{self.d}/log", now)["state"])
+        write(f"{self.d}/log/syslog", f"{st(100)} nas kernel: error: x\n")
+        self.assertEqual(a.mover_log(f"{self.d}/log", now), {"state": None, "started": None, "ended": None})
+        self.assertIn("mover", a.collect_logs(f"{self.d}/log", 24, 10, now))
+        # Gleiche Zeilen in syslog und messages (gleiche Sekunde): das Ende aus syslog bleibt (Audit 1.17.0)
+        write(f"{self.d}/log/syslog", f"{st(1800)} nas move: mover: started\n{st(600)} nas move: mover: finished\n")
+        write(f"{self.d}/log/messages", f"{st(1800)} nas move: mover: started\n")
+        self.assertEqual(a.mover_log(f"{self.d}/log", now)["state"], "finished")
+        os.remove(f"{self.d}/log/messages")
+
+    def test_grenzwert_crit_unbrauchbar_dann_max(self):
+        h = FakeHost()
+        write(f"{h.sys}/class/hwmon/hwmon5/temp1_crit", "0")            # Unsinn: crit 0 °C → max gilt
+        self.assertEqual(a.Sampler(h.sys, h.proc).limits()["CPU"], 95.0)
+        write(f"{h.sys}/class/hwmon/hwmon5/temp1_max", "255000")        # beide ausserhalb 40–150 °C → kein Wert
+        self.assertNotIn("CPU", a.Sampler(h.sys, h.proc).limits())
 
     def test_redaktion(self):
         r = a.redact_log
