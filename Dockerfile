@@ -1,6 +1,6 @@
 # NZBLab-Agent: misst Temperaturen, CPU, Grafikchip und Plattenzugriffe auf dem NAS und liefert sie der NZBLab-App.
 # Nur Python-Standardbibliothek, keine Python-Pakete aus dem Netz. Einziges Zusatzpaket (ab 1.15.0): smartmontools aus Alpine
-# (smartctl, rund 3 MB mit libstdc++), wird nur benutzt, wenn NZBLAB_SMART=1 gesetzt ist. Lizenz PolyForm Shield 1.0.0 (LICENSE). Bauen (im Ordner mit diesem Dockerfile):
+# (smartctl, rund 3 MB mit libstdc++), wird nur benutzt, wenn NZBLAB_SMART=1 gesetzt ist. Lizenz GNU AGPL-3.0 (LICENSE). Bauen (im Ordner mit diesem Dockerfile):
 #   docker build -t nzblab-agent .
 # Start: siehe docker-compose.yml bzw. unraid/nzblab-agent.xml. Alle Host-Pfade nur lesend, nur /config schreibbar.
 # /config immer auf einen Ordner des NAS legen: VOLUME unten ist nur ein anonymer Volume, der beim Neuerstellen ersetzt wird
@@ -22,7 +22,7 @@ LABEL org.opencontainers.image.title="NZBLab-Agent" \
       org.opencontainers.image.url="https://tuxxler.github.io/nzblab/agent.html" \
       org.opencontainers.image.documentation="https://tuxxler.github.io/nzblab/en/agent.html" \
       org.opencontainers.image.vendor="NZBLab" \
-      org.opencontainers.image.licenses="PolyForm-Shield-1.0.0" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
       net.unraid.docker.icon="https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/icons/nzblab-agent.png"
 
 # PUID/PGID: Der Agent legt beim Start als root /config an, gibt den Ordner diesem Benutzer und läuft dann ohne

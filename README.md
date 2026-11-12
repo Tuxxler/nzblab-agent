@@ -575,12 +575,13 @@ private Schlüssel des NAS. Der Agent gibt ihn nie weiter, aber der Container k�
 
 ## Lizenz
 
-Kostenlos, Quellcode öffentlich einsehbar, unter der **PolyForm Shield License 1.0.0** (`PolyForm-Shield-1.0.0`), siehe
-[`LICENSE`](LICENSE) und <https://polyformproject.org/licenses/shield/1.0.0>. Required Notice: Copyright (c) 2026 Tuxxler.
+Kostenlos und Open Source unter der **GNU Affero General Public License 3.0** (`AGPL-3.0-only`), siehe
+[`LICENSE`](LICENSE) und <https://www.gnu.org/licenses/agpl-3.0.html>. Copyright (c) 2026 Tuxxler.
 
-- **Erlaubt:** den Agenten kostenlos nutzen, auch geschäftlich; den Code ansehen, ändern und weitergeben (mit Lizenztext
-  und der Zeile «Required Notice»).
-- **Verboten:** den Agenten oder Teile davon für ein Produkt verwenden, das mit ihm oder mit NASlab (früher NZBLab) konkurriert.
+- **Erlaubt:** den Agenten kostenlos nutzen, auch geschäftlich; den Code ansehen, ändern und weitergeben.
+- **Pflicht:** Wer den Agenten verändert und die veränderte Version weitergibt oder als Dienst über ein Netzwerk anbietet,
+  muss den Quellcode seiner Änderungen ebenfalls unter der AGPL-3.0 offenlegen.
 
-English: free to use, also commercially, and you may read and change the code; you may not use it to build a competing
-product. Full text: [`LICENSE`](LICENSE).
+English: free and open source (GNU AGPL-3.0-only). You may use, study, change and share it, also commercially. If you
+modify it and distribute it or offer it as a network service, you must make your changes available under the same
+license. Full text: [`LICENSE`](LICENSE).

@@ -20,4 +20,4 @@ All host paths are mounted **read-only**. Only `/config` (`/mnt/user/appdata/nzb
 After start the agent drops root and runs as `PUID`/`PGID` (99/100). Set `PUID=0` only if you need container names
 in the "top load" list or appdata sizes of containers with strict permissions.
 
-Source code (free, publicly viewable), Docker/Compose files and license (PolyForm Shield 1.0.0): <https://github.com/Tuxxler/nzblab-agent>.
+Source code (free, open source), Docker/Compose files and license (GNU AGPL-3.0): <https://github.com/Tuxxler/nzblab-agent>.

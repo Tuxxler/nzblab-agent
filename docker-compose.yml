@@ -7,7 +7,7 @@
 #   docker compose logs nzblab-agent | grep "NZBLab-Agent Token"
 # Getestete Architekturen: amd64 und arm64 (beide werden gebaut; Raspberry Pi 4/5 mit 64-Bit-System, Intel/AMD-NAS).
 # Der Agent aktualisiert sich nie selbst: neue Version = «docker compose pull && docker compose up -d».
-# Anleitung: https://tuxxler.github.io/nzblab/agent.html · Code (öffentlich einsehbar, PolyForm Shield 1.0.0): https://github.com/Tuxxler/nzblab-agent
+# Anleitung: https://tuxxler.github.io/nzblab/agent.html · Code (Open Source, AGPL-3.0): https://github.com/Tuxxler/nzblab-agent
 services:
   nzblab-agent:
     image: ghcr.io/tuxxler/nzblab-agent:latest
