@@ -129,7 +129,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.18.0")
+        self.assertEqual(info["version"], "1.19.0")
         srv.shutdown()
 
 
@@ -165,7 +165,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.18.0")
+            self.assertNotIn("version", r)                   # ab 1.19.0 ohne Version
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents
@@ -284,6 +284,50 @@ class ArrayNetTest(unittest.TestCase):
             dev(3000, 1500); n = smp.net(102.0)
             self.assertEqual(n, {"eth0": {"rx": 1000, "tx": 500}})
 
+    def test_netz_gestapelt_nur_einmal(self):
+        """Unraid: eth0 → bond0 → br0 tragen denselben Verkehr; nur die oberste Schnittstelle (ohne «master») zählt (1.18.1)."""
+        import tempfile, nzblab_agent as a
+        with tempfile.TemporaryDirectory() as root:
+            proc, sysd = os.path.join(root, "proc"), os.path.join(root, "sys")
+            os.makedirs(os.path.join(proc, "1/net"))
+            for i in ("eth0", "bond0", "br0", "eth1"):
+                os.makedirs(os.path.join(sysd, "class/net", i))
+            os.symlink(os.path.join(sysd, "class/net/bond0"), os.path.join(sysd, "class/net/eth0/master"))
+            os.symlink(os.path.join(sysd, "class/net/br0"), os.path.join(sysd, "class/net/bond0/master"))
+            def dev(rx, tx):
+                open(os.path.join(proc, "1/net/dev"), "w").write("h1\nh2\n    lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n"
+                    f"  eth0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n bond0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n"
+                    f"   br0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n  eth1: {rx * 2} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n")
+            smp = a.Sampler(sysd, proc)
+            dev(1000, 500); smp.net(100.0)
+            dev(3000, 1500); n = smp.net(102.0)
+            # eth1 hängt an keiner Brücke und zählt eigenständig (Synology-Fall mit zwei Karten)
+            self.assertEqual(n, {"br0": {"rx": 1000, "tx": 500}, "eth1": {"rx": 2000, "tx": 500}})
+
+
+
+class Agent119RestTest(unittest.TestCase):
+    def test_hosts_zu_breit_abgewiesen(self):
+        import nzblab_agent as a
+        self.assertEqual(a._extra_hosts(".com, *.example.org, nas.example.org, .vpn.example.net"), ("nas.example.org", ".vpn.example.net"))
+
+    def test_hello_ohne_version(self):
+        import inspect, nzblab_agent as a
+        src = inspect.getsource(a)
+        line = [l for l in src.splitlines() if '"proof": hello_proof(tok, nonce)' in l][0]
+        self.assertNotIn("VERSION", line)
+
+    def test_ntfy_zahlenname_nie_lokal(self):
+        import nzblab_agent as a
+        old = a.ntfy_url
+        try:
+            for u in ("https://2915221794/thema12345", "https://0xadc0ffee/thema12345"):
+                a.ntfy_url = lambda u=u: u
+                self.assertFalse(a.ntfy_names_allowed(), u)
+            a.ntfy_url = lambda: "https://nas/thema12345"
+            self.assertTrue(a.ntfy_names_allowed())
+        finally:
+            a.ntfy_url = old
 
 
 class TodayTest(unittest.TestCase):
@@ -1550,7 +1594,7 @@ class ConfigPersistTest(unittest.TestCase):
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
             ping = json.load(urllib.request.urlopen(base + "/api/ping"))
-            self.assertEqual(set(ping), {"ok", "version", "config_persistent", "api_level", "sampling_ok"})   # ohne Token nur der Wahrheitswert
+            self.assertEqual(set(ping), {"ok", "config_persistent", "api_level", "sampling_ok"})   # ohne Token keine Version (ab 1.19.0)
             self.assertIs(ping["config_persistent"], False)
             info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
             self.assertIs(info["config_persistent"], False)
@@ -1574,7 +1618,10 @@ class ConfigPersistTest(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as e:
                     urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": hdr}))
                 self.assertEqual(e.exception.code, 503, path)
-                self.assertIn("token.txt ist leer", json.load(e.exception)["token_error"])
+                body = json.load(e.exception)                  # ab 1.19.0 auch von 127.0.0.1 nur der Code
+                self.assertNotIn("token_error_detail", body)
+                self.assertNotIn("token.txt", json.dumps(body))
+                self.assertTrue(body["token_error"])
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(urllib.request.Request(base + "/api/config", data=b"{}", headers={"Authorization": "Bearer "}))
             self.assertEqual(e.exception.code, 503)
@@ -2766,7 +2813,9 @@ class Agent1161Test(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(req)
             self.assertEqual(e.exception.code, 503)
-            self.assertIn("zu kurz", json.loads(e.exception.read())["token_error"])
+            body = json.loads(e.exception.read())
+            self.assertNotIn("token_error_detail", body)
+            self.assertNotIn("zu kurz", json.dumps(body))
         finally:
             h.shutdown()
             h.server_close()
@@ -3675,6 +3724,166 @@ class Agent118Test(unittest.TestCase):
             self.assertEqual(srv.get("/api/info")[0], 200)
         finally:
             srv.close()
+
+
+
+class Agent119Test(unittest.TestCase):
+    """1.19.0: Host-Prüfung ping/health, knappe Token-Fehler, Bremse je /64, ntfy ohne Namen, stacked_member."""
+
+    def test_g1_ping_health_host_header(self):
+        srv = Server115()
+        try:
+            for path in ("/api/ping", "/api/health"):
+                self.assertEqual(srv.get(path, tok=None, headers={"Host": "evil.example"})[0], 403, path)
+                self.assertEqual(srv.get(path, tok=None, headers={"Host": "evil.example:8099"})[0], 403, path)
+                self.assertEqual(srv.get(path, tok=None, headers={"Host": "192.168.1.5:8099"})[0], 200, path)
+                self.assertEqual(srv.get(path, tok=None, headers={"Host": "tower:8099"})[0], 200, path)
+            self.assertEqual(srv.get("/api/ping", tok="geheim", headers={"Host": "evil.example"})[0], 403)
+            code, body, _ = srv.get("/api/ping", tok=None)
+            self.assertEqual((code, body["ok"], body["api_level"], "version" in body), (200, True, a.API_LEVEL, False))
+            self.assertIn("config_persistent", body)                      # die App braucht das ohne Token
+            code, body, _ = srv.get("/api/ping", tok="geheim")
+            self.assertEqual(body["version"], a.VERSION)
+            code, body, _ = srv.get("/api/ping", tok="falsch")            # falscher Token: wie ohne Token
+            self.assertEqual((code, "version" in body), (200, False))
+        finally:
+            srv.close()
+
+    def test_g2_token_fehler_knapp(self):
+        d = tempfile.mkdtemp()
+        old = a.CONFIG
+        a.CONFIG = d
+        try:
+            with open(f"{d}/token.txt", "w") as f:
+                f.write("kurz")
+            import contextlib
+            import io
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), patch.dict(os.environ, {"NZBLAB_AGENT_TOKEN": ""}):
+                self.assertEqual(a.token(), "")
+            self.assertEqual(a.TOKEN_STATE["code"], "short")
+            self.assertIn(d, out.getvalue())                                # ausführlich nur im Log
+            h = a.make_handler(a.Store(":memory:"), lambda: {}, "")
+            # Anfrage von aussen (nicht Loopback): nur der Code
+            fake = type("F", (), {"client_address": ("192.168.1.9", 1)})()
+            sent = []
+            h.refuse(type("S", (), {"client_address": ("192.168.1.9", 1), "_limited": 0,
+                                    "reply": lambda self, c, o, hd=None: sent.append((c, o))})())
+            h.refuse(type("S", (), {"client_address": ("127.0.0.1", 1), "_limited": 0,
+                                    "reply": lambda self, c, o, hd=None: sent.append((c, o))})())
+            (c1, o1), (c2, o2) = sent
+            self.assertEqual((c1, o1["token_error"]), (503, "short"))
+            txt = json.dumps(o1)
+            self.assertNotIn(d, txt)
+            self.assertNotIn("Zeichen", txt)
+            self.assertNotIn("token.txt", txt)
+            self.assertNotIn("token_error_detail", o2)                       # ab 1.19.0 auch von 127.0.0.1 nur der Code
+            self.assertNotIn("Zeichen", json.dumps(o2))
+        finally:
+            a.CONFIG = old
+            a.TOKEN_STATE.update(error="", source="", code="")
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_g3_ipv6_je_64(self):
+        self.assertEqual(a.rate_key("2001:db8:1:2::1"), a.rate_key("2001:db8:1:2:ffff::9"))
+        self.assertNotEqual(a.rate_key("2001:db8:1:2::1"), a.rate_key("2001:db8:1:3::1"))
+        self.assertEqual(a.rate_key("::ffff:1.2.3.4"), "1.2.3.4")
+        lim = a.AuthLimiter(max_fail=10, window=60, block=300)
+        ips = [f"2001:db8:1:2::{i:x}" for i in range(1, 65)]
+        for i in range(1000):
+            lim.fail(ips[i % 64], now=100 + i * 0.01)
+        self.assertGreater(lim.blocked_for(ips[0], now=111), 0)           # ein /64 = ein Absender
+        self.assertGreater(lim.blocked_for("2001:db8:1:2::abcd", now=111), 0)
+        self.assertEqual(lim.blocked_for("2001:db8:1:3::1", now=111), 0)  # anderes /64 frei
+
+    def test_g3_richtiger_token_geht_immer_durch(self):
+        lim = a.AuthLimiter(max_fail=10, window=60, block=300)
+        srv = Server115(limiter=lim)
+        try:
+            for i in range(1000):
+                lim.fail(f"2001:db8:1:2::{i % 64 + 1:x}", now=time.monotonic())
+            self.assertGreater(lim.blocked_for("127.0.0.1"), -1)
+            lim.fail("127.0.0.1"); [lim.fail("127.0.0.1") for _ in range(12)]
+            self.assertGreater(lim.blocked_for("127.0.0.1"), 0)
+            self.assertEqual(srv.get("/api/info", tok="falsch")[0], 429)
+            self.assertEqual(srv.get("/api/info")[0], 200)                 # richtiger Token nie gebremst
+        finally:
+            srv.close()
+
+    def test_eigener_token_warnt_im_log(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch.dict(os.environ, {"NZBLAB_AGENT_TOKEN": "aB3dE5gH7jK9mN2pQ4sT6vW8yZ1cF0hL"}):
+            self.assertEqual(a.token(), "aB3dE5gH7jK9mN2pQ4sT6vW8yZ1cF0hL")
+        self.assertIn("zufälliger Token ist sicherer", out.getvalue())
+        a.TOKEN_STATE.update(error="", source="", code="")
+
+    def test_g1_vpn_namen_und_nzblab_hosts(self):
+        self.assertTrue(a.local_host_header("nas.tail1234.ts.net:8099"))
+        self.assertFalse(a.local_host_header("evil.example"))
+        with patch.object(a, "EXTRA_HOSTS", ("nas.example.org", ".vpn.example.net")):
+            self.assertTrue(a.local_host_header("nas.example.org:8099"))
+            self.assertTrue(a.local_host_header("x.vpn.example.net"))
+            self.assertFalse(a.local_host_header("evil.example"))
+            self.assertFalse(a.local_host_header("evil.nas.example.org"))
+            self.assertFalse(a.local_host_header("vpn.example.net.evil.example"))
+        srv = Server115()
+        try:
+            self.assertEqual(srv.get("/api/ping", tok=None, headers={"Host": "nas.tail1234.ts.net"})[0], 200)
+            self.assertEqual(srv.get("/api/ping", tok=None, headers={"Host": "evil.example"})[0], 403)
+        finally:
+            srv.close()
+
+    def test_g3_hello_limiter_ipv6_64(self):
+        lim = a.HelloLimiter(max_calls=2, window=60)
+        self.assertEqual(lim.allow("2001:db8::1", now=1), 0)
+        self.assertEqual(lim.allow("2001:db8::2", now=1), 0)
+        self.assertGreater(lim.allow("2001:db8::3", now=1), 0)
+
+    def test_g4_ntfy_ohne_namen_an_fremde_server(self):
+        for url, ok in (("https://ntfy.sh/abcdefgh12", False), ("https://ntfy.example.com/abcdefgh12", False),
+                        ("https://192.168.1.20/abcdefgh12", True), ("https://ntfy.lan/abcdefgh12", True), ("https://ntfy/abcdefgh12", True)):
+            with patch.object(a, "ntfy_url", lambda url=url: url), patch.object(a, "NTFY_ALL", False), patch.object(a, "NTFY_NAMES", False):
+                self.assertIs(a.ntfy_names_allowed(), ok, url)
+        with patch.object(a, "ntfy_url", lambda: "https://ntfy.example.com/abcdefgh12"), patch.object(a, "NTFY_NAMES", True):
+            self.assertTrue(a.ntfy_names_allowed())
+        for url, names in (("https://ntfy.sh/abcdefgh12", False), ("https://192.168.1.20/abcdefgh12", True)):
+            msgs = []
+            w = a.Watcher(a.Store(":memory:"), lambda t, x, calm=False: msgs.append(x))
+            with patch.object(a, "ntfy_url", lambda url=url: url), patch.object(a, "NTFY_ALL", False), patch.object(a, "NTFY_NAMES", False):
+                for t in (0, 400):
+                    w.feed({"t": 1000 + t, "cpu": 90.0, "temps": {"CPU": 99.0}, "disks": {}, "top": [("plex", 80.0), ("radarr", 5.0)]})
+            self.assertEqual(len(msgs), 1)
+            self.assertIn("99 °C", msgs[0])
+            self.assertEqual("plex" in msgs[0], names, url)
+
+    def test_g4_ntfy_env_wird_geprueft(self):
+        import contextlib
+        import io
+        a._NTFY_WARNED.discard("env")
+        with patch.object(a, "settings", lambda: {}):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), patch.object(a, "NTFY_URL", "https://ntfy.sh/kurz"):
+                self.assertEqual(a.ntfy_url(), "")                         # Thema zu kurz: ntfy aus
+            self.assertIn("WARNUNG", out.getvalue())
+            self.assertNotIn("kurz", out.getvalue().replace("zu kurz", ""))  # Adresse nicht im Log
+            with patch.object(a, "NTFY_URL", "http://ntfy.sh/abcdefgh12"):
+                self.assertEqual(a.ntfy_url(), "")                         # nur https
+            with patch.object(a, "NTFY_URL", "https://ntfy.sh/abcdefgh12"):
+                self.assertEqual(a.ntfy_url(), "https://ntfy.sh/abcdefgh12")
+
+    def test_stacked_member_nur_exists(self):
+        d = tempfile.mkdtemp()
+        os.makedirs(f"{d}/class/net/eth0")
+        os.symlink("/nonexistent-target", f"{d}/class/net/eth0/master")   # toter Link zählt nicht
+        os.makedirs(f"{d}/class/net/eth1/master")
+        stub = type("N", (), {"sys": d})()
+        self.assertFalse(a.Sampler.stacked_member(stub, "eth0"))        # toter Link: kein Mitglied
+        self.assertTrue(a.Sampler.stacked_member(stub, "eth1"))
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

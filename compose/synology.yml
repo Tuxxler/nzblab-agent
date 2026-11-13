@@ -18,10 +18,11 @@ services:
       - "8099:8099"
     environment:
       TZ: Europe/Zurich
-      # DSM regelt Freigaben über ACLs, die im Container keinem Benutzer entsprechen. Darum bleibt der Agent hier root;
-      # alle NAS-Pfade sind trotzdem nur lesend eingebunden. Eigene Nummer (SSH: «id») geht auch, z. B. PUID 1026 / PGID 100.
-      PUID: "0"
-      PGID: "0"
+      # Ab 1.19.0 läuft der Agent nicht mehr als root: eigene Nummer deines DSM-Benutzers (SSH: «id»), hier Beispiel 1026 / PGID 100.
+      # Dieser Benutzer braucht Leserecht auf die Ordner, die der Agent ansehen soll. PUID=0 (root) nur, wenn der Datei-Index sonst
+      # wegen DSM-ACLs Ordner nicht lesen kann, und davon wird abgeraten (root im Container = mehr Folgen bei einem Fehler).
+      PUID: "1026"
+      PGID: "100"
       FILES_EXCLUDE: "@*,#*,docker"
       CACHE_ROOTS: ""
       # NZBLAB_LAN: "1"     # ab 1.18.0 Standard AUS: Heimnetz-Suche (alle 30 Min ein leeres UDP-Paket an jede Adresse des /24-Netzes, Reverse-DNS, Push bei neuen Geräten)
@@ -37,7 +38,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-    # Ab 1.16.1: nur diese Rechte statt der Docker-Standardliste. Mit PUID 0 bleibt der Agent root, aber nur mit ihnen
+    # Ab 1.16.1: nur diese Rechte statt der Docker-Standardliste. Mit PUID 0 bliebe der Agent root, aber nur mit ihnen
     # (DAC_OVERRIDE: Ordner anderer Pakete lesen). SMART: zusätzlich SYS_RAWIO unter cap_add.
     cap_drop:
       - ALL

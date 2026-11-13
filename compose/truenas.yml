@@ -14,7 +14,7 @@ services:
       - "8099:8099"
     environment:
       TZ: Europe/Zurich
-      PUID: "568"           # TrueNAS-Benutzer «apps»; 0 = root, falls der Datei-Index Ordner nicht lesen darf
+      PUID: "568"           # TrueNAS-Benutzer «apps»; 0 = root nur im Notfall (nicht empfohlen)
       PGID: "568"
       FILES_EXCLUDE: "ix-applications,.ix-apps,.system,apps"
       CACHE_ROOTS: ""       # TrueNAS hat keinen Unraid-Cache

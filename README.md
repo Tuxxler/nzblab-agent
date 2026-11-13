@@ -64,7 +64,7 @@ Ab 1.13.0 sichert der Agent das ab:
 Container-Namen (`/host/docker/containers`, nur root lesbar), gibt `/config` diesem Benutzer und läuft dann ohne root weiter.
 Kann er `/config` nicht übergeben (z. B. NFS mit root_squash), bleibt er mit Hinweis im Log root. `PUID=0` = immer root:
 nötig nur für appdata-Grössen anderer Container mit engen Rechten. TrueNAS-Vorlage: 568:568 (Benutzer «apps»);
-Synology-Vorlage: root, weil DSM-ACLs im Container keinem Benutzer entsprechen.
+Synology-Vorlage ab 1.19.0: eigene Nummer (Beispiel 1026:100, SSH `id`). **`PUID=0` (root) wird abgeraten**, nur falls DSM-ACLs den Datei-Index sonst blockieren.
 
 **Härtung in allen Vorlagen:** `--read-only` (Root-Dateisystem), `/tmp` als tmpfs, `no-new-privileges`, 512 MB RAM, 1 CPU,
 kein `privileged`, keine Zusatz-Capabilities. HEALTHCHECK im Image auf `/api/ping`.
@@ -272,6 +272,27 @@ Containerliste des NAS (Portzuordnung) lösen. `partial: true` = eine Grenze wur
 **Teststand:** nur mit erfundenen Testdaten geprüft (`test_fixtures/discover/`, Unit-Tests), **noch nicht gegen echte appdata**
 und nicht auf echtem Unraid.
 
+## Ab 1.19.0: Host-Prüfung, knappe Token-Fehler, Bremse je /64
+
+Gleiche Schnittstelle (`api_level` 16). Geändert:
+
+- `/api/ping` und `/api/health` antworten nur, wenn der Host-Header eine IP-Adresse, `localhost`, ein Name ohne Punkt oder ein
+  Heimnetz-Name (`.local`, `.lan`, `.home.arpa`, `.internal`, `.localdomain`, `.ts.net` für Tailscale) ist, sonst `403` (gegen DNS-Rebinding).
+  Weitere Namen (ZeroTier, WireGuard, eigene Domain): `NZBLAB_HOSTS=nas.example.org,.vpn.example.net` (kommagetrennt, exakt oder mit
+  führendem Punkt als Endung). `/api/ping` nennt
+  `version` nur mit gültigem Token; `ok`, `api_level`, `config_persistent` und `sampling_ok` bleiben ohne Token.
+- `503` bei unbrauchbarer `token.txt`: nach aussen nur `{"error": …, "token_error": "<code>"}` (`short`, `simple`, `chars`, `empty`,
+  `corrupt`, `unreadable`, `unwritable`). Länge, Pfad und Fehlertext stehen nur im Log des Containers
+  (auch nicht für `127.0.0.1`, weil ein Reverse-Proxy im Host-Modus Internet-Verkehr als 127.0.0.1 weiterreicht).
+  `/api/hello` nennt keine Version mehr. `NZBLAB_HOSTS` weist zu breite Einträge (`*`, `.com`) mit Warnung ab.
+- **Token-Bremse:** IPv6-Absender zählen je /64 (Token-Bremse und `/api/hello`). Der richtige Token wird weiterhin nie gebremst.
+  Ein selbst gewählter Token (`NZBLAB_AGENT_TOKEN`) wird beim Start im Log als weniger sicher als ein zufälliger gemeldet
+  (Regel wie bisher: mindestens 32 Zeichen, mindestens 8 verschiedene).
+- **ntfy:** Programm- und Container-Namen («Meiste Last») stehen nur in Meldungen an einen ntfy-Server im Heimnetz (private IP oder
+  lokaler Name) oder mit `NZBLAB_NTFY_ALL=1` / `NZBLAB_NTFY_NAMES=1` (eigener Server unter eigener Domain). Ein ungültiger
+  `NTFY_URL` (nötig: `https://server/thema`, Thema 8–64 Zeichen) wird mit Warnung im Log ignoriert, ntfy bleibt aus.
+- Synology-Vorlage läuft nicht mehr als root (siehe oben).
+
 ## Ab 1.18.0: Korrekturen aus dem Sicherheits-Audit vom 12.11.2026
 
 Gleiche Schnittstelle (`api_level` 16), neue Felder nur ergänzend (alte Apps lesen sie nicht). Geändert:
@@ -419,7 +440,7 @@ Anzahl Absturzberichte der App, letzte Aktualisierung). Die HTML-Seite selbst en
 
 ## Schnittstelle
 
-Alle Anfragen ausser `/api/ping`, `/api/health` und `/api/hello` (ab 1.16.1 höchstens 30 pro Minute und Absender) mit `Authorization: Bearer <Token>`. Falscher Token: `401`;
+Alle Anfragen ausser `/api/ping`, `/api/health` (ab 1.19.0 mit Host-Prüfung) und `/api/hello` (ab 1.16.1 höchstens 30 pro Minute und Absender) mit `Authorization: Bearer <Token>`. Falscher Token: `401`;
 ab 1.15.0 nach 10 falschen Tokens in einer Minute von derselben Adresse `429` mit `Retry-After` für 5 Minuten
 (`NZBLAB_AUTH_FAILS`). Anfragen über 64 KiB: `413` (Absturzberichte bis 128 000 Bytes), `Transfer-Encoding`: `411`. Konnte der
 Agent selbst keinen Token laden (ab 1.13.0, `token.txt` leer/kaputt/nicht lesbar): `503` mit `token_error`.

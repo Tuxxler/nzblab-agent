@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -419,6 +419,11 @@ class Sampler:
     # Netz des NAS (nicht des Containers): /proc/1/net/dev des Hosts. Nur echte Schnittstellen, Bytes pro Sekunde
     SKIP_IF = ("lo", "docker", "veth", "br-", "shim-", "tunl", "virbr", "vnet", "bonding")
 
+    def stacked_member(self, name):
+        """Gehört die Schnittstelle zu einer Brücke oder einem Bond (Unraid: eth0 → bond0 → br0)? Dann zählt nur die
+        oberste; sonst wird derselbe Verkehr mehrfach gezählt (1.18.1). Erkannt am Symlink /sys/class/net/<x>/master."""
+        return os.path.exists(f"{self.sys}/class/net/{name}/master")
+
     def net(self, now):
         txt = read(f"{self.proc}/1/net/dev", "") if self.proc != "/proc" else read("/proc/net/dev", "")
         cur = {}
@@ -426,7 +431,7 @@ class Sampler:
             name, _, rest = line.partition(":")
             name = name.strip()
             f = rest.split()
-            if len(f) < 9 or name.startswith(self.SKIP_IF):
+            if len(f) < 9 or name.startswith(self.SKIP_IF) or self.stacked_member(name):
                 continue
             cur[name] = (int(f[0]), int(f[8]))
         out = {}
@@ -675,8 +680,11 @@ class Watcher:
             self.hot_since = self.hot_since or now
             if not self.alerted and now - self.hot_since >= HEAT_MINUTES * 60 and self.gate.allow("heat", int(cpu_t // 5), now):
                 self.alerted = True
-                who = ", ".join(n for n, _ in (s.get("top") or [])[:3]) or "unbekannt"
-                self.notify("NAS zu heiss", f"CPU seit {HEAT_MINUTES} Minuten über {HEAT_ALERT:.0f} °C (jetzt {cpu_t:.0f} °C). Meiste Last: {who}.")
+                text = f"CPU seit {HEAT_MINUTES} Minuten über {HEAT_ALERT:.0f} °C (jetzt {cpu_t:.0f} °C)."
+                if ntfy_names_allowed():      # ab 1.19.0: Programm-/Container-Namen nicht an fremde ntfy-Server (z. B. ntfy.sh)
+                    who = ", ".join(n for n, _ in (s.get("top") or [])[:3]) or "unbekannt"
+                    text += f" Meiste Last: {who}."
+                self.notify("NAS zu heiss", text)
         else:
             if cpu_t is not None and cpu_t < HEAT_ALERT - 10:
                 if self.alerted and self.gate.clear("heat"):
@@ -765,13 +773,49 @@ def hello_proof(tok, nonce):
     return hmac.new(tok.encode("utf-8"), ("nzblab-hello:" + nonce).encode("ascii"), hashlib.sha256).hexdigest()
 
 
+NTFY_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+/[A-Za-z0-9_-]{8,64}$")    # wie die Einstellung in der App (POST /api/config)
+_NTFY_WARNED = set()
+
+
 def ntfy_url():
-    return (settings().get("ntfy_url") or NTFY_URL or "").strip()
+    u = (settings().get("ntfy_url") or "").strip()
+    if u:
+        return u
+    env = (NTFY_URL or "").strip()
+    if env and not NTFY_URL_RE.match(env):
+        # ab 1.19.0: dieselbe Prüfung wie bei der App-Einstellung; sonst ntfy aus (die Adresse selbst nie ins Log: das Thema ist geheim)
+        if "env" not in _NTFY_WARNED:
+            _NTFY_WARNED.add("env")
+            print("WARNUNG: NTFY_URL ungültig (nötig: https://server/thema, Thema 8–64 Zeichen aus A-Z a-z 0-9 _ -). ntfy bleibt aus. "
+                  "WARNING: NTFY_URL invalid, ntfy stays off.", flush=True)
+        return ""
+    return env
+
+
+def ntfy_names_allowed():
+    """Programm- und Container-Namen nur in ntfy-Meldungen an einen Server im Heimnetz (IP aus privatem Netz, lokaler Name),
+    oder wenn NZBLAB_NTFY_ALL=1 / NZBLAB_NTFY_NAMES=1 es ausdrücklich erlauben (eigener Server unter eigener Domain)."""
+    if NTFY_ALL or NTFY_NAMES:
+        return bool(ntfy_url())
+    m = re.match(r"^https://([^/]+)/", ntfy_url() + "/")
+    if not m:
+        return False
+    h = m.group(1).lower().rstrip(".")
+    try:
+        ipaddress.ip_address(h)
+        return from_private_net(h)
+    except ValueError:
+        # Zahlen-Namen («2915221794», «0x…») sind verkappte IP-Adressen, nie «lokal»
+        if re.fullmatch(r"(0x)?[0-9a-f]+", h) and not re.fullmatch(r"[a-f]+", h):
+            return False
+        return local_host_header(h) and ("." not in h or h.endswith(LOCAL_SUFFIXES))
 
 
 # ab 1.18.0 (Paket D): ntfy ist der Notfall-Weg (die App meldet den Rest). Standard: nur Kritisches (Array/Platte, Hitze über der
 # kritischen Grenze). Info-Meldungen (günstige Platten, neue Geräte, «wieder normal») nur mit NZBLAB_NTFY_ALL=1.
 NTFY_ALL = os.environ.get("NZBLAB_NTFY_ALL", "").strip().lower() in ("1", "true", "yes", "on", "ja")
+# ab 1.19.0: Programm-/Container-Namen («Meiste Last») in ntfy nur zum eigenen Server im Heimnetz, oder mit NZBLAB_NTFY_ALL=1 / NZBLAB_NTFY_NAMES=1
+NTFY_NAMES = os.environ.get("NZBLAB_NTFY_NAMES", "").strip().lower() in ("1", "true", "yes", "on", "ja")
 
 
 class AlertGate:
@@ -1862,7 +1906,7 @@ def run_indexer(index, stop):
 
 # ---------------------------------------------------------------- HTTP
 
-TOKEN_STATE = {"error": "", "source": ""}      # source: env, file, new; error: warum kein Token geladen ist
+TOKEN_STATE = {"error": "", "source": "", "code": ""}      # source: env, file, new; error: warum kein Token geladen ist
 CONFIG_FIX_DE = ("Unraid › Docker › nzblab-agent › Bearbeiten › Pfad /config → /mnt/user/appdata/nzblab-agent "
                  "(Zugriffsmodus Lesen/Schreiben) › Übernehmen")
 CONFIG_FIX_EN = ("Unraid › Docker › nzblab-agent › Edit › path /config → /mnt/user/appdata/nzblab-agent "
@@ -1884,7 +1928,7 @@ def _token_weak(t):
     return "simple" if len(set(t)) < TOKEN_MIN_DISTINCT else None
 
 
-def _token_error(why_de, why_en, path, env=False):
+def _token_error(why_de, why_en, path, env=False, code="unusable"):
     """Token-Datei vorhanden, aber nicht nutzbar: nie überschreiben (sonst passt die App nicht mehr), laut melden."""
     if env:
         fix_de = ("Variable NZBLAB_AGENT_TOKEN leer lassen (dann erzeugt der Agent einen sicheren Token) oder mindestens "
@@ -1896,6 +1940,7 @@ def _token_error(why_de, why_en, path, env=False):
                   f"{TOKEN_MIN_LEN} zufällige Zeichen ohne Leerzeichen hineinschreiben, oder Variable NZBLAB_AGENT_TOKEN setzen.")
         fix_en = (f"delete {path} (a new token is created on the next start, enter it in the app) or write at least "
                   f"{TOKEN_MIN_LEN} random characters without spaces into it, or set the variable NZBLAB_AGENT_TOKEN.")
+    TOKEN_STATE["code"] = code      # ab 1.19.0: nach aussen nur dieser Code, der Text nur im Log und für 127.0.0.1
     TOKEN_STATE["error"] = f"{why_de} Der Agent erzeugt bewusst keinen neuen Token. Lösung: {fix_de}"
     line = "!" * 72
     print(f"{line}\nFEHLER: Token nicht nutzbar. {TOKEN_STATE['error']}\n"
@@ -1912,22 +1957,24 @@ def token(announce=True):
     (ab 1.13.0; vorher entstand bei leerer Datei still ein neuer Token und die App passte nicht mehr).
     Ein neu erzeugter Token steht genau einmal im Container-Log (Installation für andere: Unraid › Docker › Logs),
     danach nur noch in der Datei (Rechte 600). Wer das Log lesen kann, ist ohnehin Admin des NAS."""
-    TOKEN_STATE.update(error="", source="")
+    TOKEN_STATE.update(error="", source="", code="")
     t = os.environ.get("NZBLAB_AGENT_TOKEN", "").strip()
     if t:
         weak = _token_weak(t)
         if weak == "short":
             return _token_error(f"NZBLAB_AGENT_TOKEN ist zu kurz ({len(t)} Zeichen, nötig sind mindestens {TOKEN_MIN_LEN}).",
                                 f"NZBLAB_AGENT_TOKEN is too short ({len(t)} characters, at least {TOKEN_MIN_LEN} needed).",
-                                "NZBLAB_AGENT_TOKEN", env=True)
+                                "NZBLAB_AGENT_TOKEN", env=True, code="short")
         if weak == "simple":
             return _token_error(f"NZBLAB_AGENT_TOKEN ist zu einfach (weniger als {TOKEN_MIN_DISTINCT} verschiedene Zeichen).",
                                 f"NZBLAB_AGENT_TOKEN is too simple (fewer than {TOKEN_MIN_DISTINCT} different characters).",
-                                "NZBLAB_AGENT_TOKEN", env=True)
+                                "NZBLAB_AGENT_TOKEN", env=True, code="simple")
         if weak:
             return _token_error("NZBLAB_AGENT_TOKEN enthält Leer- oder Steuerzeichen.",
-                                "NZBLAB_AGENT_TOKEN contains whitespace or control characters.", "NZBLAB_AGENT_TOKEN", env=True)
+                                "NZBLAB_AGENT_TOKEN contains whitespace or control characters.", "NZBLAB_AGENT_TOKEN", env=True, code="chars")
         TOKEN_STATE["source"] = "env"
+        print("HINWEIS: Der Token kommt aus NZBLAB_AGENT_TOKEN (selbst gewählt). Ein zufälliger Token ist sicherer: Variable leer lassen, "
+              "dann erzeugt der Agent einen. NOTE: the token is set by you via NZBLAB_AGENT_TOKEN; a random one is safer (leave it empty).", flush=True)
         return t
     path = f"{CONFIG}/token.txt"
     try:
@@ -1935,7 +1982,7 @@ def token(announce=True):
     except FileNotFoundError:
         pass
     except OSError as e:
-        return _token_error(f"{path} lässt sich nicht prüfen ({e.strerror or e}).", f"{path} cannot be checked ({e.strerror or e}).", path)
+        return _token_error(f"{path} lässt sich nicht prüfen ({e.strerror or e}).", f"{path} cannot be checked ({e.strerror or e}).", path, code="unreadable")
     else:
         try:
             # O_NOFOLLOW (ab 1.16.1): ein Symlink als token.txt wird nie gelesen
@@ -1944,21 +1991,21 @@ def token(announce=True):
                 raw = f.read(4097)
             t = raw.decode("utf-8").strip()
         except UnicodeDecodeError:
-            return _token_error(f"{path} ist beschädigt (kein Text).", f"{path} is corrupt (not text).", path)
+            return _token_error(f"{path} ist beschädigt (kein Text).", f"{path} is corrupt (not text).", path, code="corrupt")
         except OSError as e:
             return _token_error(f"{path} ist nicht lesbar ({e.strerror or e}; Rechte prüfen, PUID/PGID).",
-                                f"{path} is not readable ({e.strerror or e}; check permissions, PUID/PGID).", path)
+                                f"{path} is not readable ({e.strerror or e}; check permissions, PUID/PGID).", path, code="unreadable")
         if not t:
-            return _token_error(f"{path} ist leer.", f"{path} is empty.", path)
+            return _token_error(f"{path} ist leer.", f"{path} is empty.", path, code="empty")
         if len(raw) > 4096 or any(c.isspace() or not c.isprintable() for c in t):
             return _token_error(f"{path} ist beschädigt (mehrere Zeilen, Steuerzeichen oder zu lang).",
-                                f"{path} is corrupt (several lines, control characters or too long).", path)
+                                f"{path} is corrupt (several lines, control characters or too long).", path, code="corrupt")
         if len(t) < TOKEN_MIN_LEN:
             return _token_error(f"{path} enthält einen zu kurzen Token ({len(t)} Zeichen, nötig sind mindestens {TOKEN_MIN_LEN}).",
-                                f"{path} holds a token that is too short ({len(t)} characters, at least {TOKEN_MIN_LEN} needed).", path)
+                                f"{path} holds a token that is too short ({len(t)} characters, at least {TOKEN_MIN_LEN} needed).", path, code="short")
         if _token_weak(t) == "simple":
             return _token_error(f"{path} enthält einen zu einfachen Token (weniger als {TOKEN_MIN_DISTINCT} verschiedene Zeichen).",
-                                f"{path} holds a token that is too simple (fewer than {TOKEN_MIN_DISTINCT} different characters).", path)
+                                f"{path} holds a token that is too simple (fewer than {TOKEN_MIN_DISTINCT} different characters).", path, code="simple")
         TOKEN_STATE["source"] = "file"
         return t
     t = secrets.token_urlsafe(24)
@@ -1974,7 +2021,7 @@ def token(announce=True):
         return token(announce)
     except OSError as e:
         return _token_error(f"{path} lässt sich nicht anlegen ({e.strerror or e}; ist /config schreibbar eingebunden?).",
-                            f"{path} cannot be created ({e.strerror or e}; is /config mounted read/write?).", path)
+                            f"{path} cannot be created ({e.strerror or e}; is /config mounted read/write?).", path, code="unwritable")
     TOKEN_STATE["source"] = "new"
     if announce:
         line = "=" * 64
@@ -3854,14 +3901,39 @@ def from_private_net(ip):
     return a in ipaddress.ip_network("192.168.0.0/16") or a in ipaddress.ip_network("10.0.0.0/8")
 
 
-LOCAL_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".localdomain")
+LOCAL_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".localdomain", ".ts.net")   # .ts.net: Tailscale MagicDNS
+# ab 1.19.0: weitere erlaubte Host-Namen (VPN, eigene Domain), kommagetrennt: «nas.example.org» exakt oder «.example.org» als Endung
+def _extra_hosts(raw):
+    """NZBLAB_HOSTS lesen. Abgewiesen (mit Warnung): Platzhalter «*» und Endungen mit nur einem Teil wie «.com» (öffnet sonst alle)."""
+    out = []
+    for x in (raw or "").split(","):
+        x = x.strip().lower().rstrip(".")
+        if not x:
+            continue
+        if "*" in x or (x.startswith(".") and x.count(".") < 2):
+            print(f"WARNUNG: NZBLAB_HOSTS-Eintrag «{x}» ignoriert (zu breit). WARNING: NZBLAB_HOSTS entry ignored (too broad).", flush=True)
+            continue
+        out.append(x)
+    return tuple(out)
+
+
+EXTRA_HOSTS = _extra_hosts(os.environ.get("NZBLAB_HOSTS", ""))
+
+
+def ipaddress_is_loopback(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return a.is_loopback or bool(getattr(a, "ipv4_mapped", None) and a.ipv4_mapped.is_loopback)
 
 
 def local_host_header(host):
     """
     Schutz gegen DNS-Rebinding für die beiden Endpunkte ohne Token: Eine fremde Website, deren Name kurz auf die Adresse des
     NAS zeigt, schickt ihren eigenen Namen im Host-Header («evil.example:8099»). Erlaubt sind nur IP-Adressen, «localhost»,
-    Namen ohne Punkt («tower», «nas») und Namen im Heimnetz (.local, .lan, .home.arpa, .internal, .localdomain).
+    Namen ohne Punkt («tower», «nas»), Namen im Heimnetz (.local, .lan, .home.arpa, .internal, .localdomain), Tailscale (.ts.net)
+    und was in NZBLAB_HOSTS steht.
     """
     h = (host or "").strip().lower()
     if not h:
@@ -3878,7 +3950,9 @@ def local_host_header(host):
         pass
     if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9]([a-z0-9-]{0,62}))*", h):
         return False
-    return h == "localhost" or "." not in h or h.endswith(LOCAL_SUFFIXES)
+    if h == "localhost" or "." not in h or h.endswith(LOCAL_SUFFIXES):
+        return True
+    return any(h == x or (x.startswith(".") and h.endswith(x)) for x in EXTRA_HOSTS)
 
 
 def run_prices(stop, notify):
@@ -5091,6 +5165,20 @@ def agent_features(smart=None, backups=None, log_dir=None):
     return feats
 
 
+def rate_key(ip):
+    """Schlüssel für die Bremsen: IPv4 und IPv4-in-IPv6 je Adresse, IPv6 je /64 (ein Absender hat dort Milliarden Adressen)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    m = getattr(a, "ipv4_mapped", None)
+    if m is not None:
+        return str(m)
+    if a.version == 6:
+        return str(ipaddress.ip_network((a, 64), strict=False))
+    return str(a)
+
+
 class AuthLimiter:
     """Bremse gegen Token-Raten: höchstens AUTH_FAILS falsche Tokens pro Minute und Absender-IP, danach 5 Minuten 429."""
 
@@ -5101,6 +5189,7 @@ class AuthLimiter:
 
     def blocked_for(self, ip, now=None):
         now = now if now is not None else time.monotonic()
+        ip = rate_key(ip)
         with self.lock:
             until = self.blocked.get(ip)
             if until is None:
@@ -5112,6 +5201,7 @@ class AuthLimiter:
 
     def fail(self, ip, now=None):
         now = now if now is not None else time.monotonic()
+        ip = rate_key(ip)
         with self.lock:
             # Viele Absender: alte Einträge weg, Speicher bleibt klein. Ab 1.16.1 höchstens einmal pro Sekunde aufräumen
             # (vorher bei über 10000 Einträgen bei jedem Fehlversuch, unter derselben Sperre wie jede Token-Prüfung)
@@ -5627,6 +5717,7 @@ class HelloLimiter:
     def allow(self, ip, now=None):
         """0 = erlaubt, sonst Sekunden bis zur nächsten freien Anfrage."""
         now = now if now is not None else time.monotonic()
+        ip = rate_key(ip)           # ab 1.19.0: IPv6 je /64
         with self.lock:
             # Viele Absender: abgelaufene weg, Speicher bleibt klein. Höchstens einmal pro Sekunde aufräumen (Review 1.16.1:
             # sonst bei über 5000 frischen Einträgen bei jeder Anfrage, wie vorher bei der Token-Bremse)
@@ -5686,6 +5777,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             if not tok:
                 return False                    # ohne geladenen Token nie «Bearer » mit leerem Token annehmen
             ip = self.client_address[0]
+            self._limited = 0
             got = self.headers.get("Authorization", "").encode("utf-8", "replace")
             if secrets.compare_digest(got, f"Bearer {tok}".encode()):
                 return True                     # ab 1.18.0 (Audit N5): der richtige Token wird nie gebremst (Proxy-/Gateway-Adresse)
@@ -5705,7 +5797,10 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                   {"Retry-After": str(self._limited)})
             if not tok:
                 why = TOKEN_STATE["error"] or "Kein Token geladen (token.txt fehlt oder ist nicht lesbar)."
-                return self.reply(503, {"error": why, "token_error": why})
+                code = TOKEN_STATE.get("code") or "unusable"
+                # ab 1.19.0: nur der Code (keine Länge, kein Pfad, kein Fehlertext), auch für 127.0.0.1: hinter einem Reverse-Proxy
+                # im Host-Modus kommt Internet-Verkehr als 127.0.0.1 an. Den vollen Text gibt es nur im Log des Containers.
+                return self.reply(503, {"error": "Token nicht nutzbar, Details im Log des Containers", "token_error": code})
             return self.reply(401, {"error": "Token fehlt oder ist falsch"})
 
         def local_request(self):
@@ -5758,10 +5853,18 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 return self.wfile.write(body)
             if u.path == "/api/ping":
                 # Ohne Token: nur ob /config bleibt (ab 1.13.0), nichts Geheimes. Unbekannt (kein Linux) zählt als bleibend.
-                return self.reply(200, {"ok": True, "version": VERSION, "api_level": API_LEVEL,
-                                        "config_persistent": CONFIG_STATE.get("persistent") is not False, "sampling_ok": sampling_ok()})
+                # ab 1.19.0: Host-Header wie bei hello (DNS-Rebinding); die Version nur mit gültigem Token
+                if not local_host_header(self.headers.get("Host", "")):
+                    return self.reply(403, {"error": "nur mit IP-Adresse oder lokalem Namen"})
+                out = {"ok": True, "api_level": API_LEVEL,
+                       "config_persistent": CONFIG_STATE.get("persistent") is not False, "sampling_ok": sampling_ok()}
+                if self.authorized(tok):
+                    out["version"] = VERSION
+                return self.reply(200, out)
             if u.path == "/api/health":
                 # Ohne Token, für die Docker-Gesundheitsprüfung (ab 1.15.0): 503, wenn die Messschleife hängt
+                if not local_host_header(self.headers.get("Host", "")):
+                    return self.reply(403, {"error": "nur mit IP-Adresse oder lokalem Namen"})
                 ok = sampling_ok()
                 return self.reply(200 if ok else 503, {"ok": ok, "sample_age_s": sampling_age(), "interval": INTERVAL})
             if u.path == "/api/hello":
@@ -5779,7 +5882,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 nonce = q.get("nonce", "")
                 if not HELLO_NONCE.fullmatch(nonce):
                     return self.reply(400, {"error": "nonce: 32 Zeichen 0-9a-f"})
-                return self.reply(200, {"id": agent_id(), "proof": hello_proof(tok, nonce), "version": VERSION})
+                return self.reply(200, {"id": agent_id(), "proof": hello_proof(tok, nonce)})   # ab 1.19.0 ohne Version (ohne Token)
             if u.path == "/api/prices/watch":
                 # Ohne Token, aber nur aus dem Heimnetz: enthält nur Plattenserien und Grössen, keine Werte vom NAS
                 if not self.authorized(tok) and not self.local_request():
@@ -5994,7 +6097,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 if not isinstance(raw_url, str):
                     return self.reply(400, {"error": "ntfy_url muss Text sein"})
                 url = raw_url.strip()
-                if url and not re.match(r"^https://[A-Za-z0-9.-]+/[A-Za-z0-9_-]{8,64}$", url):
+                if url and not NTFY_URL_RE.match(url):
                     return self.reply(400, {"error": "ntfy-Adresse ungültig (https://server/thema, Thema 8–64 Zeichen)"})
                 save_settings({"ntfy_url": url})
                 return self.reply(200, {"ok": True, "push": bool(ntfy_url())})
