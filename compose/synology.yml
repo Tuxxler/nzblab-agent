@@ -24,6 +24,8 @@ services:
       PGID: "0"
       FILES_EXCLUDE: "@*,#*,docker"
       CACHE_ROOTS: ""
+      # NZBLAB_LAN: "1"     # ab 1.18.0 Standard AUS: Heimnetz-Suche (alle 30 Min ein leeres UDP-Paket an jede Adresse des /24-Netzes, Reverse-DNS, Push bei neuen Geräten)
+      # NZBLAB_NTFY_ALL: "1"  # ab 1.18.0: ntfy (NTFY_URL) auch für Info-Meldungen. Standard 0 = nur Kritisches (Platte/Array/Hitze)
       # DISCOVER_KEYS: "0"   # ab 1.16.0: API-Keys der Dienste nicht aus appdata lesen (Standard an, nur lesend, nur mit Token)
       # DISCOVER_ROOTS: ""  # leer = /host/mnt/user/docker (= /volume1/docker)
     volumes:

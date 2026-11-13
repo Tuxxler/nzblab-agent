@@ -1116,6 +1116,9 @@ function devIcon(h) {
 function renderLan() {
   const L = S.lan;
   if (!S.info?.lan || !L) {
+    if (L?.reason === "off" || S.info?.lan_enabled === false) {
+      $("lan").innerHTML = empty("wifi", "LAN-Scan aus", "Die Heimnetz-Suche ist ausgeschaltet (Variable NZBLAB_LAN=1 schaltet sie ein)"); return;
+    }
     const why = L?.reason === "no_access" ? "Docker sperrt die Geräte-Tabelle (siehe App › Agent)" : "Braucht /host/proc (siehe App › Agent)";
     $("lan").innerHTML = empty("wifi", "Geräteliste nicht verfügbar", why); return;
   }

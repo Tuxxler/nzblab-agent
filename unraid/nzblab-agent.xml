@@ -1,33 +1,45 @@
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>nzblab-agent</Name>
+  <Name>NASlab-Agent</Name>
   <Repository>ghcr.io/tuxxler/nzblab-agent:latest</Repository>
-  <Registry>https://github.com/users/Tuxxler/packages/container/package/nzblab-agent</Registry>
+  <Registry>https://github.com/Tuxxler/nzblab-agent/pkgs/container/nzblab-agent</Registry>
+  <Beta>true</Beta>
+  <MinVer>6.12.0</MinVer>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support>https://forums.unraid.net/topic/REPLACE-ME-support-nzblab-agent/</Support>
+  <Support>&lt;&lt;FORUM-LINK&gt;&gt;</Support>
   <Project>https://github.com/Tuxxler/nzblab-agent</Project>
-  <Overview>Read-only NAS monitor for the NASlab Android app (NASlab Agent, formerly NZBLab-Agent). Measures around the clock every 30 seconds: all temperature sensors, CPU load (total and per core), GPU (render and media engine used by Plex transcoding), RAM, network, disk spin-ups after idle (and which programs woke them), top processes, cache usage per share and a file index for searching all shares. Keeps 8 days at full resolution and 2 years of hourly values in /config. It never changes anything on your server: every host path is mounted read-only, only /config is writable, and the container drops root privileges (PUID/PGID).&#xD;
+  <ReadMe>https://github.com/Tuxxler/nzblab-agent#readme</ReadMe>
+  <License>AGPL-3.0-only</License>
+  <Overview>Read-only monitoring agent for the NASlab Android app. It measures your server every 30 seconds (temperature sensors, CPU load, GPU usage, RAM, network, disk spin-ups and which programs caused them, top processes, cache usage per share) and keeps a file index for searching all shares. History: 8 days at full resolution, 2 years of hourly values, stored in /config.&#xD;
 &#xD;
-Since 1.15.0 it also records restarts, the temperature of every disk, router/internet latency and RAID/pool state. Optional and off by default: SMART values (NZBLAB_SMART), backup discovery for extra paths (NZBLAB_BACKUP_PATHS) and redacted log excerpts (NZBLAB_LOGS). The agent never updates itself: use "Update" on the Docker page.&#xD;
+Beta: tested on Unraid 7 (amd64); arm64 untested.&#xD;
 &#xD;
-Since 1.16.0 the app can connect your services in one step: the agent finds Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli and Overseerr/Jellyseerr in appdata (read-only) and passes their API keys to the app over the token-protected API. Plex tokens are never read. Turn it off with DISCOVER_KEYS=0.&#xD;
+It never changes anything on your server: every host path is mounted read-only, only /config is writable, root is dropped after start (PUID/PGID), and the container runs read-only with almost all capabilities removed. Optional and off by default: SMART values (NZBLAB_SMART), backup discovery for extra paths (NZBLAB_BACKUP_PATHS), redacted log excerpts (NZBLAB_LOGS), home-network device list (NZBLAB_LAN: every 30 minutes one empty UDP packet to each address of your /24 network to fill the ARP table, reverse DNS for new devices, push for new devices if ntfy is set). Service discovery (Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Overseerr/Jellyseerr) reads API keys from appdata read-only and hands them to the app over the token-protected API; Plex tokens are never read; turn it off with DISCOVER_KEYS=0. The agent never updates itself.&#xD;
 &#xD;
-After the first start, open the container log: it shows "NZBLab-Agent Token: ..." once. Paste this token into the app (Settings &gt; Server connections &gt; NASlab-Agent). The token is also stored in appdata/nzblab-agent/token.txt. A read-only dashboard is available in the browser on port 8099. Do not expose this port to the internet; use a VPN (WireGuard, Tailscale) when away from home.&#xD;
+After the first start, open the container log: the line "NZBLab-Agent Token: ..." appears once. Paste the token into the app (Settings, Server connections, NASlab-Agent). The token is also stored in appdata/nzblab-agent/token.txt. A read-only browser dashboard runs on port 8099. Do not expose this port to the internet; use a VPN (WireGuard, Tailscale) when away from home.&#xD;
 &#xD;
-Deutsch: Misst Temperaturen, CPU, Grafikchip, RAM und Plattenzugriffe rund um die Uhr für die NASlab-App (NASlab-Agent, früher NZBLab-Agent). Nur lesen, ändert nichts am NAS. Den Token zeigt das Container-Log beim ersten Start («NZBLab-Agent Token: …»), danach steht er in appdata/nzblab-agent/token.txt.</Overview>
+License: the agent is free and open source (GNU AGPL-3.0-only), source code on GitHub. The NASlab app is a separate, closed-source Android app (Google Play).&#xD;
+&#xD;
+Deutsch: Misst Temperaturen, CPU, Grafikchip, RAM und Plattenzugriffe rund um die Uhr für die NASlab-App. Nur lesen, ändert nichts am NAS. Den Token zeigt das Container-Log beim ersten Start einmal, danach steht er in appdata/nzblab-agent/token.txt.</Overview>
   <Category>Tools:System</Category>
+  <ExtraSearchTerms>nzblab naslab monitoring temperature smart disk spin-up android app</ExtraSearchTerms>
   <WebUI>http://[IP]:[PORT:8099]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/nzblab-agent.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/icons/nzblab-agent.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/Tuxxler/unraid-templates/main/templates/nzblab-agent.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Tuxxler/unraid-templates/main/icons/nzblab-agent.png</Icon>
   <ExtraParams>--memory=512m --cpus=1 --read-only --tmpfs /tmp --security-opt no-new-privileges:true --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=SETUID --cap-add=SETGID</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DonateText/>
   <DonateLink/>
-  <Requires>The NASlab Android app. Unraid 6.12 or newer.</Requires>
+  <Changes>1.18.0: push (ntfy) now only for critical things by default (disk failed, array stopped, CPU too hot); NZBLAB_NTFY_ALL=1 adds info messages; same alert at most once per 24 hours unless worse; log redaction also covers user names in PAM/sshd lines. Security hardening: the home-network device scan is now off by default (NZBLAB_LAN=1 turns it on); the 'Today' timeline shows no system log lines unless log excerpts are on, and then with IPs, MACs, e-mails, user names and paths removed; /config ownership is only changed in the agent's own or an empty folder (otherwise a warning); a correct token is never blocked by the failed-token brake.
+1.17.0: sensor limits from hwmon, Synology disk names (sata1...), mover state from the system log (only with log excerpts on).
+1.16.1: token hardening (min. 32 characters), crashes endpoint needs the token, parser limits.
+1.16.0: service discovery (Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Overseerr) for one-step setup in the app.
+1.15.0: reboot history, per-disk temperatures, RAID/pool status, network latency, backup discovery, optional SMART and log excerpts.</Changes>
+  <Requires>The NASlab Android app (Google Play). Unraid 6.12 or newer.</Requires>
   <Config Name="Web/API port" Target="8099" Default="8099" Mode="tcp" Description="Port for the app and the browser dashboard" Type="Port" Display="always" Required="true" Mask="false">8099</Config>
   <Config Name="Data (/config)" Target="/config" Default="/mnt/user/appdata/nzblab-agent" Mode="rw" Description="Required, read/write. The agent stores its token and history here; without it you get a new token after every update. History (SQLite), file index, settings and token.txt. The only writable path." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/nzblab-agent</Config>
   <Config Name="Shares (file index)" Target="/host/mnt/user" Default="/mnt/user" Mode="ro" Description="Read-only. Search across all shares, storage analysis, duplicates, media inventory, appdata sizes. appdata, system, domains and isos are skipped by the index." Type="Path" Display="always" Required="false" Mask="false">/mnt/user</Config>
@@ -35,16 +47,18 @@ Deutsch: Misst Temperaturen, CPU, Grafikchip, RAM und Plattenzugriffe rund um di
   <Config Name="Host /sys" Target="/host/sys" Default="/sys" Mode="ro" Description="Read-only. Temperature sensors and GPU." Type="Path" Display="advanced" Required="true" Mask="false">/sys</Config>
   <Config Name="Host /proc" Target="/host/proc" Default="/proc" Mode="ro" Description="Read-only. CPU load, top programs, disk activity." Type="Path" Display="advanced" Required="true" Mask="false">/proc</Config>
   <Config Name="Unraid notifications" Target="/host/notifications" Default="/tmp/notifications" Mode="ro" Description="Read-only. Unraid notifications for the 'Today' timeline." Type="Path" Display="advanced" Required="false" Mask="false">/tmp/notifications</Config>
-  <Config Name="System log" Target="/host/log" Default="/var/log" Mode="ro" Description="Read-only. Errors from syslog for the 'Today' timeline." Type="Path" Display="advanced" Required="false" Mask="false">/var/log</Config>
-  <Config Name="Docker container names" Target="/host/docker/containers" Default="/var/lib/docker/containers" Mode="ro" Description="Read-only. Container names in the 'top load' list. Needs PUID=0 (the files are readable by root only)." Type="Path" Display="advanced" Required="false" Mask="false">/var/lib/docker/containers</Config>
+  <Config Name="System log" Target="/host/log" Default="" Mode="ro" Description="Optional, empty by default. To enable, set /var/log (read-only): errors from the syslog for the 'Today' timeline." Type="Path" Display="advanced" Required="false" Mask="false"></Config>
+  <Config Name="Docker container names" Target="/host/docker/containers" Default="" Mode="ro" Description="Optional, empty by default. To enable, set /var/lib/docker/containers (read-only): container names in the 'top load' list. Needs PUID=0 (the files are readable by root only). The files contain container environment variables; the agent only keeps the names." Type="Path" Display="advanced" Required="false" Mask="false"></Config>
   <Config Name="Time zone" Target="TZ" Default="Europe/Zurich" Mode="" Description="e.g. Europe/Berlin, America/New_York" Type="Variable" Display="always" Required="false" Mask="false">Europe/Zurich</Config>
   <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User the agent runs as after start (99 = nobody). 0 = root: needed only for container names and appdata folders of other containers with strict permissions." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group (100 = users)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
   <Config Name="Token (optional)" Target="NZBLAB_AGENT_TOKEN" Default="" Mode="" Description="Best leave empty: the agent creates a random token on first start (container log and appdata/nzblab-agent/token.txt). If you set your own: at least 32 random characters, no spaces (shorter values are refused)." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
-  <Config Name="Heat alert (°C)" Target="HEAT_ALERT_C" Default="95" Mode="" Description="Push via ntfy when the CPU stays above this for 5 minutes" Type="Variable" Display="advanced" Required="false" Mask="false">95</Config>
+  <Config Name="Heat alert (C)" Target="HEAT_ALERT_C" Default="95" Mode="" Description="Push via ntfy when the CPU stays above this temperature (Celsius) for 5 minutes" Type="Variable" Display="advanced" Required="false" Mask="false">95</Config>
   <Config Name="ntfy URL (optional)" Target="NTFY_URL" Default="" Mode="" Description="e.g. https://ntfy.sh/a-long-secret-topic for push alerts while away" Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="ntfy: all messages (optional)" Target="NZBLAB_NTFY_ALL" Default="0" Mode="" Description="0 = push (ntfy) only for critical things: disk failed or new disk errors, array stopped, CPU above the critical limit. 1 = also info messages (cheap disk prices, new devices on the home network, 'back to normal'). The app shows the rest. The same thing is sent at most once per 24 hours unless it gets worse." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
   <Config Name="SMART (optional)" Target="NZBLAB_SMART" Default="0" Mode="" Description="1 = read SMART values of the disks (model, serial, power-on hours, reallocated/pending sectors, CRC/media errors, wear, temperature). Read-only: smartctl --scan and smartctl -a -n standby only, never self-tests, never writes, sleeping disks stay asleep. Needs the disks as devices and SYS_RAWIO, e.g. Extra Parameters: --cap-add=SYS_RAWIO --device=/dev/sdb (NVMe also --cap-add=SYS_ADMIN). Leave PUID as is: a small root helper only runs smartctl. 0 = off." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
   <Config Name="Log excerpts (optional)" Target="NZBLAB_LOGS" Default="0" Mode="" Description="1 = the app may show recent error and warning lines from the System log path (/var/log, read-only). IP/MAC/e-mail addresses, tokens, passwords, user names and share paths are removed before anything leaves the agent; it never sends logs anywhere by itself. 0 = off." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
+  <Config Name="Home-network scan (optional)" Target="NZBLAB_LAN" Default="0" Mode="" Description="1 = device list of your home network in the app. Every 30 minutes the agent sends one empty UDP packet (port 9) to each address of your /24 network so the server fills its ARP table, then reads that table, looks up names of new devices (reverse DNS via your DNS server) and, if you set a push address, reports new devices (name, IP, MAC). Needs /proc (read-only) or host network. Your router or IDS may report this as a port scan. 0 = off, nothing is sent." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
   <Config Name="Network latency" Target="NZBLAB_NET" Default="1" Mode="" Description="1 = every minute, measure the TCP connect time to the router and to 1.1.1.1:443 (no data is sent, no extra rights). Shows in the app whether the router or the internet is slow. 0 = off." Type="Variable" Display="advanced" Required="false" Mask="false">1</Config>
   <Config Name="Find services and API keys" Target="DISCOVER_KEYS" Default="1" Mode="" Description="1 = the app can connect Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli and Overseerr/Jellyseerr in one step: the agent reads their API key, port and URL base from the settings files in appdata (Shares path, read-only; no docker.sock). Only with the agent token, at most 10 requests per minute, never logged. Plex tokens are never read; Jellyfin/Emby keys must be created in their web UI. 0 = only list which services exist, without keys." Type="Variable" Display="advanced" Required="false" Mask="false">1</Config>
   <Config Name="Backup paths (optional)" Target="NZBLAB_BACKUP_PATHS" Default="" Mode="" Description="Comma-separated container paths of backup repositories (restic, borg, kopia) or backup log files (rsync, scripts), e.g. /host/backup. Add each one as an extra read-only path first. Only file names and times are read, never the backup contents. Empty = only search the shares for backup folders." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>

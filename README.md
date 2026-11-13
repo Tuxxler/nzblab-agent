@@ -73,7 +73,8 @@ Weitere Variablen für andere Systeme: `FILES_EXCLUDE` (oberste Ordner, auch Mus
 Standard `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (leer = kein Cache).
 
 Optional: Push-Meldung bei Hitze auch unterwegs: Variable `NTFY_URL` = `https://ntfy.sh/<langes-geheimes-wort>` und in der
-App «ntfy» dasselbe Thema abonnieren. Schwelle: `HEAT_ALERT_C` (Standard 95 °C, nach 5 Minuten).
+App «ntfy» dasselbe Thema abonnieren. Schwelle: `HEAT_ALERT_C` (Standard 95 °C, nach 5 Minuten). Ab 1.18.0 schickt ntfy
+standardmässig nur noch Kritisches (siehe Abschnitt 1.18.0, `NZBLAB_NTFY_ALL`).
 
 ## Linux (Debian, Ubuntu …) (ab 1.14.0)
 
@@ -166,7 +167,8 @@ Freiwillig (eigener Compose-Block in `docker-compose.yml`):
 | Block | Schalter | Liest | Braucht |
 |---|---|---|---|
 | S SMART | `NZBLAB_SMART=1` (`NZBLAB_SMART_MINUTES`, Standard 60) | `smartctl --scan` und `smartctl --json -a -n standby` pro Platte: Modell, Seriennummer, Betriebsstunden, neu zugewiesene, instabile und nicht korrigierbare Sektoren, CRC- und Medienfehler, Verschleiss, Temperatur. Nie Selbsttests, nie Schreiben, schlafende Platten bleiben schlafen | `devices:` jede Platte, `cap_add: SYS_RAWIO` (NVMe zusätzlich `SYS_ADMIN`), Start als root mit PUID (nicht `user:`) |
-| L Logs | `NZBLAB_LOGS=1` | Fehler-/Warnzeilen der letzten Stunden aus `syslog`, `messages`, `kern.log`, `daemon.log` (Textdateien; journald-Binärdateien nicht) | `/var/log:/host/log:ro` |
+| L Logs | `NZBLAB_LOGS=1` | (auch «Heute» braucht den Schalter, ab 1.18.0, geschwärzt) Fehler-/Warnzeilen der letzten Stunden aus `syslog`, `messages`, `kern.log`, `daemon.log` (Textdateien; journald-Binärdateien nicht) | `/var/log:/host/log:ro` |
+| N Heimnetz | `NZBLAB_LAN=1` (Standard aus, ab 1.18.0) | Geräteliste des Heimnetzes: alle 30 Min ein leeres UDP-Paket an jede Adresse des /24-Netzes, ARP-Tabelle, Reverse-DNS, Push bei neuen Geräten. Router/IDS können das als Port-Scan melden | `/proc:/host/proc:ro` (oder Host-Netz) |
 | B2 Backups | `NZBLAB_BACKUP_PATHS` | Repository-Ordner (nur Dateinamen und -zeiten) und Log-Dateien | die Pfade `:ro` |
 
 **SMART und Rechte:** smartctl braucht root und `CAP_SYS_RAWIO`. Damit der Agent selbst trotzdem ohne Rechte läuft, startet
@@ -269,6 +271,46 @@ Containerliste des NAS (Portzuordnung) lösen. `partial: true` = eine Grenze wur
 
 **Teststand:** nur mit erfundenen Testdaten geprüft (`test_fixtures/discover/`, Unit-Tests), **noch nicht gegen echte appdata**
 und nicht auf echtem Unraid.
+
+## Ab 1.18.0: Korrekturen aus dem Sicherheits-Audit vom 12.11.2026
+
+Gleiche Schnittstelle (`api_level` 16), neue Felder nur ergänzend (alte Apps lesen sie nicht). Geändert:
+
+- **Heimnetz-Suche ist standardmässig aus (`NZBLAB_LAN=1` schaltet sie ein).** Eingeschaltet schickt der Agent alle 30 Minuten
+  ein leeres UDP-Paket (Port 9) an jede Adresse jedes /24-Netzes aus der ARP-Tabelle des NAS, damit die Geräteliste sich füllt,
+  fragt per Reverse-DNS nach Namen neuer Geräte und meldet neue Geräte (Name, IP, MAC) per Push, wenn eine ntfy-Adresse gesetzt
+  ist. Router oder Einbruchserkennung können das als Port-Scan melden. Aus: kein Paket, keine Geräteliste. `/api/info` meldet
+  `lan_enabled`, `/api/devices` meldet `enabled` und `reason: "off"`; `POST /api/devices/scan` antwortet `202` mit `started: false`.
+  Die App zeigt dann «LAN-Scan aus» statt eines Fehlers.
+- **«Heute» (`/api/today`) liefert Syslog-Zeilen nur noch mit `NZBLAB_LOGS=1`**, dann mit derselben Schwärzung wie `/api/logs`
+  (IP, MAC, Benutzer, E-Mail, Pfade, Geheimnisse). Ohne den Schalter: keine Syslog-Inhalte, `sources.syslog` ist `false`.
+- **Besitzer von `/config`:** Der Agent ändert den Besitzer rekursiv nur, wenn `/config` leer ist oder auf der obersten
+  Ebene nur eigene Einträge liegen (die Markierungsdatei `.nzblab-agent-config` allein genügt nicht) (`token.txt`, `settings.json`, `history.db`, `files.db`,
+  `devices.db`, `crashes/`, `prices-*.json`). Liegen fremde Dateien darin (z. B. ganzes `appdata` eingebunden), ändert er nichts an
+  ihnen, besitzt nur seine eigenen Einträge um und warnt laut im Log. Eigenen Unterordner nehmen: `/mnt/user/appdata/nzblab-agent`.
+- **Warnung statt stilles root:** Kann der Agent `/config` nicht an `PUID` geben (NFS mit root_squash, ACLs, fremde Dateien), läuft er
+  weiter als root und meldet das in `/api/info` unter `warnings` (`running_as_root`) und im Log.
+- **Token-Bremse:** Ein richtiger Token wird nie gebremst, auch wenn von derselben Adresse (Proxy, Docker-Gateway) falsche kamen.
+  Falsche Tokens bleiben nach 10 Fehlversuchen pro Minute 5 Minuten gesperrt.
+- **Vorlagen:** `/var/log` und `/var/lib/docker/containers` sind nicht mehr vorausgefüllt (Syslog nur mit `NZBLAB_LOGS=1`; die
+  Container-Ordner enthalten die Umgebungsvariablen aller Container, der Agent behält nur die Namen). Neue Variable `NZBLAB_LAN`.
+
+- **ntfy nur noch für Kritisches (Standard).** Der Agent schickt per ntfy nur noch: Platte ausgefallen oder neue Lese-/Schreibfehler,
+  Array gestoppt, CPU über der kritischen Grenze (`HEAT_ALERT_C`, Standard 95 °C, nach 5 Minuten). Ntfy ist der Notfall-Weg, wenn
+  das Handy schläft; die App meldet den Rest. **Info-Meldungen** (günstige Platten, neue Geräte im Heimnetz, «wieder normal») kommen
+  per ntfy nur noch mit **`NZBLAB_NTFY_ALL=1`** (Standard `0`). In «Heute» in der App erscheinen sie unverändert. Dieselbe Sache
+  höchstens 1× in 24 Stunden, ausser sie wird schlimmer (mehr Fehler, heisser); eine Entwarnung hebt die Sperre auf (Entwarnung selbst:
+  nur mit `NZBLAB_NTFY_ALL=1`, ohne Ton). Die Sperre liegt im Speicher und gilt bis zum Neustart. `/api/info` meldet `ntfy_all`.
+- **Log-Schwärzung:** Benutzernamen in PAM-/sshd-Zeilen («authentication failure for bob from …», «Accepted … for bob from …»,
+  «user bob», `logname=`, `ruser=`, `rhost=`) werden geschwärzt; «login failed for user=bob» lässt «failed» stehen.
+
+**Genau wie dokumentiert, was den Server verlässt:** TCP-Verbindung zum Router (Port 53) und zu `1.1.1.1:443` einmal pro Minute
+(Netz-Messung, `NZBLAB_NET=0` schaltet aus); Speedtest zu `speed.cloudflare.com` (25 MB Download, 10 MB Upload) nur auf Knopfdruck;
+Preisabruf einmal pro Tag, sobald ein Land gesetzt ist (`PRICE_COUNTRY` oder durch Öffnen der Preis-Seite in der App, die das Land
+des Handys einmal übergibt), die Suchbegriffe enthalten die eigenen Plattenmodelle; Push an die selbst gesetzte ntfy-Adresse.
+Ohne Token antworten nur die Seite `/`, `/api/ping`, `/api/health`, `/api/hello` (Signatur, kein Token) und `/api/prices/watch`
+(nur Heimnetz); alles andere braucht den Token. Der Zugriff läuft unverschlüsselt über HTTP: nur im vertrauten Heimnetz oder über
+VPN beziehungsweise einen Reverse-Proxy mit TLS benutzen.
 
 ## Ab 1.17.0: Grenzwerte, Synology-Plattennamen, Mover-Stand aus dem Protokoll
 
@@ -469,6 +511,15 @@ darum fragt der Agent Geizhals in der Praxis nicht ab.
 von robots.txt verboten oder hat sie ein unbekanntes Layout, steht bei der Grösse «Preise gerade nicht lesbar» und
 `browser_url`: Die App zeigt dann den Knopf «Im Browser suchen». Beträge stehen in der Währung des Landes (`currency`);
 das Feld heisst aus Kompatibilität weiter `chf`.
+
+**Quellen und Werbelinks (Plattenpreise P1):** Jede Quelle steht in `PRICE_SOURCES` (`toppreise`, `geizhals`, `diskprices`) mit
+Name, Seite, `terms` (`pending` = schriftliche Erlaubnis offen) und `amazon`. Abschalten: Einstellung `price_sources_off`
+(Liste von IDs) oder Variable `PRICE_SOURCES_OFF=toppreise,geizhals`; dann kein Abruf, `/api/prices` meldet `search_only: true`
+und pro Grösse nur `search_url`. `/api/prices` liefert zusätzlich `sources` (id, label, url, allowed, terms, amazon), pro Grösse
+`source`, `source_id`, `fetched_at`, `no_alert` und am Angebot `source` und `t`. Amazon-Preise (diskprices) lösen nie «günstig»
+aus und bekommen nie einen Werbelink. Werbelinks: `/config/affiliate.json`, z. B. `{"galaxus": {"id": "…", "program": "…"}}`;
+ohne Kennung gibt es kein `ad_link`. Der normale `link` bleibt immer unverändert, `ad_link` kommt nur dazu (https, öffentliche
+Ziele, Amazon nie). `ads_available` zeigt der App, ob sie den Schalter «Werbelinks zeigen» anbieten soll.
 
 Ergebnis pro Land in `/config/prices-<Land>.json` (Verlauf 400 Tage). Für die Schweiz hat eine **frische** externe `prices.json`
 (höchstens 36 Stunden alt, siehe «Externe Preisliste») Vorrang; ist sie älter oder fehlt sie,

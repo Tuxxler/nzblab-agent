@@ -129,7 +129,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.17.0")
+        self.assertEqual(info["version"], "1.18.0")
         srv.shutdown()
 
 
@@ -165,7 +165,7 @@ class HelloTest(unittest.TestCase):
             nonce = "0123456789abcdef0123456789abcdef"
             r = json.load(urllib.request.urlopen(base + "/api/hello?nonce=" + nonce))
             self.assertEqual(r["proof"], a.hello_proof("geheim", nonce))
-            self.assertEqual(r["version"], "1.17.0")
+            self.assertEqual(r["version"], "1.18.0")
             self.assertRegex(r["id"], r"^[0-9a-f]{32}$")
             self.assertNotIn("geheim", json.dumps(r))
             # Kennung bleibt fest (settings.json), auch nach einem Neustart des Agents
@@ -358,7 +358,8 @@ class TodayTest(unittest.TestCase):
         store = a.Store(":memory:")
         store.add_event("heat", "err", "NAS zu heiss", "CPU über 95 °C")
         t = a.Today(store, files_root=f"{d}/shares", notify_dir=f"{d}/notify", log_dir=f"{d}/log", docker_dir=f"{d}/docker")
-        r = t.collect(24)
+        with patch.object(a, "LOGS_ON", True):
+            r = t.collect(24)
         titles = [e["title"] for e in r["items"]]
         self.assertIn("Docker-Image fast voll", titles)
         self.assertNotIn("Alt", titles)                         # älter als 24 Std.
@@ -845,6 +846,87 @@ class PriceFetchTest(unittest.TestCase):
         self.assertEqual(s["hdd28"]["best"]["shop"], "Amazon.de")
         self.assertTrue(s["hdd28"]["search_url"].startswith("https://geizhals.de/"))     # Browser-Link bleibt Geizhals
         self.assertEqual(a.price_summary()["source"], "Amazon.de (diskprices.com)")
+
+    # ---- Plattenpreise P1: Quelle und Zeit, abgeschaltete Quellen, Werbelinks
+    def test_p1_quelle_und_zeit_pro_angebot(self):
+        calls, s = self.run_country("CH", {"28TB": (200, "toppreise_search.html")})
+        b = s["hdd28"]
+        self.assertEqual((b["source"], b["source_id"]), ("Toppreise.ch", "toppreise"))
+        self.assertAlmostEqual(b["fetched_at"], time.time(), delta=30)
+        self.assertFalse(b["search_only"]); self.assertFalse(b["no_alert"])
+        p = a.price_summary()
+        self.assertEqual([x["id"] for x in p["sources"]], ["toppreise"])
+        self.assertEqual(p["sources"][0]["url"], "https://www.toppreise.ch")
+        self.assertTrue(p["sources"][0]["allowed"]); self.assertFalse(p["search_only"])
+
+    def test_p1_quelle_aus_kein_abruf_nur_suchlink(self):
+        a.save_settings({"price_country": "CH", "price_sources_off": ["toppreise"]})
+        def boom(url, lang):
+            raise AssertionError("abgeschaltete Quelle darf nicht abgefragt werden: " + url)
+        self.assertIsNone(a.fetch_own_prices("CH", fetch=boom, pause=0))
+        p = a.price_summary()
+        self.assertTrue(p["search_only"]); self.assertFalse(p["sources"][0]["allowed"])
+        for x in p["sizes"]:
+            self.assertIsNone(x["best"]); self.assertTrue(x["search_only"]); self.assertFalse(x["unreadable"])
+            self.assertIn("toppreise.ch/produktsuche", x["search_url"]); self.assertFalse(x["cheap"])
+        # auch eine frische externe prices.json ändert daran nichts
+        write(f"{a.CONFIG}/prices.json", json.dumps({"updated": int(time.time()), "queries": {
+            "hdd28": {"label": "28 TB", "tb": 28, "history": [], "best": {"name": "X", "chf": 900.0}}}}))
+        a.PRICES_FILE = f"{a.CONFIG}/prices.json"
+        self.assertTrue(all(x["best"] is None for x in a.price_summary()["sizes"]))
+        # Wieder an: Zahlen kommen zurück
+        a.save_settings({"price_sources_off": []})
+        self.assertFalse(a.price_summary()["search_only"])
+
+    def test_p1_amazon_quelle_ohne_meldung_und_ohne_werbelink(self):
+        calls, s = self.run_country("US", {"diskprices.com": (200, "diskprices_us.html")})
+        b = s["hdd28"]
+        self.assertEqual(b["source"], "Amazon.com (diskprices.com)")
+        self.assertTrue(b["no_alert"])
+        a.save_settings({"price_alerts": {"hdd28": 1000}})              # weit über dem Preis: bei Toppreise wäre das «günstig»
+        self.assertFalse({x["key"]: x for x in a.price_summary()["sizes"]}["hdd28"]["cheap"])
+        self.assertNotIn("ad_link", b["best"])
+
+    def test_p1_alte_datei_amazon_ersatz_ohne_meldung(self):
+        # Datei ohne source_id (vor P1): Amazon.de als Ersatz bei DE erkennt man am Shop
+        self.assertTrue(a.AMAZON_HOST.search("www.amazon.de"))
+        calls, s = self.run_country("DE", {"geizhals.de/robots.txt": (200, "robots_geizhals.txt"), "diskprices.com/?locale=de": (200, "diskprices_us.html")})
+        path = a.own_prices_path("DE"); d = json.load(open(path))
+        for q in d["queries"].values():
+            if q.get("best"): q["best"].pop("source_id", None); q["best"].pop("source", None)
+        json.dump(d, open(path, "w"))
+        a.save_settings({"price_alerts": {"hdd28": 1000}})
+        x = {y["key"]: y for y in a.price_summary()["sizes"]}["hdd28"]
+        self.assertTrue(x["no_alert"]); self.assertFalse(x["cheap"])
+
+    def test_p1_werbelink_aufbau(self):
+        pub = lambda h: ["93.184.216.34"]                               # noqa: E731
+        link = "https://www.galaxus.ch/de/s1/product/seagate-ironwolf-pro-28tb-123?x=1&y=2"
+        # ohne Kennung: kein Werbelink
+        self.assertEqual(a.affiliate_url(link, pub), "")
+        self.assertFalse(a.ads_available())
+        write(f"{a.CONFIG}/affiliate.json", json.dumps({"galaxus": {"id": "12345", "program": "98765"},
+                                                          "awin": {"id": "777"}}))     # awin unvollständig (mid fehlt)
+        self.assertTrue(a.ads_available())
+        ad = a.affiliate_url(link, pub)
+        self.assertTrue(ad.startswith("https://clk.tradedoubler.com/click?p=98765&a=12345&url=https%3A%2F%2Fwww.galaxus.ch"))
+        self.assertIn("%3Fx%3D1%26y%3D2", ad)                          # Ziel vollständig kodiert, keine fremden Parameter
+        self.assertEqual(a.affiliate_url("https://www.reichelt.de/x", pub), "")        # Awin ohne Händler-ID
+        # Amazon nie, auch nicht mit Eintrag; andere Shops, http und private Ziele nie
+        write(f"{a.CONFIG}/affiliate.json", json.dumps({"galaxus": {"id": "12345", "program": "98765"},
+                                                          "amazon": {"id": "x-21", "program": "1"}}))
+        for bad in ("https://www.amazon.com/dp/B0D1234567", "https://www.amazon.de/dp/B0D1", "https://amzn.to/abc",
+                    "https://www.toppreise.ch/x", "http://www.galaxus.ch/x", "https://user:pw@" + "www.galaxus.ch/x"):
+            self.assertEqual(a.affiliate_url(bad, pub), "", bad)
+        self.assertEqual(a.affiliate_url(link, lambda h: ["192.168.1.5"]), "")        # Host zeigt ins Heimnetz
+        # Ungültige Kennung (Sonderzeichen) wird nicht eingebaut
+        write(f"{a.CONFIG}/affiliate.json", json.dumps({"galaxus": {"id": "1&evil=1", "program": "9"}}))
+        self.assertEqual(a.affiliate_url(link, pub), "")
+        # with_ad lässt den normalen Link unverändert
+        write(f"{a.CONFIG}/affiliate.json", json.dumps({"galaxus": {"id": "12345", "program": "98765"}}))
+        o = a.with_ad({"name": "X", "link": link}, pub)
+        self.assertEqual(o["link"], link); self.assertIn("ad_link", o)
+        self.assertNotIn("ad_link", a.with_ad({"name": "X", "link": "https://www.toppreise.ch/x"}, pub))
 
     def test_ablauf_deutschland_pruefseite(self):
         calls, s = self.run_country("DE", {"geizhals.de": (200, "geizhals_challenge.html")})
@@ -2362,9 +2444,10 @@ class Agent115Test(unittest.TestCase):
             codes = [srv.get("/api/info", tok="falsch")[0] for _ in range(11)]
             self.assertEqual(codes[:10], [401] * 10)                       # 10 Fehlversuche, danach gesperrt
             self.assertEqual(codes[10], 429)
-            code, body, headers = srv.get("/api/info")                     # auch mit richtigem Token gesperrt
-            self.assertEqual(code, 429)
+            self.assertEqual(srv.get("/api/info", tok="falsch")[0], 429)   # falsche Tokens bleiben gesperrt
+            code, body, headers = srv.get("/api/info", tok="falsch")
             self.assertTrue(int(headers["Retry-After"]) > 0)
+            self.assertEqual(srv.get("/api/info")[0], 200)                 # ab 1.18.0: richtiger Token wird nie gebremst (N5)
             self.assertEqual(srv.get("/api/ping", tok=None)[0], 200)       # Ping bleibt
             self.assertEqual(srv.get("/api/info", tok=None)[0], 429)
         finally:
@@ -3348,6 +3431,251 @@ class AuditRestteileTest(unittest.TestCase):
         page = ('<meta property="og:url" content="javascript:/preisvergleich/x">'
                 '<meta property="og:title" content="Seagate IronWolf 8 TB ab CHF 200.00 bei Toppreise.ch">')
         self.assertIsNone(a.parse_toppreise_product(page, 8))
+
+
+class Agent118Test(unittest.TestCase):
+    """1.18.0 (Audit 12.11.): M1 chown nur im eigenen /config, M2 Syslog in «Heute», M3 Heimnetz-Suche aus, N2, N5."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = a.CONFIG, os.environ.get("PUID"), os.environ.get("PGID")
+        a.CONFIG = self.d
+        os.environ["PUID"], os.environ["PGID"] = "65534", "65534"
+
+    def tearDown(self):
+        import shutil
+        a.CONFIG = self.old[0]
+        for k, v in zip(("PUID", "PGID"), self.old[1:]):
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+        a.PRIV_STATE["root_reason"] = ""
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _drop(self):
+        """drop_privileges ohne echten Benutzerwechsel (Rückgabe, Besitzer der Dateien prüft der Test)."""
+        with patch.object(a.os, "setgroups"), patch.object(a.os, "setgid"), patch.object(a.os, "setuid"):
+            return a.drop_privileges()
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "nur als root prüfbar")
+    def test_m1_fremde_dateien_bleiben_unberuehrt(self):
+        write(f"{self.d}/postgres/data/PG_VERSION", "16")
+        write(f"{self.d}/plex/Preferences.xml", "x")
+        write(f"{self.d}/token.txt", "t")
+        write(f"{self.d}/crashes/1.json", "{}")
+        os.chmod(self.d, 0o777)
+        for p in (f"{self.d}/postgres", f"{self.d}/postgres/data", f"{self.d}/postgres/data/PG_VERSION", f"{self.d}/plex",
+                  f"{self.d}/plex/Preferences.xml"):
+            os.lchown(p, 999, 999)
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            who = self._drop()
+        self.assertEqual(who, (65534, 65534))
+        for p in ("postgres", "postgres/data", "postgres/data/PG_VERSION", "plex", "plex/Preferences.xml"):
+            self.assertEqual(os.lstat(f"{self.d}/{p}").st_uid, 999, p)          # fremde Dateien unverändert
+        for p in ("token.txt", "crashes", "crashes/1.json"):
+            self.assertEqual(os.lstat(f"{self.d}/{p}").st_uid, 65534, p)        # eigene gehören dem Agenten
+        self.assertIn("WARNUNG", out.getvalue())
+        self.assertFalse(os.path.exists(f"{self.d}/{a.CONFIG_MARKER}"))         # fremder Ordner wird nicht als «eigen» markiert
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "nur als root prüfbar")
+    def test_m1_eigener_und_leerer_ordner_wird_uebernommen(self):
+        write(f"{self.d}/token.txt", "t")
+        write(f"{self.d}/history.db-wal", "x")
+        write(f"{self.d}/prices-CH.json", "{}")
+        self.assertEqual(a.config_is_own(self.d), (True, []))
+        self.assertEqual(self._drop(), (65534, 65534))
+        for p in ("token.txt", "history.db-wal", "prices-CH.json", a.CONFIG_MARKER):
+            self.assertEqual(os.lstat(f"{self.d}/{p}").st_uid, 65534, p)
+        # Nach-Audit: die Markierung allein macht den Ordner nicht «eigen»; liegen später fremde Namen darin, gilt er als fremd
+        write(f"{self.d}/unterordner/x", "x")
+        self.assertEqual(a.config_is_own(self.d), (False, ["unterordner"]))
+        empty = tempfile.mkdtemp()
+        self.assertEqual(a.config_is_own(empty), (True, []))
+        os.rmdir(empty)
+
+    def test_nachaudit_markierung_nicht_faelschbar(self):
+        # /config war beim ersten Start leer (z. B. ganzes appdata) und bekam die Markierung; später fremde Container-Daten
+        write(f"{self.d}/{a.CONFIG_MARKER}", "x")
+        write(f"{self.d}/postgres/data/PG_VERSION", "16")
+        self.assertEqual(a.config_is_own(self.d), (False, ["postgres"]))
+
+    def test_nachaudit_sshd_benutzer_geschwaerzt(self):
+        for line, name in (("Failed password for bob from 10.0.0.5 port 22 ssh2", "bob"),
+                           ("Accepted publickey for alice from 10.0.0.5 port 22", "alice"),
+                           ("Failed password for invalid user mallory from 10.0.0.5", "mallory")):
+            out = a.redact_log(line)
+            self.assertNotIn(name, out, out)
+            self.assertNotIn("10.0.0.5", out)
+
+    def test_m2_vm_befund_benutzer_in_pam_zeilen(self):
+        r = a.redact_log
+        for line, name in (("PAM: authentication failure for bob from 10.1.2.3", "bob"),
+                           ("pam_unix(sshd:auth): authentication failure; logname=carl uid=0 euid=0 tty=ssh ruser=dora rhost=host.example.org", "carl"),
+                           ("pam_unix(sshd:auth): authentication failure; logname= uid=0 tty=ssh ruser=dora rhost=10.1.2.3 user=bob", "dora"),
+                           ("Failed password for bob from 10.1.2.3 port 22 ssh2", "bob"),
+                           ("Accepted password for bob from 10.1.2.3 port 22 ssh2", "bob"),
+                           ("pam_unix(sudo:session): session opened for user bob(uid=1000) by (uid=0)", "bob"),
+                           ("Failed password for invalid user bob from 10.1.2.3", "bob"),
+                           ("Invalid user bob from 10.1.2.3 port 5", "bob"),
+                           ("error: maximum authentication attempts exceeded for bob from 10.1.2.3", "bob")):
+            out = r(line)
+            self.assertNotIn(name, out, out)
+            self.assertNotIn("10.1.2.3", out)
+            self.assertNotIn("example.org", out)
+        # Überschwärzung: «failed» ist kein Benutzer
+        self.assertEqual(r("login failed for user=bob"), "login failed for user=<user>")
+        self.assertEqual(r("login failed"), "login failed")
+        self.assertEqual(r("user not found"), "user not found")
+        # Gegenbeispiele: gewöhnlicher Text bleibt
+        self.assertEqual(r("Reading for the first time from disk"), "Reading for the first time from disk")
+        self.assertEqual(r("Connection closed for nothing from the end"), "Connection closed for nothing from the end")
+        self.assertEqual(r("authentication failure; logname= uid=0"), "authentication failure; logname= uid=<user>")
+
+    def test_ntfy_nur_kritisch_standard(self):
+        sent, events = [], []
+        with patch.object(a, "ntfy", lambda t, x, tags="warning", priority="high": sent.append((t, priority)) or True), \
+             patch.object(a, "EVENT_SINK", lambda k, l, t, x: events.append(t)):
+            with patch.object(a, "NTFY_ALL", False):
+                a.alerter("array", "err", critical=True)("Festplatte ausgefallen", "x")
+                a.alerter("lan", "warn")("Neues Gerät im Heimnetz", "x")
+                a.alerter("prices", "info")("Platte günstig: 4 TB", "x")
+                a.alerter("array", "err", critical=True)("Array läuft wieder", "x", calm=True)
+                self.assertEqual([t for t, _ in sent], ["Festplatte ausgefallen"])
+            self.assertEqual(len(events), 4)            # «Heute» bekommt alles
+            sent.clear()
+            with patch.object(a, "NTFY_ALL", True):
+                a.alerter("lan", "warn")("Neues Gerät im Heimnetz", "x")
+                a.alerter("array", "err", critical=True)("Array läuft wieder", "x", calm=True)
+                self.assertEqual(sent, [("Neues Gerät im Heimnetz", "high"), ("Array läuft wieder", "low")])
+
+    def test_alertgate_24h_schlimmer_entwarnung(self):
+        g = a.AlertGate()
+        self.assertTrue(g.allow("k", 1, now=1000))
+        self.assertFalse(g.allow("k", 1, now=1000 + 3600))
+        self.assertTrue(g.allow("k", 2, now=1000 + 7200))          # schlimmer
+        self.assertFalse(g.allow("k", 2, now=1000 + 86000))
+        self.assertTrue(g.allow("k", 2, now=1000 + 7200 + 86401))    # nach 24 Std.
+        self.assertTrue(g.clear("k"))
+        self.assertFalse(g.clear("k"))
+        self.assertTrue(g.allow("k", 1, now=1000 + 7200 + 86402))    # Entwarnung hob die Sperre auf
+
+    def test_arraywatch_24h_und_entwarnung(self):
+        import tempfile
+        sent = []
+        with tempfile.TemporaryDirectory() as proc:
+            w = a.ArrayWatch(lambda t, x, calm=False: sent.append(("ruhig " if calm else "") + t), proc=proc)
+            def md(state="STARTED", status="DISK_OK", errors=0):
+                open(os.path.join(proc, "mdstat"), "w").write(
+                    f"mdState={state}\nmdResync=0\ndiskName.1=md1p1\nrdevName.1=sdc\nrdevStatus.1={status}\nrdevNumErrors.1={errors}\n")
+            md(); w.check()
+            md(errors=2); w.check()
+            md(errors=2); w.check()
+            self.assertEqual(sent, ["Neue Plattenfehler"])
+            md(errors=5); w.check()                                  # schlimmer: nochmals
+            self.assertEqual(len(sent), 2)
+            md(status="DISK_DSBL", errors=5); w.check()
+            md(status="DISK_OK", errors=5); w.check()                # Entwarnung (ruhig)
+            md(status="DISK_DSBL", errors=5); w.check()              # Sperre aufgehoben: wieder melden
+            self.assertEqual(sent, ["Neue Plattenfehler", "Neue Plattenfehler", "Festplatte ausgefallen",
+                                    "ruhig Festplatte wieder in Ordnung", "Festplatte ausgefallen"])
+
+    def test_hitze_entwarnung_und_24h(self):
+        store, got = a.Store(":memory:"), []
+        w = a.Watcher(store, lambda t, x, calm=False: got.append(("ruhig " if calm else "") + t))
+        t = 1_760_000_000
+        def feed(temp, n):
+            nonlocal t
+            for _ in range(n):
+                t += 30
+                w.feed({"t": t, "cpu": 20.0, "temps": {"CPU": temp}, "disks": {}, "top": []})
+        feed(97.0, 20)
+        feed(60.0, 2)                                   # abgekühlt: ruhige Entwarnung, Sperre weg
+        feed(97.0, 20)                                  # wieder heiss: neue Meldung
+        self.assertEqual(got, ["NAS zu heiss", "ruhig NAS wieder normal", "NAS zu heiss"])
+
+    def test_m1_erkennung_fremd(self):
+        write(f"{self.d}/token.txt", "t")
+        write(f"{self.d}/mariadb/db.opt", "x")
+        own, foreign = a.config_is_own(self.d)
+        self.assertFalse(own)
+        self.assertEqual(foreign, ["mariadb"])
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "nur als root prüfbar")
+    def test_n2_root_weiter_mit_warnung_in_info(self):
+        write(f"{self.d}/token.txt", "t")
+        os.chmod(self.d, 0o700)                                         # root-eigen, Benutzer 65534 kommt nicht hin
+        write(f"{self.d}/andere/datei", "x")
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(a.os, "lchown"):                          # chown schlägt fehl (z. B. NFS root_squash)
+                self.assertIsNone(self._drop())
+        w = a.privilege_warnings()
+        self.assertEqual([x["code"] for x in w], ["running_as_root"])
+        self.assertIn("root", w[0]["de"])
+        a.PRIV_STATE["root_reason"] = ""
+        self.assertEqual(a.privilege_warnings(), [])
+
+    def test_m2_heute_ohne_logs_keine_syslog_zeilen(self):
+        os.makedirs(f"{self.d}/log")
+        stamp = time.strftime("%b %d %H:%M:%S", time.localtime(time.time() - 30))
+        with open(f"{self.d}/log/syslog", "w") as f:
+            f.write(f"{stamp} nas sshd[12]: error: Failed login for invalid user admin from 192.168.1.55 port 22 mac aa:bb:cc:dd:ee:ff "
+                    "email bob@example.com\n")
+            f.write(f"{stamp} nas kernel: error: cannot open /mnt/user/private/Steuern-2026.pdf\n")
+        t = a.Today(a.Store(":memory:"), files_root=f"{self.d}/s", notify_dir=f"{self.d}/n", log_dir=f"{self.d}/log", docker_dir=f"{self.d}/d")
+        with patch.object(a, "LOGS_ON", False):
+            r = t.collect(24)
+            self.assertEqual([e for e in r["items"] if e["kind"] == "syslog"], [])
+            self.assertFalse(r["sources"]["syslog"])
+        with patch.object(a, "LOGS_ON", True):
+            items = [e for e in t.collect(24)["items"] if e["kind"] == "syslog"]
+        self.assertEqual(len(items), 2)
+        blob = json.dumps(items)
+        for secret in ("192.168.1.55", "aa:bb:cc:dd:ee:ff", "bob@example.com", "admin", "Steuern-2026"):
+            self.assertNotIn(secret, blob, secret)
+
+    def test_m3_heimnetz_standard_aus(self):
+        self.assertFalse(a.LAN_ON)                                      # Standard: aus
+        lan = a.LanScan(os.path.join(self.d, "dev.db"), lambda *x: None)
+        with patch.object(lan, "arp_path", return_value="/proc/net/arp"):
+            self.assertFalse(lan.available())
+            self.assertEqual(lan.reason(), "off")
+            with patch.object(a.socket, "socket") as so:
+                lan.scan()
+                so.assert_not_called()                                  # kein einziges UDP-Paket
+            with patch.object(a, "LAN_ON", True):
+                self.assertTrue(lan.available())
+                self.assertEqual(lan.reason(), "")
+        srv = Server115(lan=lan)
+        try:
+            code, info, _ = srv.get("/api/info")
+            self.assertEqual((code, info["lan"], info["lan_enabled"]), (200, False, False))
+            self.assertIs(info["ntfy_all"], False)                      # ab 1.18.0, Standard aus
+            self.assertNotIn("lan", info["features"])
+            code, dev, _ = srv.get("/api/devices")
+            self.assertEqual((code, dev["available"], dev["reason"], dev["enabled"], dev["devices"]), (200, False, "off", False, []))
+            req = urllib.request.Request(f"http://127.0.0.1:{srv.port}/api/devices/scan", data=b"", method="POST",
+                                         headers={"Authorization": "Bearer geheim"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertEqual((r.status, json.load(r)["started"]), (202, False))
+        finally:
+            srv.close()
+
+    def test_n5_richtiger_token_trotz_bremse(self):
+        srv = Server115()
+        try:
+            for _ in range(a.AUTH_FAILS + 1):
+                srv.get("/api/info", tok="falsch")
+            self.assertEqual(srv.get("/api/info", tok="falsch")[0], 429)
+            self.assertEqual(srv.get("/api/info")[0], 200)
+        finally:
+            srv.close()
+
 
 if __name__ == "__main__":
     unittest.main()

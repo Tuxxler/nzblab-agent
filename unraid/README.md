@@ -20,4 +20,6 @@ All host paths are mounted **read-only**. Only `/config` (`/mnt/user/appdata/nzb
 After start the agent drops root and runs as `PUID`/`PGID` (99/100). Set `PUID=0` only if you need container names
 in the "top load" list or appdata sizes of containers with strict permissions.
 
+Optional and off by default: SMART (`NZBLAB_SMART`), log excerpts (`NZBLAB_LOGS`, also needed for the system log in "Today"), the home-network device scan (`NZBLAB_LAN`: every 30 minutes one empty UDP packet to each address of your /24 network, reverse DNS, push for new devices; your router may report it as a port scan). The optional paths *System log* and *Docker container names* are empty by default. Map `/config` to its own folder (`/mnt/user/appdata/nzblab-agent`), never to the whole `appdata`.
+
 Source code (free, open source), Docker/Compose files and license (GNU AGPL-3.0): <https://github.com/Tuxxler/nzblab-agent>.

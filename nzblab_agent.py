@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -655,6 +655,7 @@ class Watcher:
         self.quiet_since = {}
         self.hot_since = None
         self.alerted = False
+        self.gate = AlertGate()
 
     def feed(self, s):
         now = s["t"]
@@ -672,12 +673,14 @@ class Watcher:
         cpu_t = (s.get("temps") or {}).get("CPU")
         if cpu_t is not None and cpu_t >= HEAT_ALERT:
             self.hot_since = self.hot_since or now
-            if not self.alerted and now - self.hot_since >= HEAT_MINUTES * 60:
+            if not self.alerted and now - self.hot_since >= HEAT_MINUTES * 60 and self.gate.allow("heat", int(cpu_t // 5), now):
                 self.alerted = True
                 who = ", ".join(n for n, _ in (s.get("top") or [])[:3]) or "unbekannt"
                 self.notify("NAS zu heiss", f"CPU seit {HEAT_MINUTES} Minuten über {HEAT_ALERT:.0f} °C (jetzt {cpu_t:.0f} °C). Meiste Last: {who}.")
         else:
             if cpu_t is not None and cpu_t < HEAT_ALERT - 10:
+                if self.alerted and self.gate.clear("heat"):
+                    self.notify("NAS wieder normal", f"Die CPU ist auf {cpu_t:.0f} °C abgekühlt.", calm=True)
                 self.hot_since, self.alerted = None, False
 
 
@@ -766,14 +769,45 @@ def ntfy_url():
     return (settings().get("ntfy_url") or NTFY_URL or "").strip()
 
 
+# ab 1.18.0 (Paket D): ntfy ist der Notfall-Weg (die App meldet den Rest). Standard: nur Kritisches (Array/Platte, Hitze über der
+# kritischen Grenze). Info-Meldungen (günstige Platten, neue Geräte, «wieder normal») nur mit NZBLAB_NTFY_ALL=1.
+NTFY_ALL = os.environ.get("NZBLAB_NTFY_ALL", "").strip().lower() in ("1", "true", "yes", "on", "ja")
+
+
+class AlertGate:
+    """Dieselbe Sache höchstens 1× in 24 Std., ausser sie wird schlimmer (höhere Stufe); Entwarnung (clear) hebt die Sperre auf.
+    Gleiche Logik wie die App ab 2.67. Der Zustand liegt nur im Speicher: nach einem Neustart darf eine Meldung wieder kommen."""
+    LOCK = 24 * 3600
+
+    def __init__(self):
+        self.sent = {}
+
+    def allow(self, key, severity=0, now=None):
+        now = time.time() if now is None else now
+        last = self.sent.get(key)
+        if last and now - last[0] < self.LOCK and severity <= last[1]:
+            return False
+        self.sent[key] = (now, severity)
+        return True
+
+    def clear(self, key):
+        """Entwarnung: True, wenn vorher eine Meldung gesperrt war (dann lohnt sich eine Entwarnung)."""
+        return self.sent.pop(key, None) is not None
+
+
 EVENT_SINK = None   # Store.add_event, gesetzt in main()
 
 
-def alerter(kind, level):
-    """Alarm aufs Handy (ntfy) und zugleich als Ereignis für «Heute» speichern."""
-    def send(title, text):
+def alerter(kind, level, critical=False):
+    """Ereignis für «Heute» speichern (immer) und, wenn es kritisch ist, aufs Handy (ntfy) schicken. Nicht Kritisches und
+    Entwarnungen («calm», ohne Ton) gehen nur mit NZBLAB_NTFY_ALL=1 per ntfy."""
+    def send(title, text, calm=False):
         if EVENT_SINK:
-            EVENT_SINK(kind, level, title, text)
+            EVENT_SINK(kind, "info" if calm else level, title, text)
+        if calm:
+            return ntfy(title, text, tags="white_check_mark", priority="low") if NTFY_ALL else False
+        if not (critical or NTFY_ALL):
+            return False
         return ntfy(title, text)
     return send
 
@@ -802,7 +836,7 @@ class ArrayWatch:
     def __init__(self, notify, proc=HOST_PROC):
         self.notify, self.proc = notify, proc
         self.prev = None
-        self.sent = {}
+        self.gate = AlertGate()
 
     def read(self):
         txt = read(f"{self.proc}/mdstat") or read("/proc/mdstat")
@@ -818,11 +852,13 @@ class ArrayWatch:
         return {"state": kv.get("mdState", ""), "disks": sorted(disks, key=lambda d: d["slot"]),
                 "resync": kv.get("mdResyncAction", "") if kv.get("mdResync", "0") not in ("0", "") else ""}
 
-    def _send(self, key, title, text):
-        now = time.time()
-        if now - self.sent.get(key, 0) >= 6 * 3600:
-            self.sent[key] = now
+    def _send(self, key, title, text, severity=0):
+        if self.gate.allow(key, severity):
             self.notify(title, text)
+
+    def _clear(self, key, title, text):
+        if self.gate.clear(key):
+            self.notify(title, text, calm=True)
 
     @staticmethod
     def label(d):
@@ -833,20 +869,31 @@ class ArrayWatch:
         if cur is None:
             return None
         prev = self.prev
+        if cur["state"] == "STARTED" and prev is not None and prev["state"] != "STARTED":
+            self._clear("array", "Array läuft wieder", "Das Unraid-Array ist gestartet.")
         if cur["state"] != "STARTED" and (prev is None or prev["state"] == "STARTED"):
             self._send("array", "Array nicht gestartet", f"Das Unraid-Array ist {cur['state'].lower()}: Freigaben, Docker und VMs laufen nicht. In der App: Übersicht › «Array starten».")
         old = {d["slot"]: d for d in (prev or {}).get("disks", [])}
         for d in cur["disks"]:
             o = old.get(d["slot"])
             if d["status"] in self.BAD and (o is None or o["status"] not in self.BAD):
-                self._send(f"bad{d['slot']}", "Festplatte ausgefallen", f"{self.label(d)} meldet {d['status']}. Unraid hat sie deaktiviert; Daten sichern und Platte prüfen.")
+                self._send(f"bad{d['slot']}", "Festplatte ausgefallen", f"{self.label(d)} meldet {d['status']}. Unraid hat sie deaktiviert; Daten sichern und Platte prüfen.", 1)
+            elif o is not None and o["status"] in self.BAD and d["status"] not in self.BAD:
+                self._clear(f"bad{d['slot']}", "Festplatte wieder in Ordnung", f"{self.label(d)} meldet {d['status']}.")
             if o is not None and d["errors"] > o["errors"]:
-                self._send(f"err{d['slot']}", "Neue Plattenfehler", f"{self.label(d)}: {d['errors'] - o['errors']} neue Lese-/Schreibfehler (gesamt {d['errors']}). SMART-Werte ansehen.")
+                self._send(f"err{d['slot']}", "Neue Plattenfehler", f"{self.label(d)}: {d['errors'] - o['errors']} neue Lese-/Schreibfehler (gesamt {d['errors']}). SMART-Werte ansehen.", int(d["errors"]).bit_length())   # erneut erst, wenn sich die Fehler verdoppeln (kein Dauer-Alarm)
+            elif o is not None and d["errors"] < o["errors"]:
+                self.gate.clear(f"err{d['slot']}")       # Zähler zurückgesetzt: stille Entwarnung
         self.prev = cur
         return cur
 
 
 # ---------------------------------------------------------------- Heimnetz
+
+# Ab 1.18.0 (Audit M3): Heimnetz-Suche nur auf Wunsch (NZBLAB_LAN=1). Sie schickt alle 30 Minuten ein leeres UDP-Paket an jede
+# Adresse des /24-Netzes, fragt per Reverse-DNS nach Namen neuer Geräte und meldet neue Geräte (Name, IP, MAC) per Push.
+LAN_ON = os.environ.get("NZBLAB_LAN", "").strip().lower() in ("1", "true", "yes", "on", "ja")
+
 
 class LanScan:
     """Geräte im Heimnetz: kurz jede Adresse im eigenen /24-Netz anstossen (ein UDP-Paket, das NAS fragt dann per ARP nach),
@@ -883,10 +930,13 @@ class LanScan:
         return None
 
     def available(self):
-        return self.arp_path() is not None
+        return LAN_ON and self.arp_path() is not None
 
     def reason(self):
-        """Warum keine Geräteliste: no_proc = Pfad /host/proc fehlt, no_access = Pfad da, aber Docker sperrt die Tabelle."""
+        """Warum keine Geräteliste: off = ab 1.18.0 ausgeschaltet (NZBLAB_LAN, Standard aus), no_proc = Pfad /host/proc fehlt,
+        no_access = Pfad da, aber Docker sperrt die Tabelle."""
+        if not LAN_ON:
+            return "off"
         if self.available():
             return ""
         return "no_proc" if self.proc != "/host/proc" else "no_access"
@@ -2028,11 +2078,62 @@ def announce_config(state=None):
     return True
 
 
+CONFIG_MARKER = ".nzblab-agent-config"
+# Ab 1.18.0: was der Agent in /config selbst anlegt; nur solche Einträge gelten als «eigener Ordner» (Markierung allein nicht)
+OWN_CONFIG_ENTRY = re.compile(r"token\.txt|settings\.json(\.tmp)?|affiliate\.json|prices-[A-Za-z0-9_-]+\.json|"
+                              r"(history|files|devices)\.db(-wal|-shm|-journal)?|crashes|" + re.escape(CONFIG_MARKER))
+PRIV_STATE = {"root_reason": ""}      # ab 1.18.0: warum der Agent als root weiterläuft (leer = nicht root oder gewollt)
+
+
+def privilege_warnings():
+    """Ab 1.18.0 (Audit N2): läuft der Agent nur als Notlösung als root, steht das in /api/info (warnings) statt nur im Log."""
+    r = PRIV_STATE["root_reason"]
+    if not r:
+        return []
+    return [{"code": "running_as_root",
+             "de": f"Der Agent läuft als root weiter, weil {r[0]}. Lösung: /config auf einen eigenen Ordner legen, der Benutzer PUID gehört "
+                   "(z. B. appdata/nzblab-agent).",
+             "en": f"The agent keeps running as root because {r[1]}. Fix: map /config to its own folder that user PUID can write "
+                   "(e.g. appdata/nzblab-agent)."}]
+
+
+def config_is_own(path):
+    """Ab 1.18.0 (Audit M1): ist /config ein eigener Ordner des Agents? Ja, wenn auf der obersten Ebene
+    nur Einträge liegen, die der Agent selbst anlegt (leer zählt auch). Sonst: (False, fremde Einträge)."""
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False, []
+    # Nach-Audit 1.18.0: die Markierung allein reicht nicht mehr. Sonst bliebe ein Ordner, der beim ersten Start leer war
+    # (z. B. /config versehentlich auf ein leeres appdata), für immer «eigen», und spätere fremde Dateien würden umbesitzt.
+    foreign = sorted(n for n in names if not OWN_CONFIG_ENTRY.fullmatch(n))
+    return not foreign, foreign
+
+
+def _chown_tree(top, uid, gid):
+    if not os.path.isdir(top) or os.path.islink(top):      # einzelne Datei (os.walk liefert für sie nichts)
+        try:
+            os.lchown(top, uid, gid)
+        except OSError:
+            pass
+        return
+    for root, dirs, files in os.walk(top):
+        for name in [root] + [os.path.join(root, x) for x in dirs + files]:
+            try:
+                if os.lstat(name).st_uid != uid:
+                    os.lchown(name, uid, gid)
+            except OSError:
+                pass
+
+
 def drop_privileges():
     """Im eigenen Image (Dockerfile setzt PUID=99, PGID=100 = Unraids nobody:users) als normaler Benutzer weiterlaufen.
     Vorher /config diesem Benutzer geben, damit Verlauf und Token schreibbar bleiben. PUID=0 oder ohne PUID (altes Setup im
     offiziellen Python-Image): bleibt root. Host-Pfade sind nur lesend eingebunden; root braucht es nur für Container-Namen
-    (/var/lib/docker/containers ist 600) und appdata-Ordner anderer Container mit engen Rechten."""
+    (/var/lib/docker/containers ist 600) und appdata-Ordner anderer Container mit engen Rechten.
+    Ab 1.18.0 (Audit M1): rekursiv umbesitzt wird nur ein eigener oder leerer /config-Ordner; liegen fremde Dateien darin
+    (falsch gesetzter Pfad, z. B. ganzes appdata), bekommen nur die eigenen Einträge den Besitzer, dazu eine laute Warnung."""
+    PRIV_STATE["root_reason"] = ""
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         return None
     try:
@@ -2041,18 +2142,34 @@ def drop_privileges():
         return None
     if uid == 0:
         return None
-    for root, dirs, files in os.walk(CONFIG):
-        for name in [root] + [os.path.join(root, x) for x in dirs + files]:
-            try:
-                if os.lstat(name).st_uid != uid:
-                    os.lchown(name, uid, gid)
-            except OSError:
-                pass
+    own, foreign = config_is_own(CONFIG)
+    if own:
+        try:
+            mk = os.path.join(CONFIG, CONFIG_MARKER)
+            if not os.path.lexists(mk):
+                with open(mk, "w") as f:
+                    f.write("NZBLab-Agent: dieser Ordner gehört dem Agenten (Besitzer-Wechsel erlaubt).\n")
+        except OSError:
+            pass
+        _chown_tree(CONFIG, uid, gid)
+    else:
+        print("!" * 72 + "\nWARNUNG: /config enthält fremde Dateien (z. B. " + ", ".join(foreign[:3]) + "). Das sieht nach einem zu grossen Ordner aus "
+              "(z. B. ganzes appdata). Der Agent ändert NICHTS an fremden Dateien und besitzt nur seine eigenen Einträge um.\n"
+              "Lösung: /config auf einen eigenen Ordner legen, z. B. /mnt/user/appdata/nzblab-agent.\n"
+              "WARNING: /config contains files that are not the agent's. The agent will not touch them, only its own entries.\n"
+              "Fix: map /config to its own folder, e.g. /mnt/user/appdata/nzblab-agent.\n" + "!" * 72, flush=True)
+        try:
+            entries = os.listdir(CONFIG)
+        except OSError:
+            entries = []                       # Nach-Audit 1.18.0: nicht lesbar → kein Absturz beim Start, unten root-Hinweis
+        for n in entries:
+            if OWN_CONFIG_ENTRY.fullmatch(n):
+                _chown_tree(os.path.join(CONFIG, n), uid, gid)
     # Nur wechseln, wenn der Benutzer /config danach sicher erreicht und beschreiben kann (z. B. NFS mit root_squash
     # oder ACLs verhindern chown). Sonst lieber als root weiter als in einer Absturzschleife.
     try:
         st = os.stat(CONFIG)
-        ok = st.st_uid == uid and st.st_mode & 0o700 == 0o700
+        ok = (st.st_uid == uid and st.st_mode & 0o700 == 0o700) or bool(st.st_mode & 0o002) or (st.st_gid == gid and st.st_mode & 0o070 == 0o070)
         d = os.path.dirname(os.path.abspath(CONFIG))
         while ok and d not in ("", "/"):
             m = os.stat(d)
@@ -2061,8 +2178,11 @@ def drop_privileges():
     except OSError:
         ok = False
     if not ok:
-        print(f"Hinweis: {CONFIG} gehört nicht Benutzer {uid} oder ist für ihn nicht erreichbar; der Agent läuft als root weiter "
-              "(Host-Pfade bleiben nur lesend).", flush=True)
+        de = f"{CONFIG} gehört nicht Benutzer {uid} oder ist für ihn nicht erreichbar" + ("" if own else " (fremde Dateien darin)")
+        en = f"{CONFIG} is not owned by user {uid} or not reachable for it" + ("" if own else " (foreign files inside)")
+        PRIV_STATE["root_reason"] = (de, en)
+        print(f"WARNUNG: {de}; der Agent läuft als root weiter (Host-Pfade bleiben nur lesend). / WARNING: {en}; the agent keeps running as root "
+              "(host paths stay read-only).", flush=True)
         return None
     os.setgroups([gid])
     os.setgid(gid)
@@ -2208,6 +2328,103 @@ def price_search_url(src, tb, kind, q=None):
         cat = "hde7s" if kind == "hdd" else "hdssd"
         return f"{src['base']}/?fs={quote_plus(q)}&cat={cat}&sort=p"
     return f"https://diskprices.com/?locale={src['locale']}&condition=new"
+
+
+# ---------------------------------------------------------------- Quellen und Werbelinks (Plattenpreise P1)
+#
+# Jede Preisquelle steht hier mit Name, Seite und Stand der Erlaubnis. «allowed» False (oder Eintrag in der Einstellung
+# «price_sources_off» bzw. Variable PRICE_SOURCES_OFF, kommagetrennte Quellen-IDs) = die Quelle wird nicht mehr abgefragt;
+# die App zeigt dann nur noch den Suchlink fürs Browser-Suchen, keine Zahl. «terms»: pending = schriftliche Erlaubnis
+# angefragt oder noch offen (Plan Plattenpreise weltweit, Paket 0). «amazon»: Amazon-Preise bekommen nie einen Werbelink
+# und keine «günstig»-Meldung (Regeln des Partnerprogramms: keine Preisverfolgung/-alarme).
+PRICE_SOURCES = {
+    "toppreise": {"label": "Toppreise.ch", "url": "https://www.toppreise.ch", "allowed": True, "terms": "pending", "amazon": False},
+    "geizhals": {"label": "Geizhals", "url": "https://geizhals.de", "allowed": True, "terms": "pending", "amazon": False},
+    "diskprices": {"label": "diskprices.com (Amazon-Preise)", "url": "https://diskprices.com", "allowed": True, "terms": "pending",
+                   "amazon": True},
+}
+
+
+def source_allowed(sid):
+    """Darf die Quelle abgefragt werden? Standard aus PRICE_SOURCES, abschaltbar in den Einstellungen und per Variable."""
+    entry = PRICE_SOURCES.get(sid)
+    if not entry or not entry.get("allowed", True):
+        return False
+    off = settings().get("price_sources_off")
+    off = {str(x) for x in off} if isinstance(off, list) else set()
+    off |= {x.strip() for x in os.environ.get("PRICE_SOURCES_OFF", "").split(",") if x.strip()}
+    return sid not in off
+
+
+def price_source_info(src):
+    """Eine Quelle für /api/prices: {id, label, url, allowed, terms, amazon}."""
+    e = PRICE_SOURCES.get(src["id"], {})
+    url = src.get("base") or e.get("url", "")
+    label = src["label"]
+    return {"id": src["id"], "label": label, "url": url, "allowed": source_allowed(src["id"]),
+            "terms": e.get("terms", "pending"), "amazon": bool(e.get("amazon"))}
+
+
+# Partnerprogramme (Werbelinks). Leer = kein Werbelink, nur der normale Link. Die Kennungen sind öffentlich (stehen in jedem
+# Werbelink) und kommen aus CONFIG/affiliate.json: {"galaxus": {"id": "…", "program": "…"}, "awin": {"id": "…", "mid": "…"}}.
+# Amazon steht bewusst nicht hier und wird auch mit Eintrag nie verlinkt (AMAZON_HOST).
+AFFILIATE = {
+    "galaxus": {"label": "Galaxus / Digitec", "hosts": ("www.galaxus.ch", "www.digitec.ch", "www.galaxus.de", "www.galaxus.at",
+                                                       "www.galaxus.fr", "www.galaxus.it"),
+                "template": "https://clk.tradedoubler.com/click?p={program}&a={id}&url={url}", "need": ("id", "program")},
+    "awin": {"label": "Awin-Shops", "hosts": ("www.notebooksbilliger.de", "www.reichelt.de"),
+             "template": "https://www.awin1.com/cread.php?awinmid={mid}&awinaffid={id}&ued={url}", "need": ("id", "mid")},
+}
+AMAZON_HOST = re.compile(r"(?i)(^|\.)(amazon\.[a-z.]+|amzn\.[a-z]+|a\.co)$")
+
+
+def affiliate_ids():
+    try:
+        with open(os.path.join(CONFIG, "affiliate.json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def affiliate_url(link, resolve=None):
+    """Werbelink zu [link] oder "": nur für https-Links auf Shops mit eingetragener Kennung, nie für Amazon, nur öffentliche Ziele."""
+    from urllib.parse import quote, urlparse
+    try:
+        host = (urlparse(link or "").hostname or "").lower()
+    except ValueError:
+        return ""
+    if not host or AMAZON_HOST.search(host):
+        return ""
+    ids = affiliate_ids()
+    if not ids:
+        return ""                      # ohne Partnerprogramm nichts tun (auch keine DNS-Abfrage)
+    for key, prog in AFFILIATE.items():
+        cfg = ids.get(key)
+        if host not in prog["hosts"] or not isinstance(cfg, dict):
+            continue
+        vals = {k: str(cfg.get(k) or "").strip() for k in prog["need"]}
+        if not all(vals.values()) or not all(re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", v) for v in vals.values()):
+            continue
+        if not public_https_url(link, resolve):
+            return ""
+        return prog["template"].format(url=quote(link, safe=""), **{k: quote(v, safe="") for k, v in vals.items()})
+    return ""
+
+
+def with_ad(offer, resolve=None):
+    """Angebot um «ad_link» ergänzen (nur wenn es einen Werbelink gibt); der normale «link» bleibt unverändert."""
+    if isinstance(offer, dict):
+        ad = affiliate_url(offer.get("link", ""), resolve)
+        if ad:
+            return dict(offer, ad_link=ad)
+    return offer
+
+
+def ads_available():
+    """Gibt es überhaupt ein Partnerprogramm mit Kennung? Dann zeigt die App den Schalter «Werbelinks zeigen»."""
+    ids = affiliate_ids()
+    return any(isinstance(ids.get(k), dict) and all(str(ids[k].get(n) or "").strip() for n in p["need"]) for k, p in AFFILIATE.items())
 
 
 # ---------------------------------------------------------------- Plattenmodelle (ab 1.12.0)
@@ -3248,7 +3465,8 @@ def _search(sources, t, fetch, lang, pages, robots, pause, query=None, keep=None
 
 
 def _best(src, offer, extra=None):
-    best = dict(offer, chf=offer["price"], currency=src["currency"], t=int(time.time()), **(extra or {}))
+    best = dict(offer, chf=offer["price"], currency=src["currency"], t=int(time.time()), source_id=src["id"],
+                source=src["label"], **(extra or {}))
     if src["id"] == "diskprices":
         best["shop"] = "Amazon." + _amazon_tld(src["locale"])
     return best
@@ -3284,6 +3502,9 @@ def fetch_own_prices(country, fetch=http_get, pause=None, today=None):
     """Einmal alle Platten für dieses Land holen und in CONFIG/prices-<Land>.json schreiben (Verlauf 400 Tage)."""
     pause = PRICE_PAUSE if pause is None else pause
     sources = price_sources(country)
+    if not source_allowed(sources[0]["id"]):
+        return None            # Quelle abgeschaltet: kein Abruf, die App zeigt nur den Suchlink (price_summary)
+    sources = [x for x in sources if source_allowed(x["id"])]
     lang = {"CH": "de-CH,de", "DE": "de-DE,de", "AT": "de-AT,de"}.get(country, "en")
     path = own_prices_path(country)
     try:
@@ -3472,12 +3693,25 @@ def price_summary(today=None):
         if tool is not None and country == "CH" and tool_prices_fresh() is None:
             tool = None   # alt: der Agent holt selbst
     countries = [{"code": c, "label": l, "source": s} for c, l, s in PRICE_COUNTRIES]
+    search_only = bool(country) and not source_allowed(price_source(country)["id"])
     base = {"country": country, "country_set": bool(country), "countries": countries, "catalog": PRICE_SERIES,
-            "watch": [{"series": w["series"], "tb": w["tb"]} for w in watch]}
+            "watch": [{"series": w["series"], "tb": w["tb"]} for w in watch],
+            "sources": [price_source_info(x) for x in (price_sources(country) if country else [])],
+            "ads_available": ads_available(), "search_only": search_only}
     if tool is not None and not isinstance(tool, dict):
+        tool = None
+    if tool is not None and not source_allowed("toppreise"):
         tool = None
     if tool is not None:
         d, src = tool, {"label": tool.get("source", "Toppreise.ch"), "currency": "CHF", "id": "toppreise"}
+    elif search_only:
+        # Quelle abgeschaltet: keine Zahlen, nur Platten im NAS und beobachtete Serien mit Suchlink
+        src = price_source(country)
+        qs = _own_view({}, local_disk_groups(), src)
+        for w in watch:
+            qs.setdefault(w["key"], {"label": w["label"], "tb": w["tb"], "history": [], "pending": True,
+                                     "search_url": price_search_url(src, w["tb"], w["kind"], w.get("q") if isinstance(w.get("q"), str) else None)})
+        d = {"queries": qs, "updated": 0}
     elif country:
         src = price_source(country)
         try:
@@ -3520,7 +3754,15 @@ def price_summary(today=None):
         avg30 = round(sum(p30) / len(p30), 2) if p30 else None
         thr = alerts.get(key)
         cheap, reason = False, ""
-        if best and thr and best["chf"] <= float(thr):
+        if search_only:
+            best, hist = None, []
+        # Quelle des Preises: beim Angebot (ab P1), sonst die Quelle der Datei. Amazon-Preise: keine «günstig»-Meldung.
+        sid = (best or {}).get("source_id") or src.get("id", "")
+        amazon = bool(PRICE_SOURCES.get(sid, {}).get("amazon")) or bool(
+            best and (str(best.get("shop", "")).startswith("Amazon.") or AMAZON_HOST.search(urlparse(str(best.get("link", ""))).hostname or "")))
+        if best and amazon:
+            pass
+        elif best and thr and best["chf"] <= float(thr):
             cheap, reason = True, f"unter deiner Grenze von {cur} {float(thr):.0f}"
         elif best and len(hist) >= 7 and low90 is not None and best["chf"] <= low90 and avg30 and best["chf"] < 0.97 * avg30:
             cheap, reason = True, "so günstig wie seit 90 Tagen nicht"
@@ -3533,12 +3775,16 @@ def price_summary(today=None):
                     "model": v.get("model") or "", "part": v.get("part") or "", "series": v.get("series") or "",
                     "warranty_years": v.get("warranty_years"), "match": match,
                     "match_label": {"exact": "exakt", "series": "gleiche Serie"}.get(match, ""),
-                    "alternative": alt, "alt_search_url": v.get("alt_search_url", ""),
-                    "best": best, "models_now": v.get("models_now", []), "offers": (v.get("offers") or [])[:3],
+                    "alternative": with_ad(alt), "alt_search_url": v.get("alt_search_url", ""),
+                    "best": with_ad(best), "models_now": v.get("models_now", []), "offers": [with_ad(o) for o in (v.get("offers") or [])[:3]],
+                    "source": (best or {}).get("source") or (src["label"] if best else ""),
+                    "source_id": sid, "fetched_at": int((best or {}).get("t") or d.get("updated") or 0) if best else 0,
+                    "search_only": search_only, "no_alert": amazon and bool(best),
                     "search_url": v.get("search_url", ""), "history": hist[-180:],
-                    "shops": (v.get("shops") or [])[:5], "intl": (v.get("intl") or [])[:14], "low90": low90, "high90": high90,
+                    "shops": [with_ad(x) for x in (v.get("shops") or [])[:5]],
+                    "intl": [with_ad(x) for x in (v.get("intl") or []) if source_allowed({"geizhals": "geizhals", "amazon": "diskprices"}.get(str(x.get("source", "")).lower(), "toppreise"))][:14], "low90": low90, "high90": high90,
                     "avg30": avg30, "threshold": thr, "cheap": cheap, "reason": reason, "error": err,
-                    "unreadable": unreadable, "browser_url": v.get("search_url", "") if unreadable or not best else "",
+                    "unreadable": unreadable and not search_only, "browser_url": v.get("search_url", "") if unreadable or not best else "",
                     "watch": key.startswith("w_"), "pending": bool(v.get("pending"))})
     return dict(base, available=True, updated=d.get("updated"), source=src["label"], currency=cur, sizes=out,
                 rates_date=(d.get("rates") or {}).get("date"))
@@ -3731,7 +3977,7 @@ class Today:
 
     def sources(self):
         return {"unraid": os.path.isdir(self.notify_dir), "downloads": self.sab_db() is not None,
-                "docker": os.path.isdir(self.docker_dir), "syslog": os.path.isfile(f"{self.log_dir}/syslog")}
+                "docker": os.path.isdir(self.docker_dir), "syslog": LOGS_ON and os.path.isfile(f"{self.log_dir}/syslog")}
 
     def notifications(self, since):
         out = []
@@ -3808,6 +4054,8 @@ class Today:
             return 0
 
     def syslog(self, since):
+        if not LOGS_ON:
+            return []                      # ab 1.18.0 (Audit M2): ohne NZBLAB_LOGS=1 keine Syslog-Inhalte, auch nicht in «Heute»
         path = f"{self.log_dir}/syslog"
         try:
             with open(path, "rb") as f:
@@ -3836,9 +4084,9 @@ class Today:
                 seen[key]["n"] += 1
                 seen[key]["t"] = t
                 continue
-            seen[key] = {"t": t, "kind": "syslog", "level": "warn", "title": f"Systemprotokoll: {src.split('[')[0]}",
-                         # ab 1.16.1: Geheimnisse (key=wert, Bearer, Cookie …) wie bei den Absturzberichten schwärzen
-                         "text": redact_secrets(msg[:LOG_LINE_MAX])[:300], "n": 1}
+            seen[key] = {"t": t, "kind": "syslog", "level": "warn", "title": redact_log(f"Systemprotokoll: {src.split('[')[0]}")[:80],
+                         # ab 1.18.0: wie /api/logs schwärzen (IP, MAC, Benutzer, E-Mail, Pfade, Geheimnisse)
+                         "text": redact_log(msg[:LOG_LINE_MAX])[:300], "n": 1}
         for e in seen.values():
             if e["n"] > 1:
                 e["text"] += f" ({e['n']}×)"
@@ -4676,7 +4924,17 @@ _REDACT = [
     (re.compile(r"(?i)(?<![0-9a-f:])[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5,}(?![0-9a-f:])"), "<mac>"),
     (re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"), "<ip>"),
     (re.compile(r"(?i)(?<![\w:.])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?:%\w+)?(?![\w:])"), None),      # IPv6, siehe _ipv6
-    (re.compile(r"(?i)\b(user(?:name)?|login|for user|invalid user|uid)([=: ]+)([^\s,;:'\"()\[\]]+)"), r"\1\2<user>"),
+    # Wörter nach «user»/«login», die kein Benutzername sind («login failed for user=bob»: «failed» bleibt stehen)
+    (re.compile(r"(?i)\b(user(?:name)?|login|for user|invalid user|illegal user|uid)([=: ]+)"
+                r"(?!(?:failed|failure|fail|error|errors|not|is|was|has|have|logged|authentication|auth|attempt|attempts|denied|ok|"
+                r"unknown|name|id|from|for|by|on|in|at|and|the|a)\b)([^\s,;:'\"()\[\]]+)"), r"\1\2<user>"),
+    # ab 1.18.0 (VM-Test M2): PAM-/sshd-Zeilen allgemein: «authentication failure for bob from …», «Failed password for bob from …»,
+    # «Accepted publickey for bob from …», «error: maximum authentication attempts exceeded for bob from …»
+    (re.compile(r"(?i)\b((?:authentication failure|failed|failure|accepted|invalid|illegal|refused|denied|error|session (?:opened|closed))\b"
+                r"[^\r\n]{0,80}?\bfor )(?!invalid user\b|illegal user\b|user\b)[^\s]+(?= from\b)"), r"\1<user>"),
+    # PAM: «logname=… ruser=… rhost=…» (leere Werte bleiben leer; eine schon geschwärzte IP bleibt «<ip>»)
+    (re.compile(r"(?i)\b(logname|ruser)(=)(?!<)[^\s]+"), r"\1\2<user>"),
+    (re.compile(r"(?i)\b(rhost)(=)(?!<)[^\s]+"), r"\1\2<host>"),
     (re.compile(r"(/(?:home|Users))/[^/\s]+"), r"\1/<user>"),
     (re.compile(r"(/mnt/(?:user|disk\d+|cache[^/\s]*|remotes|disks)/[^/\s]+)/[^\s'\"]+"), r"\1/…"),
     (re.compile(r"(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\d)(?=[A-Za-z0-9+/_-]*[A-Za-z])[A-Za-z0-9+/_-]{32,}={0,2}"), "<secret>"),
@@ -4823,6 +5081,8 @@ def agent_features(smart=None, backups=None, log_dir=None):
         pass
     if NET_ON:
         feats.append("net")
+    if LAN_ON:
+        feats.append("lan")
     if LOGS_ON and os.path.isdir(log_dir or LOG_DIR):
         feats.append("logs")
     feats.append("discover")                 # ab 1.16.0: /api/discover; «discover_keys» = liefert auch API-Keys
@@ -5426,15 +5686,16 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             if not tok:
                 return False                    # ohne geladenen Token nie «Bearer » mit leerem Token annehmen
             ip = self.client_address[0]
+            got = self.headers.get("Authorization", "").encode("utf-8", "replace")
+            if secrets.compare_digest(got, f"Bearer {tok}".encode()):
+                return True                     # ab 1.18.0 (Audit N5): der richtige Token wird nie gebremst (Proxy-/Gateway-Adresse)
             wait = limiter.blocked_for(ip)
             if wait:
                 self._limited = wait            # ab 1.15.0: zu viele falsche Tokens von dieser Adresse → 429
                 return False
-            got = self.headers.get("Authorization", "").encode("utf-8", "replace")
-            ok = secrets.compare_digest(got, f"Bearer {tok}".encode())
-            if not ok and got:
+            if got:
                 limiter.fail(ip)
-            return ok
+            return False
 
         def refuse(self):
             """401 bei falschem Token; 503 mit genauem Grund, wenn der Agent selbst keinen Token laden konnte (ab 1.13.0);
@@ -5587,6 +5848,10 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                         "host_sys": HOST_SYS == "/host/sys", "host_proc": HOST_PROC == "/host/proc",
                                         "files": index.available() if index else False,
                                         "push": bool(ntfy_url()), "lan": lan.available() if lan else False,
+                                        # ab 1.18.0: ntfy nur Kritisches (false) oder auch Info-Meldungen (NZBLAB_NTFY_ALL=1)
+                                        "ntfy_all": NTFY_ALL,
+                                        # ab 1.18.0: Heimnetz-Suche bewusst ein/aus (NZBLAB_LAN, Standard aus); die App zeigt «LAN-Scan aus»
+                                        "lan_enabled": LAN_ON,
                                         "array": array.read() is not None if array else False,
                                         # ab 1.13.0: bleibt /config beim Neuerstellen erhalten? Sonst Warnung mit Lösung
                                         "config_persistent": CONFIG_STATE.get("persistent") is not False,
@@ -5595,7 +5860,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                         "host_os": os.path.isfile(HOST_OS_RELEASE),
                                         "host_fs": sorted(n for n in (os.listdir(HOST_FS) if os.path.isdir(HOST_FS) else [])
                                                           if os.path.isdir(os.path.join(HOST_FS, n)))[:50],
-                                        "warnings": config_warnings(),
+                                        "warnings": config_warnings() + privilege_warnings(),
                                         # ab 1.15.0: Stand der Schnittstelle für die App (vergleicht mit ihrem Minimum; der Agent
                                         # aktualisiert sich nie selbst), was eingeschaltet ist, letzter Neustart
                                         "api_level": API_LEVEL, "features": agent_features(smart, backups, log_dir),
@@ -5605,7 +5870,8 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             if u.path == "/api/array" and array:
                 return self.reply(200, array.read() or {"state": "", "disks": []})
             if u.path == "/api/devices" and lan:
-                return self.reply(200, {"available": lan.available(), "reason": lan.reason(), "scanning": lan.running, "devices": lan.devices()})
+                return self.reply(200, {"available": lan.available(), "reason": lan.reason(), "enabled": LAN_ON,
+                                        "scanning": lan.running, "devices": lan.devices() if LAN_ON else []})
             if u.path == "/api/speedtest":
                 # Netzwerkkarte auch ohne Messung, damit die App sie gleich zeigt
                 return self.reply(200, dict(LAST_SPEED, nic=nic_info()) if LAST_SPEED else {"nic": nic_info()})
@@ -5768,6 +6034,8 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             if u.path == "/api/devices/scan" and lan:
                 if lan.running or lan._scan_guard.locked():
                     return self.reply(202, {"started": False, "running": True})
+                if not LAN_ON:
+                    return self.reply(202, {"started": False, "running": False, "enabled": False, "reason": "off"})
                 threading.Thread(target=lan.scan, daemon=True).start()
                 return self.reply(202, {"started": True})
             if u.path == "/api/files/refresh" and index:
@@ -5803,15 +6071,18 @@ def main():
     sampler = Sampler()
     global EVENT_SINK
     EVENT_SINK = store.add_event
-    array = ArrayWatch(alerter("array", "err"))
-    watcher = Watcher(store, alerter("heat", "err"), array)
+    array = ArrayWatch(alerter("array", "err", critical=True))
+    watcher = Watcher(store, alerter("heat", "err", critical=True), array)
     stop = threading.Event()
     threading.Thread(target=run_sampler, args=(store, sampler, watcher, stop), daemon=True).start()
     index = FileIndex(f"{CONFIG}/files.db")
     threading.Thread(target=run_indexer, args=(index, stop), daemon=True).start()
     lan = LanScan(f"{CONFIG}/devices.db", alerter("lan", "warn"))
     threading.Thread(target=run_prices, args=(stop, alerter("prices", "info")), daemon=True).start()
-    threading.Thread(target=run_lan, args=(lan, stop), daemon=True).start()
+    if LAN_ON:
+        threading.Thread(target=run_lan, args=(lan, stop), daemon=True).start()
+    else:
+        print("Heimnetz-Suche aus (NZBLAB_LAN=1 schaltet sie ein: alle 30 Min ein leeres UDP-Paket an jede Adresse des /24-Netzes).", flush=True)
     smart = SmartMonitor(store, smart_helper)
     backups = BackupScanner()
     threading.Thread(target=run_extras, args=(store, stop, smart), daemon=True).start()

@@ -22,6 +22,7 @@ services:
       PGID: "100"             # Gruppe (Unraid 100 = users); TrueNAS 568, Synology 0, Linux 65534
       # NZBLAB_AGENT_TOKEN: ""        # besser leer lassen (Agent erzeugt selbst einen); eigener: mindestens 32 zufällige Zeichen, sonst Fehler
       # NTFY_URL: "https://ntfy.sh/ein-langes-geheimes-wort"
+      # NZBLAB_NTFY_ALL: "1"   # ab 1.18.0: ntfy auch für Info-Meldungen (günstige Platten, neue Geräte, «wieder normal»). Standard 0 = nur Kritisches (Platte/Array/Hitze)
       # NZBLAB_BIND: "0.0.0.0"        # nur auf dieser Adresse lauschen, z. B. die LAN-Adresse des NAS
       # NZBLAB_NET: "0"               # Netz-/Latenz-Messung aus (Standard an: TCP-Aufbau zu Router und 1.1.1.1:443, jede Minute)
       # NZBLAB_NET_TARGET: "1.1.1.1:443"
@@ -41,6 +42,9 @@ services:
       # NZBLAB_SMART: "1"
       # --- L (Log-Auszüge, freiwillig): siehe Block L unten
       # NZBLAB_LOGS: "1"
+      # --- N (Heimnetz-Suche, freiwillig, ab 1.18.0 Standard AUS): alle 30 Min ein leeres UDP-Paket an jede Adresse des /24-Netzes,
+      #     ARP-Tabelle lesen, Namen neuer Geräte per Reverse-DNS, Push bei neuen Geräten. Router/IDS können das als Port-Scan melden.
+      # NZBLAB_LAN: "1"
       # --- B2 (Backups, freiwillig): Pfade im Container, durch Komma getrennt; Suche unter den Freigaben: NZBLAB_BACKUP_AUTO
       # NZBLAB_BACKUP_PATHS: "/host/backup/restic,/host/backup/rsync-backup.log"
       # NZBLAB_BACKUP_AUTO: "1"
@@ -59,7 +63,7 @@ services:
       # - /mnt/tank:/host/mnt/user:ro
       # --- D Synology: /mnt/user-Zeile ersetzen durch:
       # - /volume1:/host/mnt/user:ro
-      # --- L Log-Auszüge und «Heute» (freiwillig, mit NZBLAB_LOGS=1): nur Textdateien (syslog, messages, kern.log)
+      # --- L Log-Auszüge und «Heute» (freiwillig, nur mit NZBLAB_LOGS=1, sonst bleibt der Ordner ungenutzt): nur Textdateien (syslog, messages, kern.log)
       # - /var/log:/host/log:ro
       # --- B2 Backups (freiwillig): Repository-Ordner oder Log-Dateien nur lesend einbinden
       # - /mnt/backup/restic:/host/backup/restic:ro
