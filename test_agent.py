@@ -129,7 +129,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.19.1")
+        self.assertEqual(info["version"], "1.19.2")
         srv.shutdown()
 
 
