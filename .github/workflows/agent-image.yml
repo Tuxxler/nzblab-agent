@@ -95,7 +95,10 @@ jobs:
           # Bei einem Fehler die letzten Logzeilen zeigen, nie die Token-Zeile
           trap 'docker logs agent-smoke 2>&1 | grep -v "Token:" | tail -n 30 || true' ERR
           # Dieselben Rechte wie in docker-compose.yml und der Unraid-Vorlage (ab 1.16.1)
-          docker run -d --name agent-smoke -p 18099:8099 --read-only --tmpfs /tmp \
+          # Zufälliger Test-Token nur für diesen Lauf (ab 1.19.0 nennt /api/ping die Version nur noch mit Token)
+          tok=$(openssl rand -hex 24)
+          echo "::add-mask::${tok}"
+          docker run -d --name agent-smoke -p 18099:8099 --read-only --tmpfs /tmp -e NZBLAB_AGENT_TOKEN="${tok}" \
             --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETUID --cap-add SETGID \
             --security-opt no-new-privileges:true nzblab-agent:smoke
           for i in $(seq 1 30); do
@@ -105,7 +108,10 @@ jobs:
           # Antworten erst in Variablen lesen: «curl | grep -q» kann mit pipefail an SIGPIPE scheitern.
           # GET mit -D statt «curl -I»: der Agent kennt kein HEAD (501).
           ping=$(curl -fsS http://127.0.0.1:18099/api/ping)
-          grep -q "\"version\": \"${WANT_VERSION}\"" <<<"${ping}"
+          grep -q '"ok": true' <<<"${ping}"
+          if grep -q '"version"' <<<"${ping}"; then echo "::error::/api/ping nennt die Version ohne Token"; exit 1; fi
+          info=$(curl -fsS -H "Authorization: Bearer ${tok}" http://127.0.0.1:18099/api/info)
+          grep -q "\"version\": \"${WANT_VERSION}\"" <<<"${info}"
           # Sicherheits-Kopfzeilen und CSP ohne 'unsafe-inline' für Skripte
           api_headers=$(curl -fsS -D - -o /dev/null http://127.0.0.1:18099/api/ping)
           grep -qi '^cache-control: no-store' <<<"${api_headers}"
