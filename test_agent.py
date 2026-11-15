@@ -13,6 +13,8 @@ import nzblab_agent as a
 import unittest.mock
 from unittest.mock import patch
 
+a.KEYS_REQUIRE_TLS = False      # die alten Tests sprechen Klartext; die TLS-Tests von 1.20.0 schalten es mit patch.object wieder an
+
 
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -129,7 +131,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.19.2")
+        self.assertEqual(info["version"], "1.20.0")
         srv.shutdown()
 
 
@@ -2073,7 +2075,7 @@ class Agent115Test(unittest.TestCase):
             code, info, _ = srv.get("/api/info")
             for k in ("api_level", "features", "last_boot", "boots_7d", "sampling_ok"):
                 self.assertIn(k, info)
-            self.assertEqual(info["api_level"], 16)
+            self.assertEqual(info["api_level"], 17)
             self.assertIn("boots", info["features"])
             self.assertNotIn("smart", info["features"])
             self.assertNotIn("logs", info["features"])
@@ -2703,7 +2705,7 @@ class DiscoverTest(unittest.TestCase):
                 code, info, _ = srv.get("/api/info")
                 self.assertIn("discover", info["features"])
                 self.assertIn("discover_keys", info["features"])
-                self.assertEqual(info["api_level"], 16)
+                self.assertEqual(info["api_level"], 17)
                 with patch.object(a, "DISCOVER_KEYS", False):
                     code, info, _ = srv.get("/api/info")
                 self.assertIn("discover", info["features"])
@@ -3884,6 +3886,391 @@ class Agent119Test(unittest.TestCase):
         self.assertTrue(a.Sampler.stacked_member(stub, "eth1"))
         import shutil
         shutil.rmtree(d, ignore_errors=True)
+
+
+class Agent120Test(unittest.TestCase):
+    """1.20.0: HTTPS mit eigenem Zertifikat, Schlüssel nur über TLS und im Fenster, Token erneuern, NZBLAB_HTTP=0."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        import ssl
+        if not shutil.which("openssl"):
+            raise unittest.SkipTest("openssl fehlt")
+        cls.ssl = ssl
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp()
+        self.patches = [patch.object(a, "CONFIG", self.cfg), patch.object(a, "KEYS_REQUIRE_TLS", True),
+                        patch.object(a, "KEYS", a.KeysWindow()), patch.object(a, "TOKEN_STATE", {"error": "", "source": "file", "code": ""}),
+                        patch.object(a, "TLS_STATE", {"enabled": False, "fingerprint": "", "source": "", "error": ""})]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in reversed(self.patches)])
+        self.servers = []
+        self.addCleanup(lambda: [(s.shutdown(), s.server_close()) for s in self.servers])
+
+    def start(self, http=True, tok="geheim" * 6, root=None, **kw):
+        ctx = a.setup_tls()
+        self.assertIsNotNone(ctx)
+        disc = a.Discover(roots=[root] if root else [])
+        srv = a.make_server("127.0.0.1", 0, a.make_handler(a.Store(":memory:"), lambda: {}, tok, discover=disc, **kw), tls=ctx, http=http)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.servers.append(srv)
+        return srv.server_port
+
+    def call(self, port, path, scheme="https", method="POST", tok="geheim" * 6, headers=None):
+        h = dict(headers or {})
+        if tok:
+            h["Authorization"] = f"Bearer {tok}"
+        req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}{path}", headers=h, method=method, data=b"" if method == "POST" else None)
+        ctx = self.ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, self.ssl.CERT_NONE
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=ctx if scheme == "https" else None) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def fixture_root(self):
+        root = tempfile.mkdtemp()
+        write(f"{root}/binhex-sonarr/config.xml", "<Config><Port>8989</Port><ApiKey>0000sonarrfixture000000000000aaa</ApiKey></Config>")
+        return root
+
+    # --- Zertifikat
+    def test_zertifikat_erzeugt_und_wiederverwendet(self):
+        with patch.dict(os.environ, {"NZBLAB_TLS_SAN": "nas.example,192.0.2.7"}):
+            ctx = a.setup_tls()
+        self.assertIsNotNone(ctx)
+        fp1 = a.TLS_STATE["fingerprint"]
+        self.assertRegex(fp1, r"^([0-9A-F]{2}:){31}[0-9A-F]{2}$")
+        self.assertEqual(a.TLS_STATE["source"], "auto")
+        key = f"{self.cfg}/tls/agent-key.pem"
+        self.assertEqual(os.stat(key).st_mode & 0o777, 0o600)
+        txt = a._openssl(["x509", "-in", f"{self.cfg}/tls/agent-cert.pem", "-noout", "-text"]).stdout.decode()
+        for want in ("DNS:localhost", "DNS:nas.example", "IP Address:192.0.2.7", "IP Address:127.0.0.1", "prime256v1"):
+            self.assertIn(want, txt)
+        a.setup_tls()                                           # zweiter Start: dasselbe Zertifikat
+        self.assertEqual(a.TLS_STATE["fingerprint"], fp1)
+        self.assertEqual(fp1, a.cert_fingerprint(f"{self.cfg}/tls/agent-cert.pem"))
+
+    def test_eigenes_zertifikat_wird_genommen(self):
+        os.makedirs(f"{self.cfg}/tls")
+        r = a._openssl(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "5", "-subj", "/CN=eigen",
+                        "-keyout", f"{self.cfg}/tls/key.pem", "-out", f"{self.cfg}/tls/cert.pem"])
+        self.assertEqual(r.returncode, 0)
+        self.assertIsNotNone(a.setup_tls())
+        self.assertEqual(a.TLS_STATE["source"], "user")
+        self.assertFalse(os.path.exists(f"{self.cfg}/tls/agent-cert.pem"))     # nichts Eigenes erzeugt
+        self.assertEqual(a.TLS_STATE["fingerprint"], a.cert_fingerprint(f"{self.cfg}/tls/cert.pem"))
+
+    def test_ohne_openssl_kein_tls_aber_kein_absturz(self):
+        with patch.object(a, "_openssl", side_effect=FileNotFoundError("openssl")):
+            self.assertIsNone(a.setup_tls())
+        self.assertFalse(a.TLS_STATE["enabled"])
+        self.assertIn("openssl", a.TLS_STATE["error"])
+
+    def test_tls_endpunkt_und_health(self):
+        port = self.start()
+        for scheme in ("https", "http"):
+            code, body = self.call(port, "/api/tls", scheme, "GET", tok=None)
+            self.assertEqual((code, body["tls"], body["fingerprint"], body["http"]), (200, True, a.TLS_STATE["fingerprint"], True))
+            self.assertEqual(body["secure"], scheme == "https")
+        code, body = self.call(port, "/api/health", "https", "GET", tok=None)
+        self.assertEqual((code, body["fingerprint"]), (200, a.TLS_STATE["fingerprint"]))
+        code, body = self.call(port, "/api/tls", "https", "GET", tok=None, headers={"Host": "boese.example"})
+        self.assertEqual(code, 403)                                            # DNS-Rebinding-Schutz wie bei /api/health
+
+    def test_hello_tls_beweis_bindet_ausgeliefertes_zertifikat(self):
+        import hashlib, hmac, socket
+        tok = "geheim" * 6
+        port = self.start(tok=tok)
+        nonce = "0123456789abcdef" * 2
+        ctx = self.ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, self.ssl.CERT_NONE
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw, ctx.wrap_socket(raw) as s:
+            der = s.getpeercert(binary_form=True)
+        seen = ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest())   # Fingerabdruck, den die App sieht
+        self.assertEqual(seen, a.TLS_STATE["fingerprint"])
+        code, body = self.call(port, "/api/hello?nonce=" + nonce, "https", "GET", tok=None)
+        want = hmac.new(tok.encode(), ("nzblab-tls:" + nonce + "|" + seen).encode(), hashlib.sha256).hexdigest()
+        self.assertEqual((code, body["tls_proof"]), (200, want))
+        self.assertNotEqual(body["tls_proof"], body["proof"])
+        code, body = self.call(port, "/api/hello?nonce=" + nonce, "http", "GET", tok=None)
+        self.assertEqual(code, 200)
+        self.assertNotIn("tls_proof", body)                                    # über Klartext nie (nichts zu binden)
+
+    # --- Klartext an/aus
+    def test_http_aus_nur_noch_https(self):
+        port = self.start(http=False)
+        self.assertEqual(self.call(port, "/api/tls", "https", "GET", tok=None)[0], 200)
+        import socket
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            data = s.recv(500)
+        self.assertIn(b"403", data)
+        self.assertIn(b"HTTPS", data)
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=5)
+
+    def test_http_und_https_auf_demselben_port(self):
+        port = self.start()
+        self.assertEqual(self.call(port, "/api/health", "http", "GET", tok=None)[0], 200)
+        self.assertEqual(self.call(port, "/api/health", "https", "GET", tok=None)[0], 200)
+
+    def test_ohne_tls_http_pflicht(self):
+        with self.assertRaises(ValueError):
+            a.make_server("127.0.0.1", 0, a.make_handler(a.Store(":memory:"), lambda: {}, "x"), tls=None, http=False)
+
+    # --- Schlüssel
+    def test_keys_ueber_http_nie(self):
+        port = self.start(root=self.fixture_root())
+        for q in ("/api/discover?keys=1", "/api/discover"):
+            code, body = self.call(port, q, "http", "GET")
+            self.assertEqual((code, body["error"]), (403, "keys_need_tls"))
+            self.assertNotIn("0000sonarr", json.dumps(body))
+        code, body = self.call(port, "/api/discover?keys=0", "http", "GET")        # ohne Schlüssel bleibt offen
+        self.assertEqual(code, 200)
+        self.assertNotIn("0000sonarr", json.dumps(body))
+
+    def test_keys_im_fenster_und_danach_gesperrt(self):
+        now = [1000.0]
+        a.KEYS.clock = lambda: now[0]
+        a.KEYS.restart()
+        port = self.start(root=self.fixture_root())
+        code, body = self.call(port, "/api/discover?keys=1", "https", "GET")
+        self.assertEqual(code, 200)
+        self.assertIn("0000sonarrfixture000000000000aaa", json.dumps(body))
+        now[0] += 29 * 60
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 200)
+        now[0] += 2 * 60
+        code, body = self.call(port, "/api/discover?keys=1", "https", "GET")
+        self.assertEqual((code, body["error"]), (403, "keys_locked"))
+        self.assertIn("neu starten", body["hint"])
+        self.assertIn("keys-unlock", body["hint"])
+        self.assertNotIn("0000sonarr", json.dumps(body))
+        self.assertEqual(self.call(port, "/api/discover?keys=0", "https", "GET")[0], 200)
+        code, body = self.call(port, "/api/keys/status", "https", "GET")
+        self.assertEqual((code, body["open"], body["mode"]), (200, False, "window"))
+
+    def test_token_allein_entsperrt_nicht_datei_schon(self):
+        now = [1000.0]
+        a.KEYS.clock = lambda: now[0]
+        a.KEYS.restart()
+        port = self.start(root=self.fixture_root())
+        now[0] += 31 * 60
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 403)
+        self.assertEqual(self.call(port, "/api/keys/unlock", "https", "POST")[0], 404)     # es gibt keinen Entsperr-Aufruf
+        self.assertEqual(self.call(port, "/api/discover?keys=1&unlock=1", "https", "GET")[0], 403)
+        write(f"{self.cfg}/keys-unlock", "")
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 200)
+        self.assertFalse(os.path.exists(f"{self.cfg}/keys-unlock"))                        # Datei wurde gelöscht
+        now[0] += 9 * 60
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 200)
+        now[0] += 2 * 60                                                                   # 10 Minuten um
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 403)
+
+    def test_unlock_datei_als_ordner_oder_link_zaehlt_nicht(self):
+        now = [1000.0]
+        a.KEYS.clock = lambda: now[0]
+        a.KEYS.restart()
+        now[0] += 31 * 60
+        os.mkdir(f"{self.cfg}/keys-unlock")
+        self.assertEqual(a.KEYS.seconds_left(), 0)
+
+    def test_discover_keys_modi(self):
+        now = [1000.0]
+        a.KEYS.clock = lambda: now[0]
+        a.KEYS.restart()
+        now[0] += 31 * 60
+        root = self.fixture_root()
+        with patch.object(a, "KEYS_ALWAYS", True):
+            port = self.start(root=root)
+            code, body = self.call(port, "/api/discover?keys=1", "https", "GET")
+            self.assertEqual(code, 200)                                                    # always = ohne Fenster
+            self.assertEqual(self.call(port, "/api/discover?keys=1", "http", "GET")[0], 403)   # aber nie über HTTP
+        with patch.object(a, "DISCOVER_KEYS", False):
+            code, body = self.call(port, "/api/discover?keys=1", "https", "GET")
+            self.assertEqual((code, body["keys"]), (200, False))
+
+    # --- Token erneuern
+    def test_token_erneuern(self):
+        write(f"{self.cfg}/token.txt", "geheim" * 6)
+        port = self.start()
+        old = "geheim" * 6
+        code, body = self.call(port, "/api/token/rotate", tok=old)
+        self.assertEqual(code, 200)
+        new = body["token"]
+        self.assertGreaterEqual(len(new), 43)
+        self.assertNotEqual(new, old)
+        with open(f"{self.cfg}/token.txt") as f:
+            self.assertEqual(f.read(), new)
+        self.assertEqual(os.stat(f"{self.cfg}/token.txt").st_mode & 0o777, 0o600)
+        self.assertEqual(self.call(port, "/api/info", method="GET", tok=old)[0], 401)       # alter Token sofort ungültig
+        self.assertEqual(self.call(port, "/api/info", method="GET", tok=new)[0], 200)
+        self.assertEqual(self.call(port, "/api/token/rotate", tok=old)[0], 401)
+
+    def test_token_erneuern_nur_ueber_tls_und_mit_token(self):
+        port = self.start()
+        self.assertEqual(self.call(port, "/api/token/rotate", "http")[0], 403)
+        self.assertEqual(self.call(port, "/api/token/rotate", "https", tok=None)[0], 401)
+        self.assertEqual(self.call(port, "/api/token/rotate", "https", tok="falsch")[0], 401)
+        self.assertFalse(os.path.exists(f"{self.cfg}/token.txt"))
+
+    def test_token_aus_variable_gibt_409(self):
+        a.TOKEN_STATE["source"] = "env"
+        port = self.start()
+        code, body = self.call(port, "/api/token/rotate")
+        self.assertEqual((code, body["error"]), (409, "token_fixed"))
+        self.assertIn("fest eingetragen", body["hint"])
+        self.assertEqual(self.call(port, "/api/info", method="GET")[0], 200)                 # Token unverändert
+
+    def test_token_erneuern_bremse_und_schreibfehler(self):
+        write(f"{self.cfg}/token.txt", "geheim" * 6)
+        port = self.start()
+        with patch.object(a, "write_new_token", side_effect=OSError("ro")):
+            code, body = self.call(port, "/api/token/rotate")
+            self.assertEqual((code, body["error"]), (500, "token_write_failed"))
+        self.assertEqual(self.call(port, "/api/info", method="GET")[0], 200)                 # alter Token gilt weiter
+        codes = [self.call(port, "/api/token/rotate", tok=None)[0] for _ in range(3)]
+        self.assertEqual(codes, [401, 401, 401])
+        with patch.object(a, "write_new_token", return_value="x" * 43):
+            codes = [self.call(port, "/api/token/rotate", tok=("x" * 43 if i else "geheim" * 6))[0] for i in range(7)]
+        self.assertIn(429, codes)                                                           # höchstens 5 pro Minute
+
+    # --- Audit-Fixes 1.20
+    def test_token_erneuern_nur_im_schluessel_fenster(self):
+        write(f"{self.cfg}/token.txt", "geheim" * 6)
+        now = [1000.0]
+        a.KEYS.clock = lambda: now[0]
+        a.KEYS.restart()
+        port = self.start()
+        now[0] += 31 * 60
+        code, body = self.call(port, "/api/token/rotate")
+        self.assertEqual((code, body["error"]), (403, "keys_locked"))
+        self.assertIn("keys-unlock", body["hint"])
+        self.assertEqual(self.call(port, "/api/info", method="GET")[0], 200)                 # Token unverändert
+        write(f"{self.cfg}/keys-unlock", "")
+        self.assertEqual(self.call(port, "/api/token/rotate")[0], 200)
+
+    def test_token_erneuern_wird_geloggt_ohne_token(self):
+        import io
+        from contextlib import redirect_stdout
+        write(f"{self.cfg}/token.txt", "geheim" * 6)
+        port = self.start()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code, body = self.call(port, "/api/token/rotate")
+        self.assertEqual(code, 200)
+        out = buf.getvalue()
+        self.assertIn("Token erneuert von 127.0.0.1", out)
+        self.assertNotIn(body["token"], out)
+        self.assertNotIn("geheim" * 6, out)
+
+    def test_schluessel_ausgabe_wird_geloggt(self):
+        import io
+        from contextlib import redirect_stdout
+        port = self.start(root=self.fixture_root())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 200)
+        self.assertIn("Dienst-Schlüssel ausgegeben an 127.0.0.1: 1 Dienste", buf.getvalue())
+        self.assertNotIn("0000sonarr", buf.getvalue())
+
+    def test_forwarded_proto_http_verbietet_schluessel_und_rotate(self):
+        write(f"{self.cfg}/token.txt", "geheim" * 6)
+        port = self.start(root=self.fixture_root())
+        for v in ("http", "HTTP", " Http "):
+            code, body = self.call(port, "/api/discover?keys=1", "https", "GET", headers={"X-Forwarded-Proto": v})
+            self.assertEqual((code, body["error"]), (403, "keys_need_tls"))
+            self.assertEqual(self.call(port, "/api/token/rotate", headers={"X-Forwarded-Proto": v})[0], 403)
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET", headers={"X-Forwarded-Proto": "https"})[0], 200)
+        # nie zum Erlauben: über Klartext bleibt es verboten, auch mit «https»
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "http", "GET", headers={"X-Forwarded-Proto": "https"})[0], 403)
+
+    def test_klartext_antwort_laenge_stimmt_und_anfrage_wird_gelesen(self):
+        head, body = a.PLAIN_REFUSED.split(b"\r\n\r\n", 1)
+        self.assertIn(b"Content-Length: " + str(len(body)).encode(), head)
+        port = self.start(http=False)
+        import socket
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(b"POST /api/x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3000\r\n\r\n" + b"x" * 3000)
+            data = b""
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                data += c
+        self.assertTrue(data.startswith(b"HTTP/1.1 403"))
+        self.assertEqual(data.split(b"\r\n\r\n", 1)[1], body)
+
+    def test_tls_san_ueberspringt_zonen_und_link_lokal(self):
+        with patch.dict(os.environ, {"NZBLAB_TLS_SAN": "fe80::1%eth0,fe80::2,nas.example,192.0.2.7"}), \
+                patch.object(a, "_lan_ips", return_value=[]):
+            dns, ips = a.tls_names()
+        self.assertIn("nas.example", dns)
+        self.assertIn("192.0.2.7", ips)
+        self.assertFalse([x for x in ips + dns if x.startswith("fe80") or "%" in x])
+        with patch.dict(os.environ, {"NZBLAB_TLS_SAN": "fe80::1%eth0,fe80::2"}):
+            self.assertIsNotNone(a.setup_tls())                                              # HTTPS bleibt an
+        self.assertTrue(a.TLS_STATE["enabled"])
+
+    def test_kaputtes_eigenes_zertifikat_faellt_auf_automatisches_zurueck(self):
+        os.makedirs(f"{self.cfg}/tls")
+        write(f"{self.cfg}/tls/cert.pem", "kein zertifikat")
+        write(f"{self.cfg}/tls/key.pem", "kein schluessel")
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ctx = a.setup_tls()
+        self.assertIsNotNone(ctx)
+        self.assertEqual(a.TLS_STATE["source"], "auto")
+        self.assertIn("WARNUNG", buf.getvalue())
+        self.assertTrue(os.path.exists(f"{self.cfg}/tls/agent-cert.pem"))
+
+    def test_tls_aus_warnt_laut(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with patch.object(a, "_openssl", side_effect=FileNotFoundError("openssl")), redirect_stdout(buf):
+            self.assertIsNone(a.setup_tls())
+        self.assertIn("TLS ist AUS", buf.getvalue())
+
+    def test_token_temp_datei_blockiert_eigentum_nicht(self):
+        self.assertTrue(a.OWN_CONFIG_ENTRY.fullmatch("token.txt.new"))
+        self.assertTrue(a.OWN_CONFIG_ENTRY.fullmatch("token.txt"))
+        self.assertFalse(a.OWN_CONFIG_ENTRY.fullmatch("token.txt.bak"))
+
+    def test_healthcheck_ignoriert_proxy_und_nimmt_2_sekunden(self):
+        port = self.start()
+        seen = []
+        orig = urllib.request.build_opener
+
+        def spy(*h):
+            op = orig(*h)
+            real = op.open
+            op.open = lambda url, timeout=None, **k: (seen.append(timeout), real(url, timeout=timeout, **k))[1]
+            return op
+        with patch.dict(os.environ, {"https_proxy": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}), \
+                patch.object(urllib.request, "build_opener", spy), patch.object(a, "PORT", port), patch.object(a, "BIND", "127.0.0.1"):
+            self.assertEqual(a.healthcheck(), 0)
+        self.assertEqual(seen[0], 2)
+
+    def test_info_zeigt_tls_und_fenster(self):
+        port = self.start()
+        code, body = self.call(port, "/api/info", "https", "GET")
+        self.assertEqual((body["tls"], body["fingerprint"], body["secure"], body["keys"]["mode"]), (True, a.TLS_STATE["fingerprint"], True, "window"))
+        self.assertTrue(body["keys"]["open"])
+        self.assertTrue({"tls", "token_rotate", "keys_window"} <= set(body["features"]))
+        self.assertFalse(self.call(port, "/api/info", "http", "GET")[1]["secure"])
+
+    def test_healthcheck_befehl(self):
+        port = self.start()
+        with patch.object(a, "PORT", port), patch.object(a, "BIND", "127.0.0.1"):
+            self.assertEqual(a.healthcheck(), 0)
+        with patch.object(a, "PORT", 1), patch.object(a, "BIND", "127.0.0.1"):
+            self.assertEqual(a.healthcheck(), 1)
 
 
 if __name__ == "__main__":

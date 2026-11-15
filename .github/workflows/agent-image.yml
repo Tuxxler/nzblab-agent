@@ -124,6 +124,19 @@ jobs:
           # Agent läuft nach dem Start als PUID 99, nicht als root
           uid_line=$(docker exec agent-smoke sh -c 'grep "^Uid:" /proc/1/status')
           grep -qE '^Uid:\s+99\s' <<<"${uid_line}"
+          # ab 1.20.0: HTTPS auf demselben Port; Fingerabdruck aus /api/tls = Zertifikat, das der Port wirklich ausliefert
+          tls=$(curl -fsSk https://127.0.0.1:18099/api/tls)
+          grep -q '"tls": true' <<<"${tls}"
+          grep -q '"secure": true' <<<"${tls}"
+          want_fp=$(sed -n 's/.*"fingerprint": "\([0-9A-F:]*\)".*/\1/p' <<<"${tls}")
+          served_fp=$(openssl s_client -connect 127.0.0.1:18099 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 | sed 's/^.*=//')
+          if [[ -z "${want_fp}" || "${want_fp}" != "${served_fp}" ]]; then echo "::error::Fingerabdruck /api/tls passt nicht zum Zertifikat"; exit 1; fi
+          # Schlüssel und Token erneuern nie über Klartext
+          tok=$(docker exec agent-smoke cat /config/token.txt)
+          echo "::add-mask::${tok}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${tok}" http://127.0.0.1:18099/api/token/rotate)
+          unset tok
+          if [[ "${code}" != "403" ]]; then echo "::error::Token erneuern über HTTP gab ${code} statt 403"; exit 1; fi
           # Token-Banner vorhanden (Inhalt nie ausgeben)
           logs=$(docker logs agent-smoke 2>&1)
           grep -q "NZBLab-Agent Token:" <<<"${logs}"

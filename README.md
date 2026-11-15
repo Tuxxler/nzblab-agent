@@ -9,11 +9,12 @@
 **Install.** Image: `ghcr.io/tuxxler/nzblab-agent:latest` (amd64 and arm64). The image, container and folder names stay `nzblab-agent`.
 - Unraid: template `unraid/nzblab-agent.xml` (Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent`).
 - TrueNAS SCALE 24.10+: `compose/truenas.yml` (Install via YAML). Synology DSM 7.2+: `compose/synology.yml` (Container Manager project). Linux or any Docker host: `compose/linux.yml` or `docker-compose.yml`, then `docker compose up -d`.
-- Then enter `http://<NAS-IP>:8099` and the token in the app (Settings › Server connections › NASlab agent).
+- Then enter `https://<NAS-IP>:8099` and the token in the app (Settings › Server connections › NASlab agent). From 1.20.0 the same port speaks HTTPS (self-generated certificate) and, during a transition period, plain HTTP; the app (2.77+) checks the certificate itself with a token-bound proof; the SHA-256 fingerprint in the container log is there to compare if you like.
 
 **Security notes.**
 - Read-only: all host paths are mounted read-only; only `/config` is writable.
 - Token: a random token is created on first start (`/config/token.txt`, mode 600) and printed to the container log exactly once. All endpoints except ping/health/hello need `Authorization: Bearer <token>`. Wrong tokens are rate-limited.
+- HTTPS (from 1.20.0): on first start the agent creates its own certificate in `/config/tls` (EC P-256, 10 years) and logs its SHA-256 fingerprint. Own certificate: put `cert.pem` and `key.pem` into `/config/tls`. `NZBLAB_HTTP=0` switches plain HTTP off. Service API keys (`/api/discover?keys=1`) and token rotation (`POST /api/token/rotate`) are only served over HTTPS; keys only in a 30-minute window after start (or 10 minutes after creating an empty file `keys-unlock` in `/config`); a token alone never unlocks.
 - Port 8099 is for your home network or VPN only; never expose it to the internet.
 - Licence: GNU AGPL-3.0-only, see [`LICENSE`](LICENSE). Free to use, also commercially; if you distribute a modified version or offer it as a network service, you must publish your changes under the same licence.
 - Beta status: TrueNAS, Synology and Linux support is beta (tested with virtual machines and sample data, not on real hardware).
@@ -195,6 +196,9 @@ Bearer-Tokens, Cookie-Zeilen, Schlüssel und Passwörter, lange Zufallsketten). 
 
 | Pfad | Inhalt |
 |---|---|
+| `GET /api/tls` | ohne Token (Host-Prüfung wie `/api/health`), ab 1.20.0: `{"tls", "fingerprint", "algorithm": "sha256", "source": "auto"/"user", "http", "secure"}`; den Fingerabdruck hat auch `/api/health` |
+| `GET /api/keys/status` | mit Token, ab 1.20.0: `{"mode": "window"/"always"/"off", "open", "seconds_left", "tls", …}`; entsperren geht nur auf dem NAS (siehe 1.20.0) |
+| `POST /api/token/rotate` | mit Token, nur über HTTPS, ab 1.20.0: neuer Token `{"ok": true, "token": "…"}`, der alte ist sofort ungültig; `409 token_fixed`, wenn der Token per `NZBLAB_AGENT_TOKEN` fest gesetzt ist |
 | `GET /api/ping` | lebt der Agent? Ab 1.13.0 dazu `config_persistent` (`false` = `/config` geht beim Update verloren), ab 1.15.0 `api_level` und `sampling_ok`, sonst nichts |
 | `GET /api/hello?nonce=<32 Hex-Zeichen>` | ohne Token, ab 1.11.0: Heimnetz-Prüfung der App, siehe unten |
 | `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung); ab 1.14.0 `host_os` (os-release eingebunden) und `host_fs` (Ordner unter `/host/fs`); ab 1.15.0 `api_level` (Zahl, 15), `features` (eingeschaltete Zusätze: `boots`, `disktemps`, `health`, `smart`, `backups`, `raid`, `net`, `logs`; ab 1.16.0 `discover` und `discover_keys`, `api_level` 16), `last_boot`, `boots_7d`, `sampling_ok` |
@@ -232,9 +236,11 @@ antwortet (ein fremdes WLAN kann denselben Adressbereich haben, z. B. 192.168.1.
 
 - `id`: feste Zufalls-Kennung, beim ersten Start in `settings.json` angelegt (keine Namen, keine Adressen)
 - `proof`: HMAC-SHA256 mit dem Token als Schlüssel über `nzblab-hello:<nonce>`, als Hex-Text
-- `version`
+- `tls_proof` (ab 1.20.0, nur über HTTPS): HMAC-SHA256 mit dem Token über `nzblab-tls:<nonce>|<Fingerabdruck>`, wobei der
+  Fingerabdruck der SHA-256 des ausgelieferten Zertifikats ist («AB:CD:…»). Die App rechnet mit dem Fingerabdruck, den sie
+  selbst in der TLS-Verbindung gesehen hat; stimmt der Wert, heftet sie das Zertifikat ohne Abtippen an.
 
-Die App rechnet denselben Wert mit ihrem gespeicherten Token nach und vergleicht in konstanter Zeit. Der Token selbst
+Ab 1.19.0 ohne `version`. Die App rechnet denselben Wert mit ihrem gespeicherten Token nach und vergleicht in konstanter Zeit. Der Token selbst
 verlässt weder App noch Agent. Andere Nonce als 32 Zeichen `0-9a-f`: 400. Fremder Name im `Host`-Header: 403 (wie bei den
 anderen Endpunkten ohne Token). Den Agent deshalb weiterhin nicht ins Internet freigeben.
 
@@ -404,6 +410,24 @@ license. Full text: [`LICENSE`](LICENSE).
 ## Changelog (Deutsch)
 
 Funktionen und Korrekturen nach Agent-Version.
+
+### Ab 1.20.0: HTTPS, Schlüssel-Fenster, Token erneuern
+Grund (Gesamtprüfung 14.11.2026): Der Agent sprach nur HTTP. Wer im selben WLAN mithörte, las den Token und holte über `/api/discover?keys=1` alle Dienst-Schlüssel.
+
+- **HTTPS auf demselben Port (8099).** Das erste Byte einer Verbindung entscheidet (`0x16` = TLS-Handshake → HTTPS, sonst Klartext). Alte Apps (`http://…:8099`) laufen weiter, neue nehmen `https://…:8099`. Kein zweiter Port, keine zweite Freigabe in Docker, Unraid, Router.
+- **Eigenes Zertifikat.** Beim ersten Start erzeugt der Agent (mit `openssl`, im Image installiert) ein selbstsigniertes Zertifikat (EC P-256, 10 Jahre, SAN: Hostname, `localhost`, Loopback, gefundene LAN-Adressen und `NZBLAB_TLS_SAN`) nach `/config/tls/agent-cert.pem` und `agent-key.pem` (Rechte 600). Es wird wiederverwendet: der Fingerabdruck bleibt gleich, auch wenn sich die IP ändert. Neu erzeugt wird nur, wenn es in unter 30 Tagen abläuft. Im Bridge-Netz kennt der Container die LAN-Adresse des NAS nicht: sie in `NZBLAB_TLS_SAN` eintragen (nur nötig für Browser; die App prüft den Fingerabdruck).
+- **Eigenes Zertifikat verwenden:** `cert.pem` und `key.pem` (PEM, Schlüssel ohne Passwort) nach `/config/tls/` legen; der Agent nimmt sie und fasst sie nie an.
+- **Fingerabdruck (SHA-256)** steht beim Start im Log («NZBLab-Agent Fingerabdruck: AB:CD:…»), im Browser-Dashboard (Karte «Agent»), in `GET /api/tls` (ohne Token) und in `/api/health`, `/api/info`.
+- **`NZBLAB_HTTP`** (Standard `1` in 1.20: Klartext bleibt für alte Apps in der Übergangszeit). `0` = nur noch HTTPS; Klartext-Verbindungen bekommen eine kurze 403-Antwort. Ohne Zertifikat (z. B. `openssl` fehlt) startet der Agent dann nicht.
+- **Schlüssel-Ausgabe im Log.** Das Fenster öffnet sich nach jedem Neustart wieder; jede Ausgabe von Schlüsseln steht mit Absender-Adresse und Anzahl Dienste im Log (nie die Schlüssel).
+- **Hinter einem TLS-Proxy.** Meldet der Proxy `X-Forwarded-Proto: http` (Gross-/Kleinschreibung egal), gilt die Anfrage für Schlüssel und Token erneuern als unsicher (403). Der Kopf dient nur zum Verbieten, nie zum Erlauben.
+- **Zertifikat-Fallen.** `NZBLAB_TLS_SAN`-Einträge mit `%` (Zonen-Kennung) oder Link-lokale Adressen werden mit Warnung übersprungen. Lässt sich ein eigenes `cert.pem`/`key.pem` nicht laden, steht eine laute Warnung im Log und der Agent nimmt das selbst erzeugte Zertifikat. Ist TLS aus, steht eine Warnzeile im Log (`tls: false`).
+- **Empfehlung:** `NZBLAB_HTTP=0` (nur HTTPS), sobald alle Apps auf 2.77 oder neuer sind; Standard bleibt vorerst `1`. / Recommended: set `NZBLAB_HTTP=0` once all apps are on 2.77+; the default stays `1` for now.
+- **Schlüssel nie über HTTP.** `GET /api/discover` mit Schlüsseln (`keys=1`, auch ohne Angabe) antwortet über Klartext mit `403 {"error": "keys_need_tls"}`. `keys=0` (nur zählen) bleibt über beide Wege offen.
+- **Schlüssel-Fenster.** Schlüssel gibt es nur 30 Minuten nach dem Start des Agenten, danach `403 {"error": "keys_locked", "hint": "…"}`. Wieder öffnen (10 Minuten): Container neu starten (dann wieder 30 Minuten) **oder** auf dem NAS die leere Datei `keys-unlock` in `/config` anlegen (der Agent löscht sie beim nächsten Abruf). Ein Token allein entsperrt bewusst nie: sonst nützte die Sperre gegen einen gestohlenen Token nichts. `DISCOVER_KEYS=0` bleibt «nie», neu `DISCOVER_KEYS=always` = ohne Fenster (altes Verhalten, für Fortgeschrittene, weiterhin nur über HTTPS).
+- **Token erneuern:** `POST /api/token/rotate` (Token nötig, nur über HTTPS) erzeugt einen neuen Zufalls-Token (`secrets.token_urlsafe(32)`), schreibt ihn atomar nach `/config/token.txt` (Rechte 600) und antwortet damit; der alte Token ist sofort ungültig. Über HTTP `403 tls_required`. Zusätzlich nur bei offenem Schlüssel-Fenster (30 Min. nach dem Start oder 10 Min. nach der Datei `keys-unlock`), sonst `403 keys_locked` mit Hinweis: ein gestohlener Token kann den Besitzer so nicht aussperren. Jede Erneuerung (auch abgelehnte) steht mit der Absender-Adresse im Log, nie der Token. Ist der Token per `NZBLAB_AGENT_TOKEN` fest gesetzt: `409 token_fixed` («Token ist in der Vorlage fest eingetragen»). Höchstens 5 Aufrufe pro Minute und Absender; falsche Tokens zählen in der gewohnten Bremse.
+- Neu: `GET /api/keys/status` (mit Token), `features`: `tls`, `token_rotate`, `keys_window`; `api_level` 17; `/api/info` mit `tls`, `fingerprint`, `http`, `secure`, `keys`.
+- Gesundheitsprüfung des Images: `python3 nzblab_agent.py --healthcheck` (HTTPS, sonst HTTP).
 
 ### Ab 1.15.0: Neustarts, Plattentemperaturen, Netz, SMART, Backups, RAID, Logs
 

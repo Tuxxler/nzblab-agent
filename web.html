@@ -1188,7 +1188,11 @@ function renderSys() {
     ["Hitze-Alarm", "ab " + heatLimit() + " °C"],
     ["Host-Ordner", i.host_sys && i.host_proc ? "eingebunden" : "Werte aus dem Container", i.host_sys && i.host_proc ? "ok" : ""],
     ["Letzte Aktualisierung", S.last ? hms(S.last) : "–"],
-  ].map(([k, v, c]) => `<div class="kv"><span>${k}</span><span class="${c || ""}">${esc(v)}</span></div>`).join("") + "</div></div>";
+    // ab Agent 1.20.0: Verschlüsselung und Schlüssel-Fenster
+    ["Verschlüsselung", i.tls ? (i.secure ? "HTTPS (diese Seite)" : "HTTPS verfügbar") + (i.http ? ", Klartext noch an" : ", nur HTTPS") : "keine (HTTPS fehlt)", i.tls && i.secure ? "ok" : "warn"],
+    ["Dienst-Schlüssel", !i.keys ? "–" : i.keys.mode === "off" ? "gesperrt (DISCOVER_KEYS=0)" : i.keys.mode === "always" ? "immer offen" : i.keys.open ? "offen, noch " + Math.max(1, Math.round(i.keys.seconds_left / 60)) + " Min." : "gesperrt (Container neu starten oder Datei keys-unlock anlegen)", i.keys && i.keys.mode === "window" && !i.keys.open ? "ok" : ""],
+  ].map(([k, v, c]) => `<div class="kv"><span>${k}</span><span class="${c || ""}">${esc(v)}</span></div>`).join("") +
+    (i.tls && i.fingerprint ? `<div class="note" style="margin-top:8px">Fingerabdruck (SHA-256) des Zertifikats, in der App beim ersten Verbinden vergleichen:<br><code style="word-break:break-all;user-select:all">${esc(i.fingerprint)}</code></div>` : "") + "</div></div>";
   $("sys").innerHTML = html;
 }
 

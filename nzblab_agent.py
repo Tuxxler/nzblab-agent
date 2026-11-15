@@ -26,8 +26,10 @@ import re
 import secrets
 import socket
 import sqlite3
+import ssl
 import stat
 import subprocess
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -36,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.19.2"
+VERSION = "1.20.0"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -771,6 +773,15 @@ def hello_proof(tok, nonce):
     HMAC-SHA256 mit dem Token als Schlüssel über «nzblab-hello:» + Nonce der App, als Hex-Text.
     """
     return hmac.new(tok.encode("utf-8"), ("nzblab-hello:" + nonce).encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def hello_tls_proof(tok, nonce, fingerprint):
+    """
+    Ab 1.20.0: Kanalbindung für das Zertifikat. HMAC über «nzblab-tls:» + Nonce + «|» + Fingerabdruck des Zertifikats, das
+    dieser Agent ausliefert. Die App rechnet mit dem Fingerabdruck, den SIE in der TLS-Verbindung gesehen hat: stimmt der
+    Beweis, ist das Zertifikat das des echten Agenten (ein Mann in der Mitte hat ein anderes und kennt den Token nicht).
+    """
+    return hmac.new(tok.encode("utf-8"), ("nzblab-tls:" + nonce + "|" + fingerprint).encode("ascii"), hashlib.sha256).hexdigest()
 
 
 NTFY_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+/[A-Za-z0-9_-]{8,64}$")    # wie die Einstellung in der App (POST /api/config)
@@ -2127,8 +2138,8 @@ def announce_config(state=None):
 
 CONFIG_MARKER = ".nzblab-agent-config"
 # Ab 1.18.0: was der Agent in /config selbst anlegt; nur solche Einträge gelten als «eigener Ordner» (Markierung allein nicht)
-OWN_CONFIG_ENTRY = re.compile(r"token\.txt|settings\.json(\.tmp)?|affiliate\.json|prices-[A-Za-z0-9_-]+\.json|"
-                              r"(history|files|devices)\.db(-wal|-shm|-journal)?|crashes|" + re.escape(CONFIG_MARKER))
+OWN_CONFIG_ENTRY = re.compile(r"token\.txt(\.new)?|settings\.json(\.tmp)?|affiliate\.json|prices-[A-Za-z0-9_-]+\.json|"
+                              r"(history|files|devices)\.db(-wal|-shm|-journal)?|crashes|tls|keys-unlock|" + re.escape(CONFIG_MARKER))
 PRIV_STATE = {"root_reason": ""}      # ab 1.18.0: warum der Agent als root weiterläuft (leer = nicht root oder gewollt)
 
 
@@ -4201,7 +4212,7 @@ class Today:
 # ---------------------------------------------------------------- Ab 1.15.0: Neustarts, Plattentemperaturen, Netz, SMART,
 # Backups, RAID, Log-Auszüge. Alles nur lesen; was Geräte oder Logs braucht, ist freiwillig (Umgebungsvariable + Compose-Block).
 
-API_LEVEL = 16              # steigt mit jeder Agent-Version, die neue Endpunkte bringt; die App vergleicht mit ihrem Minimum
+API_LEVEL = 17              # steigt mit jeder Agent-Version, die neue Endpunkte bringt; die App vergleicht mit ihrem Minimum
 
 
 def _env_int(name, default, lo, hi):
@@ -4235,7 +4246,15 @@ DISKTEMP_EVERY = 300        # Plattentemperaturen alle 5 Minuten speichern
 # Ab 1.16.0: Dienste in appdata finden und ihre API-Keys auslesen (Standard an, aus mit DISCOVER_KEYS=0).
 # DISCOVER_ROOTS: Container-Pfade der appdata-Ordner, durch Komma getrennt; leer = <FILES_ROOT>/appdata (Unraid),
 # sonst <FILES_ROOT>/apps (TrueNAS) und <FILES_ROOT>/docker (Synology).
+# Ab 1.20.0: Schlüssel nur über TLS und nur im Einrichtungs-Fenster (KEYS_FIRST_S nach dem Start oder KEYS_REOPEN_S nach der Datei
+# /config/keys-unlock). DISCOVER_KEYS=always = ohne Fenster (altes Verhalten, nur noch über TLS), 0 = nie.
 DISCOVER_KEYS = _env_on("DISCOVER_KEYS", True)
+KEYS_ALWAYS = os.environ.get("DISCOVER_KEYS", "").strip().lower() == "always"
+KEYS_FIRST_S = 30 * 60
+KEYS_REOPEN_S = 10 * 60
+KEYS_REQUIRE_TLS = True     # Tests ohne TLS schalten das ab
+HTTP_ON = _env_on("NZBLAB_HTTP", True)     # ab 1.20.0: Klartext-HTTP auf demselben Port (Übergangszeit); 0 = nur HTTPS
+TLS_STATE = {"enabled": False, "fingerprint": "", "source": "", "error": ""}
 DISCOVER_ROOTS = [x.strip() for x in os.environ.get("DISCOVER_ROOTS", "").split(",") if x.strip()]
 SAMPLER_STATE = {"last": time.time()}   # letzte fertige Messung (Gesundheitsprüfung: hängt die Messschleife?)
 
@@ -5159,6 +5178,7 @@ def agent_features(smart=None, backups=None, log_dir=None):
         feats.append("lan")
     if LOGS_ON and os.path.isdir(log_dir or LOG_DIR):
         feats.append("logs")
+    feats.extend(["tls", "tls_bind", "token_rotate", "keys_window"])   # ab 1.20.0
     feats.append("discover")                 # ab 1.16.0: /api/discover; «discover_keys» = liefert auch API-Keys
     if DISCOVER_KEYS:
         feats.append("discover_keys")
@@ -5706,6 +5726,236 @@ def web_page(path=None):
         return _WEB["body"], _WEB["csp"]
 
 
+# ---------------------------------------------------------------- HTTPS, Schlüssel-Fenster, Token erneuern (ab 1.20.0)
+
+def cert_fingerprint(pem_path):
+    """SHA-256-Fingerabdruck des ersten Zertifikats einer PEM-Datei als «AB:CD:…» (kein openssl nötig)."""
+    with open(pem_path, "r", encoding="ascii", errors="replace") as f:
+        txt = f.read()
+    m = re.search(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", txt, re.S)
+    if not m:
+        raise ValueError("kein Zertifikat in der Datei")
+    h = hashlib.sha256(ssl.PEM_cert_to_DER_cert(m.group(0))).hexdigest().upper()
+    return ":".join(h[i:i + 2] for i in range(0, len(h), 2))
+
+
+def _lan_ips():
+    """Eigene Heimnetz-Adressen für das Zertifikat: Namensauflösung des Hostnamens und die Adresse der Standardroute
+    (UDP-«connect» sendet nichts). Im Bridge-Netz ist das die Adresse im Container; die des NAS: NZBLAB_TLS_SAN."""
+    out = set()
+    try:
+        for ai in socket.getaddrinfo(socket.gethostname(), None):
+            out.add(ai[4][0])
+    except OSError:
+        pass
+    for fam, target in ((socket.AF_INET, ("192.0.2.1", 9)), (socket.AF_INET6, ("2001:db8::1", 9))):
+        try:
+            with socket.socket(fam, socket.SOCK_DGRAM) as sk:
+                sk.connect(target)
+                out.add(sk.getsockname()[0])
+        except OSError:
+            pass
+    res = []
+    for x in sorted(out):
+        x = x.split("%")[0]
+        try:
+            ip = ipaddress.ip_address(x)
+        except ValueError:
+            continue
+        if not ip.is_loopback and not ip.is_unspecified and not ip.is_link_local and not ip.is_multicast:
+            res.append(str(ip))
+    return res
+
+
+def tls_names():
+    """(DNS-Namen, IP-Adressen) für das SAN: Hostname, localhost, NZBLAB_TLS_SAN (Komma), gefundene LAN-Adressen, Loopback."""
+    dns, ips = ["localhost"], ["127.0.0.1", "::1"]
+    host = re.sub(r"[^A-Za-z0-9.-]", "", socket.gethostname())[:63]
+    if host and host not in dns:
+        dns.append(host)
+    for x in [x.strip() for x in os.environ.get("NZBLAB_TLS_SAN", "").split(",") if x.strip()] + _lan_ips():
+        if "%" in x:        # ab 1.20.0 (Audit): Adressen mit Zonen-Kennung (fe80::1%eth0) lassen openssl scheitern → HTTPS wäre aus
+            print(f"WARNUNG: NZBLAB_TLS_SAN-Eintrag «{x}» übersprungen (Zonen-Kennung «%» geht nicht ins Zertifikat). / WARNING: skipped.", flush=True)
+            continue
+        try:
+            ip = ipaddress.ip_address(x)
+            if ip.is_link_local:
+                print(f"WARNUNG: NZBLAB_TLS_SAN-Eintrag «{x}» übersprungen (Link-lokale Adresse). / WARNING: link-local address skipped.", flush=True)
+                continue
+            v = str(ip)
+            if v not in ips:
+                ips.append(v)
+        except ValueError:
+            if re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", x) and x not in dns:
+                dns.append(x)
+    return dns, ips
+
+
+def _openssl(args, timeout=60):
+    return subprocess.run(["openssl"] + args, capture_output=True, timeout=timeout, check=False)
+
+
+def _cert_usable(cert_path, key_path):
+    """Zertifikat und Schlüssel vorhanden, lesbar, noch mindestens 30 Tage gültig (ohne openssl: vorhanden genügt)."""
+    if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
+        return False
+    try:
+        r = _openssl(["x509", "-in", cert_path, "-noout", "-checkend", str(30 * 86400)], timeout=15)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def ensure_cert(config=None):
+    """Zertifikat und Schlüssel bestimmen. Vom Nutzer: CONFIG/tls/cert.pem + key.pem (werden nie angefasst). Sonst eigenes,
+    selbstsigniertes (EC P-256, 10 Jahre) in CONFIG/tls/agent-cert.pem + agent-key.pem, beim ersten Start mit openssl erzeugt
+    und danach wiederverwendet (Fingerabdruck bleibt stabil, auch wenn sich die IP ändert; nur Ablauf in unter 30 Tagen erzeugt
+    neu). Rückgabe (cert, key, quelle) mit quelle «user» oder «auto»; wirft OSError/RuntimeError, wenn nichts möglich ist."""
+    d = os.path.join(config or CONFIG, "tls")
+    uc, uk = os.path.join(d, "cert.pem"), os.path.join(d, "key.pem")
+    if os.path.isfile(uc) and os.path.isfile(uk):
+        try:        # ab 1.20.0 (Audit): eigenes Zertifikat prüfen; kaputt → laut melden und das selbst erzeugte nehmen
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(uc, uk)
+            return uc, uk, "user"
+        except (OSError, ssl.SSLError, ValueError) as e:
+            print(f"WARNUNG: eigenes Zertifikat in {d} (cert.pem/key.pem) lässt sich nicht laden ({str(e)[:150]}): "
+                  f"nehme stattdessen das selbst erzeugte. / WARNING: own certificate unusable, using the auto-generated one.", flush=True)
+    ac, ak = os.path.join(d, "agent-cert.pem"), os.path.join(d, "agent-key.pem")
+    if _cert_usable(ac, ak):
+        return ac, ak, "auto"
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    dns, ips = tls_names()
+    san = ",".join([f"DNS:{x}" for x in dns] + [f"IP:{x}" for x in ips])
+    cn = next((x for x in dns if x != "localhost"), "nzblab-agent")
+    tc, tk = ac + ".new", ak + ".new"
+    for f in (tc, tk):
+        try:
+            os.unlink(f)
+        except FileNotFoundError:
+            pass
+    old = os.umask(0o077)
+    try:
+        try:
+            r = _openssl(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "3650",
+                          "-sha256", "-subj", f"/CN={cn}/O=NZBLab-Agent", "-addext", f"subjectAltName={san}",
+                          "-addext", "keyUsage=digitalSignature", "-addext", "extendedKeyUsage=serverAuth",
+                          "-keyout", tk, "-out", tc])
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(f"openssl nicht verfügbar ({e})") from e
+    finally:
+        os.umask(old)
+    if r.returncode != 0 or not os.path.isfile(tc) or not os.path.isfile(tk):
+        raise RuntimeError("openssl konnte kein Zertifikat erzeugen: " + r.stderr.decode("utf-8", "replace").strip()[:200])
+    os.chmod(tk, 0o600)
+    os.replace(tk, ak)
+    os.replace(tc, ac)
+    return ac, ak, "auto"
+
+
+def setup_tls(config=None):
+    """TLS vorbereiten (vor dem Rechte-Abgeben: der Schlüssel wird hier gelesen). Rückgabe SSLContext oder None;
+    TLS_STATE bekommt Fingerabdruck und Quelle bzw. den Fehlertext."""
+    TLS_STATE.update(enabled=False, fingerprint="", source="", error="")
+    try:
+        cert, key, src = ensure_cert(config)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+        fp = cert_fingerprint(cert)
+    except (OSError, RuntimeError, ssl.SSLError, ValueError) as e:
+        TLS_STATE["error"] = str(e)[:300]
+        print(f"WARNUNG: HTTPS ist nicht verfügbar, TLS ist AUS (tls: false): {TLS_STATE['error']}. / WARNING: HTTPS is not available, TLS is OFF.", flush=True)
+        return None
+    TLS_STATE.update(enabled=True, fingerprint=fp, source=src)
+    print(f"NZBLab-Agent Fingerabdruck: {fp}\n"
+          f"(SHA-256 des {'eigenen Zertifikats aus /config/tls/cert.pem' if src == 'user' else 'selbst erzeugten Zertifikats'}; "
+          f"in der App beim ersten Verbinden mit diesem Wert vergleichen. / SHA-256 of the certificate, compare it in the app.)", flush=True)
+    return ctx
+
+
+class KeysWindow:
+    """Einrichtungs-Fenster für Dienst-Schlüssel: [first] Sekunden ab Start, nach der Datei CONFIG/keys-unlock [reopen] Sekunden.
+    Ein Token allein entsperrt nie (sonst nützte die Sperre gegen einen gestohlenen Token nichts): nur wer im Container oder in
+    /config etwas tun kann (Neustart, Datei anlegen) ist Admin des NAS."""
+
+    def __init__(self, clock=time.monotonic, first=None, reopen=None):
+        self.clock, self.first, self.reopen = clock, first or KEYS_FIRST_S, reopen or KEYS_REOPEN_S
+        self.until = clock() + self.first
+        self.lock = threading.Lock()
+
+    def restart(self):
+        with self.lock:
+            self.until = self.clock() + self.first
+
+    def _consume_file(self):
+        path = os.path.join(CONFIG, "keys-unlock")
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        try:
+            os.unlink(path)
+        except OSError:
+            return False        # nicht löschbar: nicht öffnen (sonst wäre das Fenster dauernd offen)
+        return True
+
+    def seconds_left(self):
+        with self.lock:
+            if self._consume_file():
+                self.until = self.clock() + self.reopen
+            return max(0, int(self.until - self.clock()))
+
+
+KEYS = KeysWindow()
+KEYS_HINT = ("Dienst-Schlüssel gibt es nur in den ersten 30 Minuten nach dem Start des Agenten. Container neu starten (dann 30 Minuten Zeit) "
+             "oder auf dem NAS die leere Datei keys-unlock im Ordner /config anlegen (dann 10 Minuten). Ein Token allein entsperrt nicht. "
+             "/ Service keys are only handed out in the first 30 minutes after the agent starts. Restart the container (30 minutes), "
+             "or create an empty file keys-unlock in /config on the NAS (10 minutes). A token alone does not unlock.")
+KEYS_TLS_HINT = ("Dienst-Schlüssel gibt es nur über HTTPS (gleicher Port, https://…). / Service keys are only served over HTTPS "
+                 "(same port, https://…).")
+
+
+def keys_state():
+    """Für /api/info: mode off|window|always, open, seconds_left (0 bei always/off)."""
+    if not DISCOVER_KEYS:
+        return {"mode": "off", "open": False, "seconds_left": 0}
+    if KEYS_ALWAYS:
+        return {"mode": "always", "open": True, "seconds_left": 0}
+    n = KEYS.seconds_left()
+    return {"mode": "window", "open": n > 0, "seconds_left": n}
+
+
+_TOKEN_LOCK = threading.Lock()
+
+
+def write_new_token():
+    """Neuen Token (secrets.token_urlsafe(32), 43 Zeichen) atomar nach CONFIG/token.txt (0600) schreiben; Rückgabe der Token.
+    Die alte Datei bleibt bei einem Fehler unangetastet (OSError)."""
+    path = os.path.join(CONFIG, "token.txt")
+    t = secrets.token_urlsafe(32)
+    tmp = path + ".new"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(t)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return t
+
+
 class HelloLimiter:
     """Höchstens [max_calls] Anfragen an /api/hello pro Minute und Absender (die App braucht wenige pro Prüfung)."""
 
@@ -5739,6 +5989,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
     discover = discover or Discover()        # je Server eine eigene Bremse für /api/discover
     smart = smart or SmartMonitor(store, SmartHelper(), enabled=False)
     backups = backups or BackupScanner(explicit=[], auto_roots=[], auto=False)
+    rotate_limiter = HelloLimiter(max_calls=5)    # ab 1.20.0: Token erneuern höchstens 5 pro Minute und Absender
 
     class H(BaseHTTPRequestHandler):
         # Lese-Timeout je Verbindung: halbe Anfragen (Slowloris) oder eine zu grosse Content-Length halten sonst einen
@@ -5749,6 +6000,29 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
 
         def log_message(self, *a):
             pass
+
+        @property
+        def secure(self):
+            """Ab 1.20.0: kam die Anfrage über TLS? (Schlüssel und Token erneuern gibt es nur dann)"""
+            if (self.headers.get("X-Forwarded-Proto") or "").strip().lower() == "http":
+                return False        # ab 1.20.0 (Audit): Proxy meldet Klartext auf dem Client-Weg → nie sicher (nur verbieten, nie erlauben)
+            return isinstance(self.connection, ssl.SSLSocket)
+
+        def keys_blocked(self, with_keys):
+            """Ab 1.20.0: None = Schlüssel dürfen mit; sonst (Status, Antwort). Nur HTTPS, nur im Einrichtungs-Fenster."""
+            if not (DISCOVER_KEYS and with_keys):
+                return None
+            if KEYS_REQUIRE_TLS and not self.secure:
+                return 403, {"error": "keys_need_tls", "hint": KEYS_TLS_HINT}
+            if not KEYS_ALWAYS and KEYS.seconds_left() <= 0:
+                return 403, {"error": "keys_locked", "hint": KEYS_HINT}
+            return None
+
+        def rotate_window_blocked(self):
+            """Ab 1.20.0 (Audit): Token erneuern nur bei offenem Schlüssel-Fenster (ein gestohlener Token sperrt sonst den Besitzer aus)."""
+            if not KEYS_ALWAYS and KEYS.seconds_left() <= 0:
+                return 403, {"error": "keys_locked", "hint": KEYS_HINT}
+            return None
 
         def version_string(self):
             return self.server_version          # ohne Leerzeichen am Ende (sys_version ist leer)
@@ -5866,7 +6140,21 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 if not local_host_header(self.headers.get("Host", "")):
                     return self.reply(403, {"error": "nur mit IP-Adresse oder lokalem Namen"})
                 ok = sampling_ok()
-                return self.reply(200 if ok else 503, {"ok": ok, "sample_age_s": sampling_age(), "interval": INTERVAL})
+                return self.reply(200 if ok else 503, {"ok": ok, "sample_age_s": sampling_age(), "interval": INTERVAL,
+                                                       "tls": TLS_STATE["enabled"], "fingerprint": TLS_STATE["fingerprint"]})
+            if u.path == "/api/tls":
+                # Ab 1.20.0, ohne Token (der Fingerabdruck ist öffentlich, nicht geheim): was die App beim ersten Verbinden mit dem
+                # angezeigten Wert vergleicht (Zertifikat anheften). Host-Prüfung wie bei /api/health.
+                if not local_host_header(self.headers.get("Host", "")):
+                    return self.reply(403, {"error": "nur mit IP-Adresse oder lokalem Namen"})
+                return self.reply(200, {"tls": TLS_STATE["enabled"], "fingerprint": TLS_STATE["fingerprint"], "algorithm": "sha256",
+                                        "source": TLS_STATE["source"], "http": HTTP_ON, "secure": self.secure})
+            if u.path == "/api/keys/status":
+                # Ab 1.20.0, mit Token: ob das Schlüssel-Fenster offen ist (entsperren geht nur auf dem NAS: Neustart oder Datei)
+                if not self.authorized(tok):
+                    return self.refuse()
+                return self.reply(200, dict(keys_state(), tls=self.secure, window_s=KEYS_FIRST_S, reopen_s=KEYS_REOPEN_S,
+                                            hint=KEYS_HINT), {"Cache-Control": "no-store"})
             if u.path == "/api/hello":
                 # Ohne Token (die App prüft damit, ob sie im eigenen Heimnetz ist, bevor sie Schlüssel sendet). Antwort:
                 # feste Zufalls-Kennung und HMAC über die Nonce der App; der Token selbst verlässt den Agent nie.
@@ -5882,7 +6170,10 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 nonce = q.get("nonce", "")
                 if not HELLO_NONCE.fullmatch(nonce):
                     return self.reply(400, {"error": "nonce: 32 Zeichen 0-9a-f"})
-                return self.reply(200, {"id": agent_id(), "proof": hello_proof(tok, nonce)})   # ab 1.19.0 ohne Version (ohne Token)
+                body = {"id": agent_id(), "proof": hello_proof(tok, nonce)}   # ab 1.19.0 ohne Version (ohne Token)
+                if self.secure and TLS_STATE["enabled"] and TLS_STATE["fingerprint"]:
+                    body["tls_proof"] = hello_tls_proof(tok, nonce, TLS_STATE["fingerprint"])   # ab 1.20.0: Zertifikat anheften ohne Abtippen
+                return self.reply(200, body)
             if u.path == "/api/prices/watch":
                 # Ohne Token, aber nur aus dem Heimnetz: enthält nur Plattenserien und Grössen, keine Werte vom NAS
                 if not self.authorized(tok) and not self.local_request():
@@ -5940,8 +6231,15 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 if wait:
                     return self.reply(429, {"error": "Zu viele Abrufe, später nochmals versuchen", "retry_after": wait},
                                       dict(nostore, **{"Retry-After": str(wait)}))
+                want_keys = q.get("keys", "1").strip().lower() not in ("0", "false", "no", "off", "nein")
+                blocked = self.keys_blocked(want_keys)
+                if blocked:
+                    return self.reply(blocked[0], blocked[1], nostore)
                 try:
-                    return self.reply(200, discover.scan(with_keys=q.get("keys", "1").strip().lower() not in ("0", "false", "no", "off", "nein")), nostore)
+                    res = discover.scan(with_keys=want_keys)
+                    if want_keys and DISCOVER_KEYS:     # ab 1.20.0 (Audit): jede Ausgabe von Schlüsseln ins Log (nie die Schlüssel selbst)
+                        print(f"Dienst-Schlüssel ausgegeben an {self.client_address[0]}: {len(res.get('services') or [])} Dienste.", flush=True)
+                    return self.reply(200, res, nostore)
                 except Exception:  # noqa: BLE001
                     return self.reply(500, {"error": "Suche fehlgeschlagen"}, nostore)
             if u.path == "/api/info":
@@ -5967,6 +6265,9 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                         # ab 1.15.0: Stand der Schnittstelle für die App (vergleicht mit ihrem Minimum; der Agent
                                         # aktualisiert sich nie selbst), was eingeschaltet ist, letzter Neustart
                                         "api_level": API_LEVEL, "features": agent_features(smart, backups, log_dir),
+                                        # ab 1.20.0: HTTPS, Fingerabdruck, Klartext an/aus, Schlüssel-Fenster
+                                        "tls": TLS_STATE["enabled"], "fingerprint": TLS_STATE["fingerprint"], "http": HTTP_ON,
+                                        "secure": self.secure, "keys": keys_state(),
                                         "last_boot": (boot_now() or (None,))[0],
                                         "boots_7d": len(store.boots(now - 7 * 86400)),
                                         "sampling_ok": sampling_ok()})
@@ -6036,6 +6337,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             return self.reply(404, {"error": "unbekannt"})
 
         def do_POST(self):
+            nonlocal tok                    # ab 1.20.0: /api/token/rotate tauscht den Token im laufenden Betrieb
             u = urlparse(self.path)
             if self.headers.get("Transfer-Encoding"):
                 self.close_connection = True
@@ -6044,6 +6346,36 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 return None
             if not self.authorized(tok):
                 return self.refuse()
+            if u.path == "/api/token/rotate":
+                # Ab 1.20.0: neuer Zufalls-Token, der alte ist sofort ungültig. Nur über HTTPS (die Antwort enthält den neuen Token).
+                ip = self.client_address[0]
+                if not self.secure:
+                    print(f"Token erneuern abgelehnt (kein HTTPS) von {ip}.", flush=True)
+                    return self.reply(403, {"error": "tls_required", "hint": "Token erneuern nur über HTTPS (https://…). / Rotate the token over HTTPS only."})
+                closed = self.rotate_window_blocked()
+                if closed:
+                    print(f"Token erneuern abgelehnt (Schlüssel-Fenster zu) von {ip}.", flush=True)
+                    return self.reply(closed[0], closed[1], {"Cache-Control": "no-store"})
+                wait = rotate_limiter.allow(ip)
+                if wait:
+                    print(f"Token erneuern abgelehnt (zu viele Anfragen) von {ip}.", flush=True)
+                    return self.reply(429, {"error": "Zu viele Anfragen, später nochmals versuchen", "retry_after": wait},
+                                      {"Retry-After": str(wait)})
+                if TOKEN_STATE["source"] == "env":
+                    print(f"Token erneuern abgelehnt (Token per NZBLAB_AGENT_TOKEN fest) von {ip}.", flush=True)
+                    return self.reply(409, {"error": "token_fixed", "hint": "Token ist in der Vorlage fest eingetragen (NZBLAB_AGENT_TOKEN). "
+                                            "Dort ändern oder die Variable leeren. / The token is fixed in the template (NZBLAB_AGENT_TOKEN)."})
+                with _TOKEN_LOCK:
+                    try:
+                        new = write_new_token()
+                    except OSError:
+                        print(f"Token erneuern fehlgeschlagen (token.txt nicht schreibbar) von {ip}.", flush=True)
+                        return self.reply(500, {"error": "token_write_failed", "hint": "token.txt nicht schreibbar, alter Token bleibt gültig"},
+                                          {"Cache-Control": "no-store"})
+                    tok = new
+                    TOKEN_STATE.update(error="", source="file", code="")
+                print(f"Token erneuert von {ip} (der alte Token ist ungültig).", flush=True)
+                return self.reply(200, {"ok": True, "token": new}, {"Cache-Control": "no-store", "Pragma": "no-cache"})
             if u.path == "/api/config":
                 try:
                     n = int(self.headers.get("Content-Length", "0") or 0)
@@ -6152,15 +6484,47 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
     return H
 
 
+def healthcheck():
+    """Ab 1.20.0 (Docker-Gesundheitsprüfung, «--healthcheck»): /api/health über HTTPS (Zertifikat nicht geprüft, es ist der eigene
+    Agent auf dieser Adresse), sonst über HTTP. Exit 0 = gesund."""
+    host = BIND if BIND not in ("0.0.0.0", "::", "") else "127.0.0.1"
+    host = f"[{host}]" if ":" in host else host
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    for scheme in ("https", "http"):
+        try:
+            # Proxy-Einstellungen aus der Umgebung ignorieren, 2 s je Versuch
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
+            with opener.open(f"{scheme}://{host}:{PORT}/api/health", timeout=2) as r:
+                return 0 if r.status == 200 else 1
+        except urllib.error.HTTPError:
+            return 1
+        except (OSError, ValueError):
+            continue
+    return 1
+
+
 def main():
+    if "--healthcheck" in sys.argv[1:]:
+        sys.exit(healthcheck())
     # Ab 1.16.1: neue Dateien in /config nur für den Agenten lesbar (Datei-Index, Verlauf, Absturzberichte; vorher 644)
     os.umask(0o077)
     try:
         os.makedirs(CONFIG, exist_ok=True)
     except OSError as e:
         print(f"FEHLER: {CONFIG} lässt sich nicht anlegen: {e}", flush=True)
+    try:
+        os.unlink(os.path.join(CONFIG, "token.txt.new"))    # liegengebliebene Temp-Datei vom Token erneuern (Audit 1.20)
+    except OSError:
+        pass
     CONFIG_STATE.update(config_mount())    # vor dem Token: bleibt /config beim Neuerstellen erhalten?
     tok = token()                          # als root anlegen und anzeigen, danach gehört er dem Benutzer (drop_privileges)
+    tls_ctx = setup_tls()                  # ab 1.20.0: Zertifikat erzeugen/laden (als root, vor dem Rechte-Abgeben), Fingerabdruck ins Log
+    if tls_ctx is None and not HTTP_ON:
+        print("FEHLER: NZBLAB_HTTP=0 verlangt HTTPS, aber es gibt kein Zertifikat (siehe WARNUNG oben). Der Agent startet nicht. "
+              "/ ERROR: NZBLAB_HTTP=0 needs HTTPS but there is no certificate. Not starting.", flush=True)
+        sys.exit(1)
+    KEYS.restart()                         # Schlüssel-Fenster: 30 Minuten ab jetzt
     announce_config()                      # laute Warnung mit Lösung, wenn nicht (nach dem Token, damit sie danach im Log steht)
     load_container_names()                 # braucht root (config.v2.json ist 600); einmal beim Start reicht
     smart_helper = SmartHelper()
@@ -6212,11 +6576,23 @@ def main():
         announce_config()                  # nochmals am Ende des Starts, damit sie im Log nicht untergeht
     print("Heute: Quellen", Today(store).sources(), flush=True)
     crashes = CrashStore(f"{CONFIG}/crashes")
-    make_server(BIND, PORT, make_handler(store, now_values, tok, index, array, lan, Today(store), crashes, smart, backups)).serve_forever()
+    print(f"HTTPS {'an' if tls_ctx else 'AUS'}, Klartext-HTTP {'an (Übergangszeit; NZBLAB_HTTP=0 schaltet ihn ab)' if HTTP_ON else 'aus'}; "
+          f"Schlüssel: {'nie' if not DISCOVER_KEYS else 'immer' if KEYS_ALWAYS else '30 Min. nach dem Start, nur über HTTPS'}.", flush=True)
+    make_server(BIND, PORT, make_handler(store, now_values, tok, index, array, lan, Today(store), crashes, smart, backups),
+                tls=tls_ctx, http=HTTP_ON).serve_forever()
 
 
-def make_server(bind, port, handler):
-    """Ab 1.15.0: Adresse wählbar (NZBLAB_BIND, z. B. 127.0.0.1 hinter einem Proxy oder die LAN-Adresse); IPv6 mit «::»."""
+_PLAIN_BODY = "NZBLab-Agent: nur HTTPS (NZBLAB_HTTP=0). Bitte https://... verwenden.\n".encode("utf-8")
+PLAIN_REFUSED = (b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " + str(len(_PLAIN_BODY)).encode()
+                 + b"\r\nConnection: close\r\n\r\n" + _PLAIN_BODY)
+
+
+def make_server(bind, port, handler, tls=None, http=True):
+    """Ab 1.15.0: Adresse wählbar (NZBLAB_BIND, z. B. 127.0.0.1 hinter einem Proxy oder die LAN-Adresse); IPv6 mit «::».
+    Ab 1.20.0: [tls] = SSLContext → derselbe Port nimmt HTTPS und (wenn [http]) Klartext an; das erste Byte entscheidet
+    (0x16 = TLS-Handshake). Ohne [tls] nur Klartext wie bisher."""
+    if tls is None and not http:
+        raise ValueError("ohne TLS muss HTTP an sein")
     try:
         fam = socket.AF_INET6 if ipaddress.ip_address(bind).version == 6 else socket.AF_INET
     except ValueError:
@@ -6246,8 +6622,45 @@ def make_server(bind, port, handler):
                 self._release(ip)
                 raise
 
+        def _sniff(self, request):
+            """Erstes Byte ansehen (ohne es zu lesen): 0x16 → TLS-Handshake, sonst Klartext (wenn erlaubt). None = Verbindung beendet."""
+            try:
+                request.settimeout(10)
+                first = request.recv(1, socket.MSG_PEEK)
+                if not first:
+                    return None
+                if first == b"\x16":
+                    return tls.wrap_socket(request, server_side=True)
+                if not http:
+                    try:
+                        request.settimeout(1)       # Anfrage (bis ca. 8 KB) lesen und verwerfen, sonst sieht der Client ein Reset statt der 403
+                        got = 0
+                        try:
+                            while got < 8192:
+                                chunk = request.recv(8192 - got)
+                                if not chunk:
+                                    break
+                                got += len(chunk)
+                                if b"\r\n\r\n" in chunk:
+                                    break
+                        except OSError:
+                            pass
+                        request.sendall(PLAIN_REFUSED)
+                    except OSError:
+                        pass
+                    return None
+                return request
+            except (OSError, ssl.SSLError):
+                return None
+
         def process_request_thread(self, request, client_address):
             try:
+                if tls is not None:
+                    got = self._sniff(request)
+                    if got is None:
+                        self.shutdown_request(request)
+                        return
+                    request = got
                 super().process_request_thread(request, client_address)
             finally:
                 self._release(client_address[0])

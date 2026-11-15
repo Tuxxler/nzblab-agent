@@ -44,16 +44,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /agent
 # smartctl für das freiwillige SMART-Lesen (NZBLAB_SMART=1, nur «--scan» und «-a», nie Selbsttests). Im selben Image statt eines
 # eigenen Tags: ein Image für alle, einfacher zu pflegen; ohne NZBLAB_SMART=1 und ohne «devices» im Compose ruht es.
-RUN apk add --no-cache smartmontools
+# openssl (ab 1.20.0): nur, um beim ersten Start das eigene HTTPS-Zertifikat in /config/tls zu erzeugen (ec P-256, 10 Jahre).
+RUN apk add --no-cache smartmontools openssl
 COPY nzblab_agent.py web.html start.sh ./
 RUN chmod 0644 nzblab_agent.py web.html && chmod 0755 start.sh && python3 -m py_compile nzblab_agent.py && rm -rf __pycache__
 
 VOLUME /config
+# Ab 1.20.0: derselbe Port nimmt HTTPS und (NZBLAB_HTTP=1, Standard in der Übergangszeit) Klartext an; NZBLAB_HTTP=0 = nur HTTPS.
 EXPOSE 8099
 
-# Ab 1.15.0: /api/health antwortet 503, wenn die Messschleife länger als 2 Intervalle (+15 s) steht. NZBLAB_BIND=Adresse
+# Ab 1.20.0 prüft «--healthcheck» über HTTPS (Zertifikat nicht geprüft), sonst HTTP. Ab 1.15.0: /api/health antwortet 503, wenn die Messschleife länger als 2 Intervalle (+15 s) steht. NZBLAB_BIND=Adresse
 # ohne 127.0.0.1 (z. B. nur die LAN-Adresse): dann prüft der Healthcheck diese Adresse.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=90s --retries=3 \
-    CMD wget -q -O /dev/null "http://$( [ "${NZBLAB_BIND:-0.0.0.0}" = "0.0.0.0" ] || [ "${NZBLAB_BIND}" = "::" ] && echo 127.0.0.1 || echo "${NZBLAB_BIND}" ):${PORT:-8099}/api/health" || exit 1
+    CMD ["python3", "/agent/nzblab_agent.py", "--healthcheck"]
 
 CMD ["sh", "/agent/start.sh"]
