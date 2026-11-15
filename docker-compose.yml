@@ -17,7 +17,7 @@ services:
       - "8099:8099"           # Linux-Block A: statt «ports» besser «network_mode: host» (siehe unten)
     # network_mode: host     # A (Linux): echte Netzwerkkarten, Heimnetz-Geräte. Dann «ports» oben löschen
     environment:
-      TZ: Europe/Zurich
+      # TZ: "Europe/Zurich"   # Beispiel: nur setzen, wenn Zeiten im Log falsch sind; deine eigene Zeitzone eintragen
       PUID: "99"              # Benutzer nach dem Start (Unraid 99 = nobody); TrueNAS 568, Synology eigene Nummer (z. B. 1026), Linux 65534; 0 = root (nicht empfohlen)
       PGID: "100"             # Gruppe (Unraid 100 = users); TrueNAS 568, Synology 100, Linux 65534
       # NZBLAB_AGENT_TOKEN: ""        # besser leer lassen (Agent erzeugt selbst einen); eigener: mindestens 32 zufällige Zeichen, sonst Fehler

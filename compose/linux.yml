@@ -22,7 +22,7 @@ services:
     network_mode: host
     user: "65534:65534"     # eigener Benutzer ohne Login (nobody); Ordner unter /host/fs müssen für alle lesbar sein
     environment:
-      TZ: Europe/Zurich
+      # TZ: "Europe/Zurich"   # Beispiel: nur setzen, wenn Zeiten im Log falsch sind; deine eigene Zeitzone eintragen
       FILES_ROOT: "/host/fs"
       CACHE_ROOTS: ""       # kein Unraid-Cache
       # NZBLAB_LAN: "1"     # ab 1.18.0 Standard AUS: Heimnetz-Suche (alle 30 Min ein leeres UDP-Paket an jede Adresse des /24-Netzes, Reverse-DNS, Push bei neuen Geräten)

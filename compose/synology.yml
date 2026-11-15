@@ -17,7 +17,7 @@ services:
     ports:
       - "8099:8099"
     environment:
-      TZ: Europe/Zurich
+      # TZ: "Europe/Zurich"   # Beispiel: nur setzen, wenn Zeiten im Log falsch sind; deine eigene Zeitzone eintragen
       # Ab 1.19.0 läuft der Agent nicht mehr als root: eigene Nummer deines DSM-Benutzers (SSH: «id»), hier Beispiel 1026 / PGID 100.
       # Dieser Benutzer braucht Leserecht auf die Ordner, die der Agent ansehen soll. PUID=0 (root) nur, wenn der Datei-Index sonst
       # wegen DSM-ACLs Ordner nicht lesen kann, und davon wird abgeraten (root im Container = mehr Folgen bei einem Fehler).

@@ -9,8 +9,8 @@
 **Getting the app.** The NASlab Android app is coming to the Google Play Store in the next few days. Until then it is in a closed test: see <https://tuxxler.github.io/nzblab/en/#play>.
 
 **Install.** Image: `ghcr.io/tuxxler/nzblab-agent:latest` (amd64 and arm64). The image, container and folder names stay `nzblab-agent`.
-- Unraid: template `unraid/nzblab-agent.xml` (Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent`).
-- TrueNAS SCALE 24.10+: `compose/truenas.yml` (Install via YAML). Synology DSM 7.2+: `compose/synology.yml` (Container Manager project). Linux or any Docker host: `compose/linux.yml` or `docker-compose.yml`, then `docker compose up -d`.
+- Unraid: Apps › search «NASlab-Agent» › Install. Alternative: Docker › Template repositories › `https://github.com/Tuxxler/unraid-templates` (the template is also in `unraid/nzblab-agent.xml`).
+- TrueNAS SCALE 24.10+: `compose/truenas.yml` (Install via YAML). The agent runs there; the NASlab app talks to the TrueNAS API from TrueNAS 25.04. Synology DSM 7.2+: `compose/synology.yml` (Container Manager project). Linux or any Docker host: `compose/linux.yml` or `docker-compose.yml`, then `docker compose up -d`.
 - Then enter `https://<NAS-IP>:8099` and the token in the app (Settings › Server connections › NASlab agent). From 1.20.0 the same port speaks HTTPS (self-generated certificate) and, during a transition period, plain HTTP; the app (2.77+) checks the certificate itself with a token-bound proof; the SHA-256 fingerprint in the container log is there to compare if you like.
 
 **Security notes.**
@@ -20,6 +20,15 @@
 - Port 8099 is for your home network or VPN only; never expose it to the internet.
 - Licence: GNU AGPL-3.0-only, see [`LICENSE`](LICENSE). Free to use, also commercially; if you distribute a modified version or offer it as a network service, you must publish your changes under the same licence.
 - Beta status: TrueNAS, Synology and Linux support is beta (tested with virtual machines and sample data, not on real hardware).
+
+**What leaves your server.** Nothing from your NAS goes to the developer. The agent itself contacts only these addresses:
+- `1.1.1.1` port 443: a plain TCP connection once a minute to measure internet latency; no data is sent (`NZBLAB_NET=0` turns it off).
+- Disk price sites (Toppreise.ch, Geizhals.de/.at, diskprices.com): only when a price country is set; the search terms are your own disk models (`PRICE_SOURCES_OFF` turns sources off).
+- `speed.cloudflare.com`: only when you start a speed test in the app.
+- Your ntfy server: only if you set `NTFY_URL`.
+Each of them sees the IP address of your connection. The NASlab app has its own list of addresses (in the app: Trust screen, and the privacy policy on the website).
+
+**Uninstall.** Stop and remove the container (Unraid: Docker › container › Remove; others: `docker compose down`). Then delete the `/config` folder (for example `appdata/nzblab-agent`): it holds the history, the file index and the token. The agent changes nothing else on the NAS. In the app, remove the NASlab-Agent connection under Settings › Server connections.
 
 The rest of this document is in German; the versioned feature history is at the bottom under "Changelog (Deutsch)".
 
@@ -45,8 +54,8 @@ Website <https://tuxxler.github.io/nzblab/agent.html>.
 
 | System | Datei | Kurz |
 |---|---|---|
-| Unraid | `unraid/nzblab-agent.xml` | Apps › «NASlab-Agent» › Install; bis zur Aufnahme in CA: Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent` |
-| TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = eigener Pool |
+| Unraid | `unraid/nzblab-agent.xml` | Apps › «NASlab-Agent» › Install; sonst Docker › Template repositories › `https://github.com/Tuxxler/unraid-templates` |
+| TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = eigener Pool. Der Agent läuft ab 24.10; die App spricht die TrueNAS-Schnittstelle erst ab 25.04 an |
 | Synology DSM 7.2+ | `compose/synology.yml` | Ordner `docker/nzblab-agent` anlegen; Container Manager › Projekt › Erstellen |
 | Linux (Debian, Ubuntu …, ab 1.14.0) | `compose/linux.yml` | Ordner anlegen, Datei als `docker-compose.yml` speichern, `docker compose up -d`; siehe unten |
 | Docker allgemein / alle in einer Datei (ab 1.15.0) | `docker-compose.yml` | Block A–D für deinen Server einkommentieren, freiwillige Blöcke S (SMART), L (Logs), B2 (Backups); `docker compose up -d` |
@@ -93,7 +102,7 @@ nötig nur für appdata-Grössen anderer Container mit engen Rechten. TrueNAS-Vo
 Synology-Vorlage ab 1.19.0: eigene Nummer (Beispiel 1026:100, SSH `id`). **`PUID=0` (root) wird abgeraten**, nur falls DSM-ACLs den Datei-Index sonst blockieren.
 
 **Härtung in allen Vorlagen:** `--read-only` (Root-Dateisystem), `/tmp` als tmpfs, `no-new-privileges`, 512 MB RAM, 1 CPU,
-kein `privileged`, keine Zusatz-Capabilities. HEALTHCHECK im Image auf `/api/ping`.
+kein `privileged`, `cap_drop: ALL` und nur fünf Capabilities für den Start (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`; danach läuft der Agent ohne root). HEALTHCHECK im Image: `--healthcheck` des Agenten, der `/api/health` prüft.
 
 Weitere Variablen für andere Systeme: `FILES_EXCLUDE` (oberste Ordner, auch Muster wie `@*`), `FILES_SKIP` (in jeder Ebene,
 Standard `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (leer = kein Cache).
@@ -155,14 +164,14 @@ Hängt ein Netzwerk-Mount unter `/host/fs` (NFS/SMB weg), wartet der Agent höch
 und markiert ihn mit `timeout: true`. `/api/host` und `/api/filesystems` rechnet er höchstens alle `HOST_CACHE_S`
 Sekunden neu (Standard 15).
 
-Die Vorlagen für Unraid (99:100), TrueNAS (568:568) und Synology (root) sind davon unverändert.
+Die Vorlagen für Unraid (99:100), TrueNAS (568:568) und Synology (eigene Nummer, ab 1.19.0 nicht mehr root) sind davon unverändert.
 
 Unraid, TrueNAS und Synology ändern sich dadurch nicht: Die neuen Pfade sind nur zusätzlich.
 
 ## Übersicht im Browser (ab 1.4.0)
 
-`http://<NAS-IP>:8099` (z. B. `http://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
-WireGuard). Beim ersten Mal den Token einfügen (siehe «Token» oben); er bleibt nur in diesem Browser gespeichert, «Abmelden» löscht ihn.
+`https://<NAS-IP>:8099` (z. B. `https://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
+WireGuard). Der Browser warnt einmal, weil der Agent ein eigenes Zertifikat benutzt: Vergleiche den Fingerabdruck mit der Zeile im Container-Log. Die Einrichtung (Dienste suchen) geht nur innert 30 Minuten nach dem Start; sonst Container neu starten. Beim ersten Mal den Token einfügen (siehe «Token» oben); er bleibt nur in diesem Browser gespeichert, «Abmelden» löscht ihn.
 
 Zu sehen, live alle 5 Sekunden: CPU und CPU-Temperatur mit Verlauf (12 Std.), Arbeitsspeicher, Netzwerk, Array mit
 Platten, Internet-Tempo (Knopf «Jetzt messen»), alle Temperaturen, meiste Last, Festplatten-Zugriffe, Grafikchip,

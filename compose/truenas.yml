@@ -13,7 +13,7 @@ services:
     ports:
       - "8099:8099"
     environment:
-      TZ: Europe/Zurich
+      # TZ: "Europe/Zurich"   # Beispiel: nur setzen, wenn Zeiten im Log falsch sind; deine eigene Zeitzone eintragen
       PUID: "568"           # TrueNAS-Benutzer «apps»; 0 = root nur im Notfall (nicht empfohlen)
       PGID: "568"
       FILES_EXCLUDE: "ix-applications,.ix-apps,.system,apps"

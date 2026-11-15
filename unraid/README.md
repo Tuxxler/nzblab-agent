@@ -6,15 +6,19 @@ Unraid Community Applications (CA) template for the **NASlab-Agent** (this folde
 |---|---|---|
 | [`nzblab-agent.xml`](nzblab-agent.xml) | `ghcr.io/tuxxler/nzblab-agent:latest` | Read-only NAS monitor for the NASlab Android app: temperatures, CPU, GPU, RAM, disk spin-ups, file index. Never changes anything on the server. |
 
-## Install without CA (works today)
+## Install
+
+Easiest: Unraid › **Apps** › search **NASlab-Agent** › **Install**.
+
+Alternative without the Apps search:
 
 1. Unraid › **Docker** › scroll down to **Template repositories**, add the line
-   `https://github.com/Tuxxler/nzblab-agent` › **Save**.
-2. **Add Container** › *Template*: pick **nzblab-agent**. Check the paths (remove *Cache pool* if you have no pool named `cache`).
+   `https://github.com/Tuxxler/unraid-templates` › **Save**.
+2. **Add Container** › *Template*: pick **NASlab-Agent**. Check the paths (remove *Cache pool* if you have no pool named `cache`).
    Keep *Data (/config)* → `/mnt/user/appdata/nzblab-agent` (read/write): the agent stores its token and history there;
    without it you get a new token after every update.
-3. **Apply.** Open the container **Logs**: the line `NZBLab-Agent Token: …` appears once.
-4. App: *Settings › Server connections › NASlab-Agent* › address `http://<unraid-ip>:8099`, paste the token, *Test connection*.
+3. **Apply.** Open the container **Logs**: the line `NZBLab-Agent Token: …` appears once, plus the certificate fingerprint.
+4. App: *Settings › Server connections › NASlab-Agent* › address `https://<unraid-ip>:8099`, paste the token, *Test connection*. The agent uses its own certificate (a browser warns once; compare the fingerprint with the container log). Set up within 30 minutes after the container starts (service keys are only handed out in that window); otherwise restart the container.
 
 All host paths are mounted **read-only**. Only `/config` (`/mnt/user/appdata/nzblab-agent`) is writable.
 After start the agent drops root and runs as `PUID`/`PGID` (99/100). Set `PUID=0` only if you need container names
