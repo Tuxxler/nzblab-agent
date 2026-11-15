@@ -6,6 +6,8 @@
 
 **What it reads.** Host data through read-only mounts (`/proc`, `/sys`, your shares, optionally logs and SMART). It writes only to its own `/config` folder (history and token). It never changes anything on the NAS. Reading service API keys for auto-connect is on by default and can be turned off with `DISCOVER_KEYS=0`.
 
+**Getting the app.** The NASlab Android app is coming to the Google Play Store in the next few days. Until then it is in a closed test: see <https://tuxxler.github.io/nzblab/en/#play>.
+
 **Install.** Image: `ghcr.io/tuxxler/nzblab-agent:latest` (amd64 and arm64). The image, container and folder names stay `nzblab-agent`.
 - Unraid: template `unraid/nzblab-agent.xml` (Docker › Template repositories › `https://github.com/Tuxxler/nzblab-agent`).
 - TrueNAS SCALE 24.10+: `compose/truenas.yml` (Install via YAML). Synology DSM 7.2+: `compose/synology.yml` (Container Manager project). Linux or any Docker host: `compose/linux.yml` or `docker-compose.yml`, then `docker compose up -d`.
