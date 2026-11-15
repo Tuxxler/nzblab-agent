@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.20.0"
+VERSION = "1.20.1"
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
@@ -251,6 +251,15 @@ class Sampler:
         for h in sorted(os.listdir(base)) if os.path.isdir(base) else []:
             d = f"{base}/{h}"
             name = read(f"{d}/name", h)
+            # D1: AMD (k10temp) meldet Tctl (mit festem Zuschlag, bis +20 °C bei Ryzen 1000/2000X und Threadripper) und, wo es ihn
+            # gibt, Tdie (echte Chip-Temperatur). Mit beiden zählt nur Tdie, sonst warnt die Hitze-Meldung zu früh.
+            # (N3: nur, wenn Tdie auch einen gültigen Wert liefert; sonst bleibt Tctl der einzige Messwert)
+            def _valid_tdie(x):
+                if (read(f"{d}/{x}", "") or "").strip().lower() != "tdie":
+                    return False
+                v = read(f"{d}/{x.replace('_label', '_input')}")
+                return v is not None and v.lstrip("-").isdigit() and -40 < int(v) / 1000.0 < 150
+            has_tdie = name == "k10temp" and any(_valid_tdie(x) for x in os.listdir(d) if re.match(r"temp\d+_label$", x))
             for f in sorted(os.listdir(d)):
                 m = re.match(r"temp(\d+)_input$", f)
                 if not m:
@@ -259,6 +268,8 @@ class Sampler:
                 if v is None or not v.lstrip("-").isdigit():
                     continue
                 label = read(f"{d}/temp{m.group(1)}_label", "")
+                if has_tdie and (label or "").strip().lower() == "tctl":
+                    continue
                 key = friendly_sensor(name, label, h)
                 res[key] = max(res.get(key, -1000), int(v) / 1000.0)
         return {k: round(v, 1) for k, v in res.items() if -40 < v < 150}
@@ -688,6 +699,10 @@ class Watcher:
                     text += f" Meiste Last: {who}."
                 self.notify("NAS zu heiss", text)
         else:
+            # D2: «seit N Minuten» heisst durchgehend. Fällt die CPU unter die Schwelle (auch nur knapp), beginnt die Zeit neu;
+            # vorher blieb hot_since stehen, und ein kurzer Ausreisser Stunden später löste sofort die Meldung aus.
+            if cpu_t is not None and not self.alerted:
+                self.hot_since = None
             if cpu_t is not None and cpu_t < HEAT_ALERT - 10:
                 if self.alerted and self.gate.clear("heat"):
                     self.notify("NAS wieder normal", f"Die CPU ist auf {cpu_t:.0f} °C abgekühlt.", calm=True)
@@ -2139,7 +2154,7 @@ def announce_config(state=None):
 CONFIG_MARKER = ".nzblab-agent-config"
 # Ab 1.18.0: was der Agent in /config selbst anlegt; nur solche Einträge gelten als «eigener Ordner» (Markierung allein nicht)
 OWN_CONFIG_ENTRY = re.compile(r"token\.txt(\.new)?|settings\.json(\.tmp)?|affiliate\.json|prices-[A-Za-z0-9_-]+\.json|"
-                              r"(history|files|devices)\.db(-wal|-shm|-journal)?|crashes|tls|keys-unlock|" + re.escape(CONFIG_MARKER))
+                              r"(history|files|devices)\.db(-wal|-shm|-journal)?|crashes|tls|keys-unlock|keys-issued|" + re.escape(CONFIG_MARKER))
 PRIV_STATE = {"root_reason": ""}      # ab 1.18.0: warum der Agent als root weiterläuft (leer = nicht root oder gewollt)
 
 
@@ -5178,7 +5193,9 @@ def agent_features(smart=None, backups=None, log_dir=None):
         feats.append("lan")
     if LOGS_ON and os.path.isdir(log_dir or LOG_DIR):
         feats.append("logs")
-    feats.extend(["tls", "tls_bind", "token_rotate", "keys_window"])   # ab 1.20.0
+    feats.extend(["token_rotate", "keys_window"])   # ab 1.20.0
+    if TLS_STATE["enabled"]:                 # ab 1.20.1: nur wenn HTTPS wirklich läuft (sonst wartet die App vergeblich auf Schlüssel)
+        feats.extend(["tls", "tls_bind"])
     feats.append("discover")                 # ab 1.16.0: /api/discover; «discover_keys» = liefert auch API-Keys
     if DISCOVER_KEYS:
         feats.append("discover_keys")
@@ -5873,6 +5890,38 @@ def setup_tls(config=None):
     return ctx
 
 
+def _keys_mark_path():
+    return os.path.join(CONFIG, "keys-issued")
+
+
+def keys_issued():
+    """Ab 1.20.1: wurden auf diesem Agenten schon einmal Dienst-Schlüssel ausgegeben (Marker /config/keys-issued)?
+    Der Marker von 1.20.0-Zwischenständen (/config/tls/keys-issued) zählt auch und wird übernommen."""
+    try:
+        if os.path.isfile(_keys_mark_path()):
+            return True
+        if os.path.isfile(os.path.join(CONFIG, "tls", "keys-issued")):
+            mark_keys_issued()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def mark_keys_issued():
+    """Marker setzen. Rückgabe True, wenn er da ist. Ein Schreibfehler wird laut gemeldet (sonst öffnete jeder Neustart weiter das Fenster)."""
+    path = _keys_mark_path()
+    try:
+        with open(path, "a"):
+            pass
+        return True
+    except OSError as e:
+        print(f"WARNUNG: Marker keys-issued lässt sich nicht schreiben ({e.__class__.__name__}); das Schlüssel-Fenster öffnet bei jedem Start. "
+              f"/config muss für den Agenten beschreibbar sein. / WARNING: cannot write marker keys-issued; the keys window opens at every start. "
+              f"/config must be writable.", flush=True)
+        return False
+
+
 class KeysWindow:
     """Einrichtungs-Fenster für Dienst-Schlüssel: [first] Sekunden ab Start, nach der Datei CONFIG/keys-unlock [reopen] Sekunden.
     Ein Token allein entsperrt nie (sonst nützte die Sperre gegen einen gestohlenen Token nichts): nur wer im Container oder in
@@ -5884,8 +5933,10 @@ class KeysWindow:
         self.lock = threading.Lock()
 
     def restart(self):
+        """Fenster beim Start: nur solange noch nie Schlüssel ausgegeben wurden (ab 1.20.1; sonst öffnete jeder nächtliche Neustart
+        das Fenster für einen gestohlenen Token). Danach nur noch über die Datei keys-unlock."""
         with self.lock:
-            self.until = self.clock() + self.first
+            self.until = self.clock() + (0 if keys_issued() else self.first)
 
     def _consume_file(self):
         path = os.path.join(CONFIG, "keys-unlock")
@@ -5909,6 +5960,24 @@ class KeysWindow:
 
 
 KEYS = KeysWindow()
+
+
+def existing_install():
+    """Läuft hier schon ein Agent (Update)? token.txt, oder bei Token per Umgebung (NZBLAB_AGENT_TOKEN) eine settings.json/history.db."""
+    try:
+        if os.path.isfile(os.path.join(CONFIG, "token.txt")):
+            return True
+        return any(os.path.isfile(os.path.join(CONFIG, n)) for n in ("settings.json", "history.db"))
+    except OSError:
+        return False
+
+
+def startup_keys_window(had_token):
+    """Fenster beim Start. Bestehende Installation (Token gab es schon) ohne Marker: dieses Start-Fenster ist das einmalige letzte
+    nach dem Update, der Marker wird gleich gesetzt, ab dem nächsten Start bleibt es zu (ab 1.20.1)."""
+    KEYS.restart()
+    if had_token and not keys_issued():
+        mark_keys_issued()
 KEYS_HINT = ("Dienst-Schlüssel gibt es nur in den ersten 30 Minuten nach dem Start des Agenten. Container neu starten (dann 30 Minuten Zeit) "
              "oder auf dem NAS die leere Datei keys-unlock im Ordner /config anlegen (dann 10 Minuten). Ein Token allein entsperrt nicht. "
              "/ Service keys are only handed out in the first 30 minutes after the agent starts. Restart the container (30 minutes), "
@@ -6238,6 +6307,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 try:
                     res = discover.scan(with_keys=want_keys)
                     if want_keys and DISCOVER_KEYS:     # ab 1.20.0 (Audit): jede Ausgabe von Schlüsseln ins Log (nie die Schlüssel selbst)
+                        mark_keys_issued()              # ab 1.20.1: danach öffnet ein Neustart das Fenster nicht mehr
                         print(f"Dienst-Schlüssel ausgegeben an {self.client_address[0]}: {len(res.get('services') or [])} Dienste.", flush=True)
                     return self.reply(200, res, nostore)
                 except Exception:  # noqa: BLE001
@@ -6267,6 +6337,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                         "api_level": API_LEVEL, "features": agent_features(smart, backups, log_dir),
                                         # ab 1.20.0: HTTPS, Fingerabdruck, Klartext an/aus, Schlüssel-Fenster
                                         "tls": TLS_STATE["enabled"], "fingerprint": TLS_STATE["fingerprint"], "http": HTTP_ON,
+                                        "tls_failed": bool(TLS_STATE["error"] and not TLS_STATE["enabled"]),   # ab 1.20.1
                                         "secure": self.secure, "keys": keys_state(),
                                         "last_boot": (boot_now() or (None,))[0],
                                         "boots_7d": len(store.boots(now - 7 * 86400)),
@@ -6374,6 +6445,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                                           {"Cache-Control": "no-store"})
                     tok = new
                     TOKEN_STATE.update(error="", source="file", code="")
+                    mark_keys_issued()      # ab 1.20.1: wer den Token erneuert hat, hat das Fenster schon genutzt
                 print(f"Token erneuert von {ip} (der alte Token ist ungültig).", flush=True)
                 return self.reply(200, {"ok": True, "token": new}, {"Cache-Control": "no-store", "Pragma": "no-cache"})
             if u.path == "/api/config":
@@ -6518,13 +6590,14 @@ def main():
     except OSError:
         pass
     CONFIG_STATE.update(config_mount())    # vor dem Token: bleibt /config beim Neuerstellen erhalten?
+    had_token = existing_install()         # ab 1.20.1: gab es den Agenten schon (Update, kein Neu-Install)?
     tok = token()                          # als root anlegen und anzeigen, danach gehört er dem Benutzer (drop_privileges)
     tls_ctx = setup_tls()                  # ab 1.20.0: Zertifikat erzeugen/laden (als root, vor dem Rechte-Abgeben), Fingerabdruck ins Log
     if tls_ctx is None and not HTTP_ON:
         print("FEHLER: NZBLAB_HTTP=0 verlangt HTTPS, aber es gibt kein Zertifikat (siehe WARNUNG oben). Der Agent startet nicht. "
               "/ ERROR: NZBLAB_HTTP=0 needs HTTPS but there is no certificate. Not starting.", flush=True)
         sys.exit(1)
-    KEYS.restart()                         # Schlüssel-Fenster: 30 Minuten ab jetzt
+    startup_keys_window(had_token)         # Schlüssel-Fenster: 30 Minuten ab jetzt (nur solange nie Schlüssel ausgegeben wurden)
     announce_config()                      # laute Warnung mit Lösung, wenn nicht (nach dem Token, damit sie danach im Log steht)
     load_container_names()                 # braucht root (config.v2.json ist 600); einmal beim Start reicht
     smart_helper = SmartHelper()

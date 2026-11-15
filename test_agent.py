@@ -131,7 +131,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.20.0")
+        self.assertEqual(info["version"], "1.20.1")
         srv.shutdown()
 
 
@@ -3648,6 +3648,40 @@ class Agent118Test(unittest.TestCase):
         feed(97.0, 20)                                  # wieder heiss: neue Meldung
         self.assertEqual(got, ["NAS zu heiss", "ruhig NAS wieder normal", "NAS zu heiss"])
 
+    def test_d2_hitze_zeit_beginnt_neu_wenn_unter_schwelle(self):
+        store, got = a.Store(":memory:"), []
+        w = a.Watcher(store, lambda t, x, calm=False: got.append(t))
+        t = 1_760_000_000
+        def feed(temp, n):
+            nonlocal t
+            for _ in range(n):
+                t += 30
+                w.feed({"t": t, "cpu": 20.0, "temps": {"CPU": temp}, "disks": {}, "top": []})
+        feed(97.0, 2)                                   # 1 Minute heiss
+        feed(a.HEAT_ALERT - 5, 2)                       # knapp darunter (noch keine Entwarnung): Zeit beginnt neu
+        feed(97.0, 2 * a.HEAT_MINUTES - 2)              # fast die ganze Zeit wieder heiss, aber nicht lang genug am Stück
+        self.assertEqual(got, [])
+        feed(97.0, 4)
+        self.assertEqual(got, ["NAS zu heiss"])
+
+    def test_d1_ryzen_tdie_statt_tctl(self):
+        h = FakeHost()
+        write(f"{h.sys}/class/hwmon/hwmon7/name", "k10temp")
+        write(f"{h.sys}/class/hwmon/hwmon7/temp1_label", "Tctl")
+        write(f"{h.sys}/class/hwmon/hwmon7/temp1_input", "85000")
+        write(f"{h.sys}/class/hwmon/hwmon7/temp2_label", "Tdie")
+        write(f"{h.sys}/class/hwmon/hwmon7/temp2_input", "65000")
+        os.remove(f"{h.sys}/class/hwmon/hwmon5/temp1_input")
+        os.remove(f"{h.sys}/class/hwmon/hwmon5/temp2_input")
+        self.assertEqual(a.Sampler(h.sys, h.proc).temps()["CPU"], 65.0)
+        # N3: Tdie ohne gültigen Wert (leer/Unsinn): Tctl bleibt
+        write(f"{h.sys}/class/hwmon/hwmon7/temp2_input", "x")
+        self_cpu = a.Sampler(h.sys, h.proc).temps()["CPU"]
+        self.assertEqual(self_cpu, 85.0)
+        # nur Tctl (Ryzen 7000): Tctl zählt
+        write(f"{h.sys}/class/hwmon/hwmon7/temp2_label", "Tccd1")
+        self.assertEqual(a.Sampler(h.sys, h.proc).temps()["CPU"], 85.0)
+
     def test_m1_erkennung_fremd(self):
         write(f"{self.d}/token.txt", "t")
         write(f"{self.d}/mariadb/db.opt", "x")
@@ -4264,6 +4298,75 @@ class Agent120Test(unittest.TestCase):
         self.assertTrue(body["keys"]["open"])
         self.assertTrue({"tls", "token_rotate", "keys_window"} <= set(body["features"]))
         self.assertFalse(self.call(port, "/api/info", "http", "GET")[1]["secure"])
+
+    def test_fenster_beim_start_nur_bis_zur_ersten_ausgabe(self):
+        now = [1000.0]
+        a.KEYS.clock = lambda: now[0]
+        a.KEYS.restart()
+        self.assertGreater(a.KEYS.seconds_left(), 0)           # noch nie Schlüssel ausgegeben: Fenster offen
+        port = self.start(root=self.fixture_root())
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 200)
+        self.assertTrue(os.path.isfile(f"{self.cfg}/keys-issued"))
+        a.KEYS.restart()                                        # «nächtlicher Neustart»
+        self.assertEqual(a.KEYS.seconds_left(), 0)
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 403)
+        write(f"{self.cfg}/keys-unlock", "")                    # die Datei geht weiter
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 200)
+
+    def test_update_einer_bestehenden_installation_gibt_ein_letztes_fenster(self):
+        now = [1000.0]
+        a.KEYS.clock = lambda: now[0]
+        a.startup_keys_window(had_token=True)                   # Update: Token gab es schon, noch nie Schlüssel geholt
+        self.assertGreater(a.KEYS.seconds_left(), 0)            # dieses Fenster ist offen (einmalig)
+        self.assertTrue(os.path.isfile(f"{self.cfg}/keys-issued"))
+        a.startup_keys_window(had_token=True)                   # nächster (nächtlicher) Neustart
+        self.assertEqual(a.KEYS.seconds_left(), 0)
+
+    def test_neu_installation_bleibt_offen_bis_zur_ersten_ausgabe(self):
+        a.startup_keys_window(had_token=False)
+        self.assertFalse(os.path.exists(f"{self.cfg}/keys-issued"))
+        a.startup_keys_window(had_token=False)
+        self.assertGreater(a.KEYS.seconds_left(), 0)
+
+    def test_bestehende_installation_erkennen_auch_mit_env_token(self):
+        self.assertFalse(a.existing_install())
+        write(f"{self.cfg}/history.db", "")
+        self.assertTrue(a.existing_install())          # Token per Umgebung, aber Verlauf da: Update
+        os.unlink(f"{self.cfg}/history.db")
+        write(f"{self.cfg}/settings.json", "{}")
+        self.assertTrue(a.existing_install())
+        os.unlink(f"{self.cfg}/settings.json")
+        write(f"{self.cfg}/token.txt", "x")
+        self.assertTrue(a.existing_install())
+
+    def test_alter_marker_aus_1_20_0_zaehlt_und_wird_uebernommen(self):
+        os.makedirs(f"{self.cfg}/tls", exist_ok=True)
+        write(f"{self.cfg}/tls/keys-issued", "")
+        self.assertTrue(a.keys_issued())
+        self.assertTrue(os.path.isfile(f"{self.cfg}/keys-issued"))
+        a.KEYS.restart()
+        self.assertEqual(a.KEYS.seconds_left(), 0)
+
+    def test_marker_schreibfehler_wird_gemeldet(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with patch.object(a, "CONFIG", f"{self.cfg}/gibts-nicht"), contextlib.redirect_stdout(buf):
+            self.assertFalse(a.mark_keys_issued())
+        self.assertIn("WARNUNG", buf.getvalue())
+        self.assertIn("WARNING", buf.getvalue())
+
+    def test_zaehlen_ohne_schluessel_setzt_keinen_marker(self):
+        port = self.start(root=self.fixture_root())
+        self.assertEqual(self.call(port, "/api/discover?keys=0", "https", "GET")[0], 200)
+        self.assertFalse(os.path.exists(f"{self.cfg}/keys-issued"))
+
+    def test_tls_merkmale_nur_wenn_https_laeuft(self):
+        self.start()
+        self.assertTrue({"tls", "tls_bind"} <= set(a.agent_features(None, None, None)))
+        a.TLS_STATE.update(enabled=False, error="kaputt")
+        feats = a.agent_features(None, None, None)
+        self.assertFalse({"tls", "tls_bind"} & set(feats))
+        self.assertIn("token_rotate", feats)
 
     def test_healthcheck_befehl(self):
         port = self.start()
