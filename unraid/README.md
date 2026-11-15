@@ -8,9 +8,7 @@ Unraid Community Applications (CA) template for the **NASlab-Agent** (this folde
 
 ## Install
 
-Easiest: Unraid › **Apps** › search **NASlab-Agent** › **Install**.
-
-Alternative without the Apps search:
+Via the template repository:
 
 1. Unraid › **Docker** › scroll down to **Template repositories**, add the line
    `https://github.com/Tuxxler/unraid-templates` › **Save**.
@@ -23,6 +21,8 @@ Alternative without the Apps search:
 All host paths are mounted **read-only**. Only `/config` (`/mnt/user/appdata/nzblab-agent`) is writable.
 After start the agent drops root and runs as `PUID`/`PGID` (99/100). Set `PUID=0` only if you need container names
 in the "top load" list or appdata sizes of containers with strict permissions.
+
+Once the agent is approved in Community Applications, it can also be installed via **Apps** › search *NASlab-Agent*.
 
 Optional and off by default: SMART (`NZBLAB_SMART`), log excerpts (`NZBLAB_LOGS`, also needed for the system log in "Today"), the home-network device scan (`NZBLAB_LAN`: every 30 minutes one empty UDP packet to each address of your /24 network, reverse DNS, push for new devices; your router may report it as a port scan). The optional paths *System log* and *Docker container names* are empty by default. Map `/config` to its own folder (`/mnt/user/appdata/nzblab-agent`), never to the whole `appdata`.
 

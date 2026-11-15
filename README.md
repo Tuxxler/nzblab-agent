@@ -1,15 +1,17 @@
-# NASlab-Agent (früher NZBLab-Agent)
+# NASlab Agent
 
-## Overview (English)
+**English** · [Deutsch](README.de.md)
 
-**What it is.** A small, free and open-source service for your NAS that measures around the clock and feeds the NASlab Android app: temperatures of all sensors, CPU load (total and per core), GPU, memory, disk activity (when a disk spins up after a pause) and the top CPU processes. 8 days at full resolution (every 30 s), 2 years of hourly values. Optional parts: SMART, logs, backup status, service discovery ("everything connected in one minute"), file index, duplicate finder. The agent is optional; the app also works without it.
+## Overview
+
+**What it is.** A small, free and open-source service for your NAS that measures around the clock and feeds the NASlab Android app: temperatures of all sensors, CPU load (total and per core), GPU (graphics and media engine; the media engine transcodes video for Plex), memory, disk activity (when a disk spins up after a pause) and the top CPU processes. 8 days at full resolution (every 30 s), 2 years of hourly values. Optional parts: SMART, logs, backup status, service discovery ("everything connected in one minute"), file index, duplicate finder. The agent is optional; the app also works without it.
 
 **What it reads.** Host data through read-only mounts (`/proc`, `/sys`, your shares, optionally logs and SMART). It writes only to its own `/config` folder (history and token). It never changes anything on the NAS. Reading service API keys for auto-connect is on by default and can be turned off with `DISCOVER_KEYS=0`.
 
 **Getting the app.** The NASlab Android app is coming to the Google Play Store in the next few days. Until then it is in a closed test: see <https://tuxxler.github.io/nzblab/en/#play>.
 
 **Install.** Image: `ghcr.io/tuxxler/nzblab-agent:latest` (amd64 and arm64). The image, container and folder names stay `nzblab-agent`.
-- Unraid: Apps › search «NASlab-Agent» › Install. Alternative: Docker › Template repositories › `https://github.com/Tuxxler/unraid-templates` (the template is also in `unraid/nzblab-agent.xml`).
+- Unraid: Docker › "Template repositories" › `https://github.com/Tuxxler/unraid-templates` › Save, then Docker › Add Container › template "NASlab-Agent" (the template is also in `unraid/nzblab-agent.xml`). Once it is approved in Community Apps, you can also install it via Apps › search "NASlab-Agent".
 - TrueNAS SCALE 24.10+: `compose/truenas.yml` (Install via YAML). The agent runs there; the NASlab app talks to the TrueNAS API from TrueNAS 25.04. Synology DSM 7.2+: `compose/synology.yml` (Container Manager project). Linux or any Docker host: `compose/linux.yml` or `docker-compose.yml`, then `docker compose up -d`.
 - Then enter `https://<NAS-IP>:8099` and the token in the app (Settings › Server connections › NASlab agent). From 1.20.0 the same port speaks HTTPS (self-generated certificate) and, during a transition period, plain HTTP; the app (2.77+) checks the certificate itself with a token-bound proof; the SHA-256 fingerprint in the container log is there to compare if you like.
 
@@ -26,538 +28,526 @@
 - Disk price sites (Toppreise.ch, Geizhals.de/.at, diskprices.com): only when a price country is set; the search terms are your own disk models (`PRICE_SOURCES_OFF` turns sources off).
 - `speed.cloudflare.com`: only when you start a speed test in the app.
 - Your ntfy server: only if you set `NTFY_URL`.
+
 Each of them sees the IP address of your connection. The NASlab app has its own list of addresses (in the app: Trust screen, and the privacy policy on the website).
 
 **Uninstall.** Stop and remove the container (Unraid: Docker › container › Remove; others: `docker compose down`). Then delete the `/config` folder (for example `appdata/nzblab-agent`): it holds the history, the file index and the token. The agent changes nothing else on the NAS. In the app, remove the NASlab-Agent connection under Settings › Server connections.
 
-The rest of this document is in German; the versioned feature history is at the bottom under "Changelog (Deutsch)".
-
 ---
 
+The container, image (`ghcr.io/tuxxler/nzblab-agent`), folders and paths are still called `nzblab-agent`; the log line with the token still reads "NZBLab-Agent Token: …".
 
-Container, Image (`ghcr.io/tuxxler/nzblab-agent`), Ordner und Pfade heissen weiter `nzblab-agent`; die Log-Zeile mit dem Token lautet weiterhin «NZBLab-Agent Token: …».
+## Install (for everyone, from agent 1.10.0)
 
-Kleiner Dienst auf dem NAS, der rund um die Uhr misst und die Werte der NASlab-App liefert:
-Temperaturen aller Sensoren, CPU-Last (gesamt und pro Kern), Grafikchip (Grafik- und Medien-Einheit, die Medien-Einheit
-rechnet Videos für Plex um), Arbeitsspeicher, Plattenzugriffe (wann eine Platte nach einer Pause anläuft) und welche
-Programme die meiste CPU brauchen. 8 Tage volle Auflösung (alle 30 s), 2 Jahre Stundenwerte.
+Ready-made image: **`ghcr.io/tuxxler/nzblab-agent:latest`** (amd64 and arm64, built by `.github/workflows/agent-image.yml`,
+based on `python:3.12-alpine3.22`, Python standard library only). Free, source code publicly viewable:
+<https://github.com/Tuxxler/nzblab-agent> (see Licence below).
+The same instructions are in the app (Settings › Server connections › NASlab agent › "Install agent") and on the
+website <https://tuxxler.github.io/nzblab/agent.html>.
 
-**Nur lesen.** Der Agent ändert nichts am NAS. Alle Host-Pfade sind nur lesend eingebunden, schreibbar ist nur `/config`.
-
-## Installieren (für alle, ab Agent 1.10.0)
-
-Fertiges Image: **`ghcr.io/tuxxler/nzblab-agent:latest`** (amd64 und arm64, gebaut von `.github/workflows/agent-image.yml`,
-Grundlage `python:3.12-alpine3.22`, nur Python-Standardbibliothek). Kostenlos, Quellcode öffentlich einsehbar:
-<https://github.com/Tuxxler/nzblab-agent> (Lizenz siehe unten).
-Gleiche Anleitung in der App (Einstellungen › Server-Verbindungen › NASlab-Agent › «Agent installieren») und auf der
-Website <https://tuxxler.github.io/nzblab/agent.html>.
-
-| System | Datei | Kurz |
+| System | File | In short |
 |---|---|---|
-| Unraid | `unraid/nzblab-agent.xml` | Apps › «NASlab-Agent» › Install; sonst Docker › Template repositories › `https://github.com/Tuxxler/unraid-templates` |
-| TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = eigener Pool. Der Agent läuft ab 24.10; die App spricht die TrueNAS-Schnittstelle erst ab 25.04 an |
-| Synology DSM 7.2+ | `compose/synology.yml` | Ordner `docker/nzblab-agent` anlegen; Container Manager › Projekt › Erstellen |
-| Linux (Debian, Ubuntu …, ab 1.14.0) | `compose/linux.yml` | Ordner anlegen, Datei als `docker-compose.yml` speichern, `docker compose up -d`; siehe unten |
-| Docker allgemein / alle in einer Datei (ab 1.15.0) | `docker-compose.yml` | Block A–D für deinen Server einkommentieren, freiwillige Blöcke S (SMART), L (Logs), B2 (Backups); `docker compose up -d` |
+| Unraid | `unraid/nzblab-agent.xml` | Docker › "Template repositories" › `https://github.com/Tuxxler/unraid-templates` › Save, then Docker › Add Container › template "NASlab-Agent" |
+| TrueNAS SCALE (24.10+) | `compose/truenas.yml` | Apps › Discover Apps › ⋮ › Install via YAML; `tank` = your own pool. The agent runs from 24.10; the app only talks to the TrueNAS API from 25.04 |
+| Synology DSM 7.2+ | `compose/synology.yml` | Create the folder `docker/nzblab-agent`; Container Manager › Project › Create |
+| Linux (Debian, Ubuntu …, from 1.14.0) | `compose/linux.yml` | Create a folder, save the file as `docker-compose.yml`, `docker compose up -d`; see below |
+| Docker in general / everything in one file (from 1.15.0) | `docker-compose.yml` | Uncomment blocks A–D for your server, optional blocks S (SMART), L (logs), B2 (backups); `docker compose up -d` |
 
-**Token:** Beim ersten Start erzeugt der Agent einen zufälligen Token (`/config/token.txt`, Rechte 600) und schreibt ihn
-**genau einmal** ins Container-Log:
+**Token:** On first start the agent creates a random token (`/config/token.txt`, mode 600) and writes it to the container
+log **exactly once** (the log text itself is in German):
 
 ```
 ================================================================
 NZBLab-Agent Token: …
-In der App eintragen: Einstellungen › Server-Verbindungen › NASlab-Agent.
+In der App eintragen: Einstellungen › Server-Verbindungen › NZBLab-Agent.
 ================================================================
 ```
 
-Danach steht er nur noch in der Datei. Wer das Container-Log lesen kann, ist ohnehin Admin des NAS. Bewusst **keine**
-Setup-Seite, die den Token im Browser zeigt: sonst könnte ihn jedes Gerät im Heimnetz abholen. Neuer Token: `token.txt`
-löschen und Container neu starten. Eigener Token: Variable `NZBLAB_AGENT_TOKEN` (dann nichts im Log, sie hat Vorrang): **mindestens 32 zufällige Zeichen ohne
-Leerzeichen, besser leer lassen** (ab 1.16.1; kürzere Werte oder Werte mit weniger als 8 verschiedenen Zeichen, z. B.
-`aaaa…`, lehnt der Agent mit `503`/`token_error` ab).
+After that it only exists in the file. Anyone who can read the container log is an admin of the NAS anyway. There is deliberately **no**
+setup page that shows the token in the browser: otherwise every device in the home network could fetch it. New token: delete
+`token.txt` and restart the container. Own token: variable `NZBLAB_AGENT_TOKEN` (then nothing is logged; it takes precedence): **at least 32 random characters without
+spaces, better leave it empty** (from 1.16.1; shorter values or values with fewer than 8 distinct characters, e.g.
+`aaaa…`, are rejected by the agent with `503`/`token_error`).
 
-**Pfad `/config` ist Pflicht:** Hier speichert der Agent Token und Verlauf. Ohne eigenen Pfad liegt beides nur im
-Container und ist nach jedem Update weg: Dann gibt es jedes Mal einen neuen Token, die App verbindet sich nicht mehr. Unraid:
-Docker › nzblab-agent › Bearbeiten › Pfad `/config` → `/mnt/user/appdata/nzblab-agent` (Lesen/Schreiben) › Übernehmen.
-Compose: `- ./nzblab-agent:/config` (bzw. der Pfad in den Vorlagen).
+**The `/config` path is mandatory:** the agent stores its token and history there. Without a path of its own, both live only inside the
+container and are gone after every update: you get a new token each time and the app can no longer connect. Unraid:
+Docker › nzblab-agent › Edit › path `/config` → `/mnt/user/appdata/nzblab-agent` (read/write) › Apply.
+Compose: `- ./nzblab-agent:/config` (or the path in the templates).
 
-Ab 1.13.0 sichert der Agent das ab:
+From 1.13.0 the agent guards against this:
 
-- Ein neuer Token entsteht **nur**, wenn `token.txt` fehlt. Ist die Datei leer, beschädigt, zu kurz (unter 32 Zeichen, ab 1.16.1), ein Symlink (ab 1.16.1 mit `O_NOFOLLOW` nie gelesen) oder nicht lesbar (Rechte),
-  überschreibt er sie nie: Fehlermeldung im Log, und alle Anfragen mit Token antworten `503` mit dem genauen Grund
-  (`{"error": …, "token_error": …}`). Lösung: alten Token in die Datei schreiben, Datei löschen (dann neuer Token) oder
-  `NZBLAB_AGENT_TOKEN` setzen.
-- Beim Start prüft er in `/proc/self/mountinfo`, ob `/config` (oder ein Ordner darüber, ausser `/`) ein eigener Mount ist.
-  Nicht bleibend sind: nur das Dateisystem des Containers, tmpfs, ein anonymer Docker-Volume (`VOLUME /config` im Image
-  ohne eigenen Pfad, wird beim Neuerstellen ersetzt) und ein nur lesender Mount. Dann: laute Warnung mit Lösung im Log
-  (Deutsch und Englisch), `config_persistent: false` in `/api/ping` und `/api/info` (dort dazu `warnings`) und ein Hinweis
-  auf der Browser-Seite.
-- Ist `settings.json` beschädigt (kein gültiges JSON), hebt er sie vor dem nächsten Speichern als
-  `settings.json.broken-<Zeit>` auf und meldet das im Log, statt sie still zu überschreiben.
+- A new token is created **only** if `token.txt` is missing. If the file is empty, damaged, too short (under 32 characters, from 1.16.1), a symlink (never read from 1.16.1 on, thanks to `O_NOFOLLOW`) or unreadable (permissions),
+  it never overwrites it: an error is logged, and all requests with a token answer `503` with the exact reason
+  (`{"error": …, "token_error": …}`). Fix: write the old token into the file, delete the file (then a new token is created) or
+  set `NZBLAB_AGENT_TOKEN`.
+- At start it checks in `/proc/self/mountinfo` whether `/config` (or a folder above it, except `/`) is a mount of its own.
+  Not persistent are: only the container's own filesystem, tmpfs, an anonymous Docker volume (`VOLUME /config` in the image
+  without a path of your own, replaced when the container is recreated) and a read-only mount. In that case: a loud warning with the fix in the log
+  (German and English), `config_persistent: false` in `/api/ping` and `/api/info` (plus `warnings` there) and a notice
+  on the browser page.
+- If `settings.json` is damaged (not valid JSON), it moves it aside before the next save as
+  `settings.json.broken-<time>` and reports this in the log instead of silently overwriting it.
 
-**Ohne root:** Das Image setzt `PUID=99`, `PGID=100` (nobody:users). Der Agent startet als root, legt den Token an, liest die
-Container-Namen (`/host/docker/containers`, nur root lesbar), gibt `/config` diesem Benutzer und läuft dann ohne root weiter.
-Kann er `/config` nicht übergeben (z. B. NFS mit root_squash), bleibt er mit Hinweis im Log root. `PUID=0` = immer root:
-nötig nur für appdata-Grössen anderer Container mit engen Rechten. TrueNAS-Vorlage: 568:568 (Benutzer «apps»);
-Synology-Vorlage ab 1.19.0: eigene Nummer (Beispiel 1026:100, SSH `id`). **`PUID=0` (root) wird abgeraten**, nur falls DSM-ACLs den Datei-Index sonst blockieren.
+**Without root:** The image sets `PUID=99`, `PGID=100` (nobody:users). The agent starts as root, creates the token, reads the
+container names (`/host/docker/containers`, readable by root only), gives `/config` to this user and then continues without root.
+If it cannot hand over `/config` (e.g. NFS with root_squash), it stays root and says so in the log. `PUID=0` = always root:
+needed only for appdata sizes of other containers with strict permissions. TrueNAS template: 568:568 (user "apps");
+Synology template from 1.19.0: its own number (example 1026:100, SSH `id`). **`PUID=0` (root) is discouraged**, only if DSM ACLs would otherwise block the file index.
 
-**Härtung in allen Vorlagen:** `--read-only` (Root-Dateisystem), `/tmp` als tmpfs, `no-new-privileges`, 512 MB RAM, 1 CPU,
-kein `privileged`, `cap_drop: ALL` und nur fünf Capabilities für den Start (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`; danach läuft der Agent ohne root). HEALTHCHECK im Image: `--healthcheck` des Agenten, der `/api/health` prüft.
+**Hardening in all templates:** `--read-only` (root filesystem), `/tmp` as tmpfs, `no-new-privileges`, 512 MB RAM, 1 CPU,
+no `privileged`, `cap_drop: ALL` and only five capabilities for the start (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`; after that the agent runs without root). HEALTHCHECK in the image: the agent's `--healthcheck`, which checks `/api/health`.
 
-Weitere Variablen für andere Systeme: `FILES_EXCLUDE` (oberste Ordner, auch Muster wie `@*`), `FILES_SKIP` (in jeder Ebene,
-Standard `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (leer = kein Cache).
+More variables for other systems: `FILES_EXCLUDE` (top-level folders, also patterns like `@*`), `FILES_SKIP` (at every level,
+default `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (empty = no cache).
 
-Optional: Push-Meldung bei Hitze auch unterwegs: Variable `NTFY_URL` = `https://ntfy.sh/<langes-geheimes-wort>` und in der
-App «ntfy» dasselbe Thema abonnieren. Schwelle: `HEAT_ALERT_C` (Standard 95 °C, nach 5 Minuten). Ab 1.18.0 schickt ntfy
-standardmässig nur noch Kritisches (siehe Abschnitt 1.18.0, `NZBLAB_NTFY_ALL`).
+Optional: push notification on overheating while you are away: variable `NTFY_URL` = `https://ntfy.sh/<long-secret-word>` and subscribe
+to the same topic in the app's "ntfy". Threshold: `HEAT_ALERT_C` (default 95 °C, after 5 minutes). From 1.18.0 ntfy sends
+only critical things by default (see section 1.18.0, `NZBLAB_NTFY_ALL`).
 
-## Linux (Debian, Ubuntu …) (ab 1.14.0)
+## Linux (Debian, Ubuntu …) (from 1.14.0)
 
-Für Linux-Server ohne eigene NAS-Schnittstelle (Debian, Ubuntu, Raspberry Pi OS und ähnliche). In der App heisst der
-Server-Typ **«Linux (Beta)»** (Einstellungen › Server-Verbindungen › NAS-Server). Übersicht, Speicher, Temperaturen und
-Meldungen kommen vom Agenten; Docker-Container steuert die App optional über **Portainer** (eigener Dienst in der App,
-Zugriffstoken aus Portainer › Mein Konto › Zugriffstoken). Der Agent selbst bekommt **kein** `docker.sock`.
+For Linux servers without a NAS interface of their own (Debian, Ubuntu, Raspberry Pi OS and similar). In the app the
+server type is called **"Linux (Beta)"** (Settings › Server connections › NAS server). Overview, storage, temperatures and
+notifications come from the agent; Docker containers are optionally controlled by the app through **Portainer** (a separate service in the app,
+access token from Portainer › My account › Access tokens). The agent itself gets **no** `docker.sock`.
 
-**Beta:** nur mit Testdaten geprüft (nachgebautes `/proc`, `/sys` und `os-release` in `test_agent.py`, Demo-Agent in der App),
-noch nie an einem echten Debian- oder Ubuntu-Server.
+**Beta:** tested only with test data (replicated `/proc`, `/sys` and `os-release` in `test_agent.py`, demo agent in the app),
+never on a real Debian or Ubuntu server.
 
-Vorlage `compose/linux.yml`:
+Template `compose/linux.yml`:
 
-1. Ordner anlegen und den Ordner für Token und Verlauf dem Agenten-Benutzer geben:
+1. Create a folder and give the folder for token and history to the agent's user:
    `mkdir -p ~/nzblab-agent/nzblab-agent-config && sudo chown 65534:65534 ~/nzblab-agent/nzblab-agent-config`,
-   dann in `~/nzblab-agent` die Datei als `docker-compose.yml` speichern.
-2. Ordner mit Daten anpassen (siehe unten), dann `docker compose up -d`.
-3. Token: `docker logs nzblab-agent 2>&1 | grep "NZBLab-Agent Token"`. In der App den Dienst «NASlab-Agent» eintragen und
-   beim NAS-Server den Typ «Linux (Beta)» wählen.
+   then save the file as `docker-compose.yml` in `~/nzblab-agent`.
+2. Adjust the folders with data (see below), then `docker compose up -d`.
+3. Token: `docker logs nzblab-agent 2>&1 | grep "NZBLab-Agent Token"`. In the app, add the "NASlab agent" service and
+   choose the type "Linux (Beta)" for the NAS server.
 
-**Sicherheit zuerst: nie das ganze System (`/`) einbinden.** Der Agent braucht es nicht. Er liest:
+**Security first: never mount the whole system (`/`).** The agent does not need it. It reads:
 
-| Pfad im Container | vom Host | wofür |
+| Path in the container | From the host | Used for |
 |---|---|---|
-| `/host/proc` | `/proc` (nur lesen) | CPU, RAM, Last, Betriebszeit, Einhängepunkte (`/host/proc/1/mountinfo`, sonst `mounts`, sonst die eigenen des Containers), Netz |
-| `/host/sys` | `/sys` (nur lesen) | Platten (Modell, Grösse, drehend, Temperatur über `drivetemp`/NVMe), Netzwerkkarten, Sensoren |
-| `/host/os-release` | `/etc/os-release` (nur lesen, **eine Datei**) | Name und Version des Systems |
-| `/host/fs/<Name>` | ein Ordner deiner Wahl (nur lesen) | **Belegung** (belegt, frei, gesamt per `os.statvfs`) und Datei-Index |
-| `/host/docker-root` | optional | Belegung des Docker-Datenordners. Vorsicht: `/var/lib/docker` enthält die Einstellungen aller Container (auch Passwörter); nur einbinden, wenn nötig |
+| `/host/proc` | `/proc` (read-only) | CPU, RAM, load, uptime, mount points (`/host/proc/1/mountinfo`, else `mounts`, else the container's own), network |
+| `/host/sys` | `/sys` (read-only) | Disks (model, size, rotational, temperature via `drivetemp`/NVMe), network cards, sensors |
+| `/host/os-release` | `/etc/os-release` (read-only, **one file**) | Name and version of the system |
+| `/host/fs/<name>` | a folder of your choice (read-only) | **Usage** (used, free, total via `os.statvfs`) and file index |
+| `/host/docker-root` | optional | Usage of the Docker data folder. Careful: `/var/lib/docker` holds the settings of all containers (including passwords); mount it only if necessary |
 
-Belegung gibt es nur für Ordner unter `/host/fs` (Beispiel `- /srv:/host/fs/data:ro`, weitere mit eigenem Namen). Alle anderen
-Dateisysteme stehen ohne Belegung in der Liste, die Grösse kommt aus `/sys/class/block`. Pseudo-Dateisysteme (proc, tmpfs,
-overlay, squashfs …), `/proc`, `/sys`, `/dev`, `/run`, `/boot/efi` und Docker-Overlays sind ausgeblendet. Mit
-`FILES_ROOT=/host/fs` indexiert der Agent genau diese Ordner (Speicher-Analyse, Suche, Duplikate).
+Usage is only available for folders under `/host/fs` (example `- /srv:/host/fs/data:ro`, more with their own names). All other
+filesystems appear in the list without usage; the size comes from `/sys/class/block`. Pseudo filesystems (proc, tmpfs,
+overlay, squashfs …), `/proc`, `/sys`, `/dev`, `/run`, `/boot/efi` and Docker overlays are hidden. With
+`FILES_ROOT=/host/fs` the agent indexes exactly these folders (storage analysis, search, duplicates).
 
-`network_mode: host`: So sieht der Agent die echten Netzwerkkarten und IP-Adressen des Servers und die Geräte im Heimnetz.
-Port 8099 liegt dann direkt auf dem Server: nie ins Internet freigeben.
+`network_mode: host`: this way the agent sees the server's real network cards and IP addresses and the devices in the home network.
+Port 8099 then sits directly on the server: never expose it to the internet.
 
-**Benutzer (wichtig):** Die Vorlage startet den Agenten direkt als `65534:65534` (nobody, kein Login) mit `cap_drop: ALL`
-und `no-new-privileges`; er wechselt also nie von root weg, sondern hat root gar nicht erst. **Nicht** als root und
-**nicht** als deinen eigenen Benutzer (z. B. 1000) starten: Mit `/proc` des Servers kann ein Prozess über
-`/proc/<pid>/root` in das Dateisystem anderer Prozesse **desselben** Benutzers schauen, mit dessen Schreibrechten. Als
-nobody betrifft das höchstens Programme, die selbst als nobody laufen. Noch strenger: eine eigene, sonst unbenutzte Nummer
-(z. B. `user: "8099:8099"`, Ordner entsprechend `chown 8099:8099`). Ordner unter `/host/fs` müssen für diesen Benutzer
-lesbar sein (meist «für alle lesbar»); die Belegung (`statvfs`) geht auch ohne Leserecht.
+**User (important):** The template starts the agent directly as `65534:65534` (nobody, no login) with `cap_drop: ALL`
+and `no-new-privileges`; so it never drops from root, it never has root in the first place. Do **not** start it as root and
+**not** as your own user (e.g. 1000): with the server's `/proc`, a process can look into the filesystem of other processes of the **same** user
+via `/proc/<pid>/root`, with that user's write permissions. As nobody this affects at most programs that run as nobody themselves. Even stricter: a number of its own that is otherwise unused
+(e.g. `user: "8099:8099"`, folder `chown 8099:8099` accordingly). Folders under `/host/fs` must be
+readable for this user (usually "world-readable"); usage (`statvfs`) also works without read permission.
 
-Optional härter: `/proc` auf dem Server mit `hidepid=invisible` (früher `hidepid=2`) einhängen
-(`proc /proc proc defaults,hidepid=invisible 0 0` in `/etc/fstab`). Dann sieht der Agent keine fremden Prozesse mehr:
-Die Liste «meiste Last» bleibt leer, und die Einhängepunkte kommen nur noch aus den eingebundenen Ordnern.
+Optionally stricter: mount `/proc` on the server with `hidepid=invisible` (formerly `hidepid=2`)
+(`proc /proc proc defaults,hidepid=invisible 0 0` in `/etc/fstab`). The agent then no longer sees other users' processes:
+the "top load" list stays empty, and mount points only come from the mounted folders.
 
-Hängt ein Netzwerk-Mount unter `/host/fs` (NFS/SMB weg), wartet der Agent höchstens `STATVFS_TIMEOUT` Sekunden (Standard 2)
-und markiert ihn mit `timeout: true`. `/api/host` und `/api/filesystems` rechnet er höchstens alle `HOST_CACHE_S`
-Sekunden neu (Standard 15).
+If a network mount under `/host/fs` hangs (NFS/SMB gone), the agent waits at most `STATVFS_TIMEOUT` seconds (default 2)
+and marks it with `timeout: true`. It recalculates `/api/host` and `/api/filesystems` at most every `HOST_CACHE_S`
+seconds (default 15).
 
-Die Vorlagen für Unraid (99:100), TrueNAS (568:568) und Synology (eigene Nummer, ab 1.19.0 nicht mehr root) sind davon unverändert.
+The templates for Unraid (99:100), TrueNAS (568:568) and Synology (own number, no longer root from 1.19.0) are unchanged by this.
 
-Unraid, TrueNAS und Synology ändern sich dadurch nicht: Die neuen Pfade sind nur zusätzlich.
+Unraid, TrueNAS and Synology therefore do not change: the new paths are only additional.
 
-## Übersicht im Browser (ab 1.4.0)
+## Overview in the browser (from 1.4.0)
 
-`https://<NAS-IP>:8099` (z. B. `https://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
-WireGuard). Der Browser warnt einmal, weil der Agent ein eigenes Zertifikat benutzt: Vergleiche den Fingerabdruck mit der Zeile im Container-Log. Die Einrichtung (Dienste suchen) geht nur innert 30 Minuten nach dem Start; sonst Container neu starten. Beim ersten Mal den Token einfügen (siehe «Token» oben); er bleibt nur in diesem Browser gespeichert, «Abmelden» löscht ihn.
+Open `https://<NAS-IP>:8099` (e.g. `https://192.168.1.10:8099`) in the browser (PC, tablet, phone on Wi-Fi or via
+WireGuard). The browser warns once because the agent uses its own certificate: compare the fingerprint with the line in the container log. Setup (finding services) only works within 30 minutes after the start; otherwise restart the container. The first time, paste the token (see "Token" above); it stays stored in this browser only, "Sign out" deletes it.
 
-Zu sehen, live alle 5 Sekunden: CPU und CPU-Temperatur mit Verlauf (12 Std.), Arbeitsspeicher, Netzwerk, Array mit
-Platten, Internet-Tempo (Knopf «Jetzt messen»), alle Temperaturen, meiste Last, Festplatten-Zugriffe, Grafikchip,
-Geräte im Heimnetz und Datei-Index. **Nur Anzeige**: Steuern (Container, Downloads, Array) geht in der App.
+Shown live, every 5 seconds: CPU and CPU temperature with history (12 h), memory, network, array with
+disks, internet speed ("Measure now" button), all temperatures, top load, disk activity, GPU,
+devices in the home network and file index. **Display only**: control (containers, downloads, array) is done in the app.
 
-Ganz oben **«Heute auf dem NAS»** (letzte 24 Stunden, Filter Probleme · Downloads · Unraid-Meldungen · Container · System):
-Unraid-Meldungen, fertige und fehlgeschlagene Downloads (aus dem Verlauf von SABnzbd in appdata, nur lesend), abgestürzte
-oder gestoppte Container, Fehler im Systemprotokoll (gleiche Meldungen zusammengefasst) und die Alarme des Agenten
-(Hitze, Array, neue Geräte, angelaufene Platten, Speedtest). Ohne Passwörter oder API-Keys. Dafür zwei zusätzliche
-Pfade, beide **nur lesen**: `/tmp/notifications` → `/host/notifications` und `/var/log` → `/host/log`.
-Fehlt eine Quelle, sagt die Seite unten in der Karte, welcher Pfad fehlt.
+At the very top **"Today on the NAS"** (last 24 hours, filters Problems · Downloads · Unraid notifications · Containers · System):
+Unraid notifications, finished and failed downloads (from SABnzbd's history in appdata, read-only), crashed
+or stopped containers, errors in the system log (identical messages grouped) and the agent's alerts
+(heat, array, new devices, disks that spun up, speed test). No passwords or API keys. This takes two additional
+paths, both **read-only**: `/tmp/notifications` → `/host/notifications` and `/var/log` → `/host/log`.
+If a source is missing, the page says at the bottom of the card which path is missing.
 
-Die Seite selbst braucht keinen Token, alle Werte schon. Sie lädt nichts aus dem Internet (strenge Content-Security-Policy).
-Nicht ins Internet freigeben; von unterwegs über WireGuard.
+The page itself needs no token, all values do. It loads nothing from the internet (strict Content-Security-Policy).
+Do not expose it to the internet; from elsewhere use WireGuard.
 
-Ab 1.9.0: Der Token gilt nur noch für den offenen Browser-Tab (`sessionStorage`, weg nach dem Schliessen). Die Seite
-aktualisiert sich alle 30 Sekunden, der Verlauf von CPU und Temperatur zeigt 24 Stunden. Neu dazu die Karten
-**«Cache & Mover»** (läuft der Mover, Belegung der Freigaben auf dem Cache) und **«Agent»** (Version, misst seit,
-Anzahl Absturzberichte der App, letzte Aktualisierung). Die HTML-Seite selbst enthält keine Werte vom NAS.
+From 1.9.0: the token is only valid for the open browser tab (`sessionStorage`, gone after closing). The page
+refreshes every 30 seconds, the CPU and temperature history shows 24 hours. New are the cards
+**"Cache & Mover"** (is the mover running, usage of the shares on the cache) and **"Agent"** (version, measuring since,
+number of crash reports from the app, last update). The HTML page itself contains no values from the NAS.
 
-## Schnittstelle
+## API
 
-Alle Anfragen ausser `/api/ping`, `/api/health` (ab 1.19.0 mit Host-Prüfung) und `/api/hello` (ab 1.16.1 höchstens 30 pro Minute und Absender) mit `Authorization: Bearer <Token>`. Falscher Token: `401`;
-ab 1.15.0 nach 10 falschen Tokens in einer Minute von derselben Adresse `429` mit `Retry-After` für 5 Minuten
-(`NZBLAB_AUTH_FAILS`). Anfragen über 64 KiB: `413` (Absturzberichte bis 128 000 Bytes), `Transfer-Encoding`: `411`. Konnte der
-Agent selbst keinen Token laden (ab 1.13.0, `token.txt` leer/kaputt/nicht lesbar): `503` mit `token_error`.
+All requests except `/api/ping`, `/api/health` (with host check from 1.19.0) and `/api/hello` (from 1.16.1 at most 30 per minute and sender) need `Authorization: Bearer <token>`. Wrong token: `401`;
+from 1.15.0, after 10 wrong tokens within a minute from the same address: `429` with `Retry-After` for 5 minutes
+(`NZBLAB_AUTH_FAILS`). Requests over 64 KiB: `413` (crash reports up to 128,000 bytes), `Transfer-Encoding`: `411`. If the
+agent itself could not load a token (from 1.13.0, `token.txt` empty/broken/unreadable): `503` with `token_error`.
 
-Ausnahme ohne Token: `GET /api/prices/watch` (nur Plattenserien), nur aus privaten Netzen **und** nur mit IP-Adresse oder
-lokalem Namen im `Host`-Header (`nas`, `*.local`, `*.lan`, `*.home.arpa`, `*.internal`), damit fremde Websites sie nicht über
-DNS-Rebinding lesen können. `GET /api/crashes` (Absturzberichte der App) braucht ab 1.16.1 immer den Token, auch vom NAS
-selbst. Die App sendet den Token ohnehin. Neue Berichte schwärzt der Agent beim Speichern (Zugangsdaten in Adressen,
-Bearer-Tokens, Cookie-Zeilen, Schlüssel und Passwörter, lange Zufallsketten). Der Token wird in konstanter Zeit verglichen (`secrets.compare_digest`); `token.txt` und `settings.json` haben Rechte 600.
+Exception without a token: `GET /api/prices/watch` (disk series only), only from private networks **and** only with an IP address or
+a local name in the `Host` header (`nas`, `*.local`, `*.lan`, `*.home.arpa`, `*.internal`), so that foreign websites cannot read it via
+DNS rebinding. `GET /api/crashes` (crash reports from the app) always needs the token from 1.16.1, even from the NAS
+itself. The app sends the token anyway. The agent redacts new reports when saving them (credentials in URLs,
+bearer tokens, cookie lines, keys and passwords, long random strings). The token is compared in constant time (`secrets.compare_digest`); `token.txt` and `settings.json` have mode 600.
 
-| Pfad | Inhalt |
+| Path | Content |
 |---|---|
-| `GET /api/tls` | ohne Token (Host-Prüfung wie `/api/health`), ab 1.20.0: `{"tls", "fingerprint", "algorithm": "sha256", "source": "auto"/"user", "http", "secure"}`; den Fingerabdruck hat auch `/api/health` |
-| `GET /api/keys/status` | mit Token, ab 1.20.0: `{"mode": "window"/"always"/"off", "open", "seconds_left", "tls", …}`; entsperren geht nur auf dem NAS (siehe 1.20.0) |
-| `POST /api/token/rotate` | mit Token, nur über HTTPS, ab 1.20.0: neuer Token `{"ok": true, "token": "…"}`, der alte ist sofort ungültig; `409 token_fixed`, wenn der Token per `NZBLAB_AGENT_TOKEN` fest gesetzt ist |
-| `GET /api/ping` | lebt der Agent? Ab 1.13.0 dazu `config_persistent` (`false` = `/config` geht beim Update verloren), ab 1.15.0 `api_level` und `sampling_ok`, sonst nichts |
-| `GET /api/hello?nonce=<32 Hex-Zeichen>` | ohne Token, ab 1.11.0: Heimnetz-Prüfung der App, siehe unten |
-| `GET /api/info` | Version, Hostname, Messintervall, seit wann gemessen wird; ab 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) und `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, mit Lösung); ab 1.14.0 `host_os` (os-release eingebunden) und `host_fs` (Ordner unter `/host/fs`); ab 1.15.0 `api_level` (Zahl, 15), `features` (eingeschaltete Zusätze: `boots`, `disktemps`, `health`, `smart`, `backups`, `raid`, `net`, `logs`; ab 1.16.0 `discover` und `discover_keys`, `api_level` 16), `last_boot`, `boots_7d`, `sampling_ok` |
-| `GET /api/now` | aktuelle Werte (höchstens alle 2 s neu gemessen) |
-| `GET /api/history?hours=24` | bis 192 h alle Messungen, darüber Stundenwerte (`res=hour` erzwingt Stundenwerte) |
-| `GET /api/today?hours=24` | «Heute»: Ereignisse aller Quellen, neueste zuerst, mit Zusammenfassung und welche Quellen fehlen |
-| `GET /api/prices` | Plattenpreise (ab 1.5.0): pro Platte im NAS der Preis des eigenen Modells (ab 1.12.0, mit günstigster Alternative), sonst pro Grösse bester Preis mit Shop, Schweizer Shops, Ausland, Verlauf, Tief/Hoch 90 Tage, «günstig» |
-| `GET /api/prices/watch` | ohne Token, nur aus privaten Netzen: welche Plattenserien die App zusätzlich beobachtet (für eine externe Preisliste, siehe unten) |
-| `POST /api/config` | `ntfy_url`, `price_alerts` (`{"hdd28": 900}`), `price_watch` (`[{"series": "ironwolfpro", "tb": 16}]`), `price_country` (`"DE"`, ab 1.10.0; mit `price_country_if_unset: true` nur, wenn noch keins gewählt ist). `price_alerts` und `price_watch` ersetzen jeweils die ganze Liste; ein leerer Wert (`{}`, `[]`, `null`) löscht alle Preisgrenzen bzw. beobachteten Serien |
-| `GET /api/wakes?hours=168` | Platten, die nach `DISK_IDLE_MINUTES` (30) Ruhe angelaufen sind, mit den Programmen in diesem Moment |
-| `GET /api/files/tree?path=` · `GET /api/files/largest?path=&limit=` | Speicher-Analyse (ab 1.7.0) |
-| `GET /api/files/duplicates?min_mb=100&limit=100` | doppelte Dateien (ab 1.8.0), siehe unten |
-| `GET /api/inventory` | Medien-Bestand: Filme, Serien, Lücken, neu seit dem letzten Index (ab 1.8.0) |
-| `GET /api/cache/shares` | Belegung jeder Freigabe auf dem Cache (ab 1.8.1; Pfad `/mnt/cache` → `/host/mnt/cache` nur lesen, mehrere Pools mit `CACHE_ROOTS`) |
-| `GET /api/discover` | ab 1.16.0: gefundene Dienste mit Port, SSL, URL-Basis und API-Key (siehe «Ab 1.16.0»); `DISCOVER_KEYS=0` oder Abfrage `?keys=0` ohne Schlüssel (`apiKey: null`, Codes unverändert; die App zählt so nur), `Cache-Control: no-store`, höchstens 10 Abrufe pro Minute (`429`) |
-| `GET /api/appdata` | Grösse jedes Container-Ordners unter appdata (ab 1.8.2; misst im Hintergrund höchstens alle 6 Std., braucht `/mnt/user` → `/host/mnt/user` nur lesen) |
-| `GET /api/wireguard` | WireGuard-Tunnel und Geräte, ohne Schlüssel (ab 1.8.0) |
-| `GET /api/host` | Linux-Server (ab 1.14.0): `hostname`, `os` (aus `/host/os-release`: `name`, `version`, `id`, `pretty`, `available`), `kernel`, `uptime_s`, `boot_time`, `cpu` (`model`, `cores`, `threads`), `load` (1/5/15 Min.), `mem` (Bytes), `net` (Schnittstellen mit MAC, Zustand, Tempo, IPv4) |
-| `GET /api/filesystems` | Linux-Server (ab 1.14.0): `filesystems` (`device`, `mount`, `fstype`, `size`, `used`/`free` nur bei `measured: true`, `label`), `disks` (`dev`, `model`, `size`, `rotational`, `kind`, `temp`), `mounts_from` (`host` oder `container`), `measured` (Namen unter `/host/fs`) |
-| `GET /api/health` | ohne Token, ab 1.15.0: `200 {"ok": true, "sample_age_s", "interval"}`, `503`, wenn die Messschleife länger als 2 Intervalle (+15 s) steht (Docker-Gesundheitsprüfung) |
-| `GET /api/boots?days=30` | ab 1.15.0: `boots: [{boot_time, previous_uptime_s (oder null), planned: "unknown"}]`, neueste zuerst |
-| `GET /api/disktemps?days=7&res=` | ab 1.15.0: `devices: {sda: {model, latest, points}}`, `res` = `raw` (bis 2 Tage, Punkte `[t, °C]` alle 5 Min.), `hour` (bis 14 Tage) oder `day` (Punkte `[t, Mittel, Höchstwert]`), `fields`, `interval_s` |
-| `GET /api/net?days=1&res=` | ab 1.15.0: `enabled`, `targets` (`gateway`, `internet`), `latest` (`{gateway: {t, rtt, loss}}`), `series` (`{gateway: {rtt: [...], loss: [...]}}`, ms bzw. %), `res`/`fields` wie oben |
-| `GET /api/smart` | ab 1.15.0, nur mit `NZBLAB_SMART=1`: `enabled`, `checked`, `error`, `disks: [{device, device_name, model_name, serial_number, firmware, capacity, rotational_speed, device_protocol, smart_passed, power_on_hours, power_cycle_count, temp, reallocated, pending, uncorrectable, crc, media_errors, percentage_used, unsafe_shutdowns, standby, attrs}]` (`attrs` wie Scrutiny: nach ID `"5"` bzw. bei NVMe nach Namen `media_errors`, `percentage_used` …, je `raw_value`) |
-| `GET /api/smart/history?days=90` | ab 1.15.0: ein Tageswert pro Platte (letzter Stand, Temperatur = Höchstwert): `disks: [{serial, model, device, rows: [{day, realloc, pending, uncorr, crc, media, temp_max, hours, wear, passed}]}]`, 2 Jahre |
-| `GET /api/backups` | ab 1.15.0: `backups: [{kind (restic, borg, kopia, rsync, log, unknown), name, path, last_success, last_error, error_text, snapshots, source, found_by (path, auto)}]`, `checked`, `paths`; unbekannt = `null` |
-| `GET /api/raid` | ab 1.15.0: `pools: [...]` (mdadm: `level`, `devices`, `total`, `active`, `degraded`, `sync {action, percent, finish_min}`; ZFS: `state`; Btrfs: `profiles`, `devices` mit `missing` und `errors`; Unraid: Verweis auf `/api/array`), `degraded`, `sources {mdadm, zfs: kstat/zpool/none/unavailable, btrfs}` |
-| `GET /api/logs?hours=24&max=200` | ab 1.15.0, nur mit `NZBLAB_LOGS=1`: `lines: [{t, level (err, warn), src, text, n}]`, `files`, `redacted: true`; sonst `403` |
+| `GET /api/tls` | without token (host check like `/api/health`), from 1.20.0: `{"tls", "fingerprint", "algorithm": "sha256", "source": "auto"/"user", "http", "secure"}`; `/api/health` also carries the fingerprint |
+| `GET /api/keys/status` | with token, from 1.20.0: `{"mode": "window"/"always"/"off", "open", "seconds_left", "tls", …}`; unlocking is only possible on the NAS (see 1.20.0) |
+| `POST /api/token/rotate` | with token, HTTPS only, from 1.20.0: new token `{"ok": true, "token": "…"}`, the old one is invalid immediately; `409 token_fixed` if the token is fixed via `NZBLAB_AGENT_TOKEN` |
+| `GET /api/ping` | is the agent alive? From 1.13.0 also `config_persistent` (`false` = `/config` is lost on update), from 1.15.0 `api_level` and `sampling_ok`, nothing else |
+| `GET /api/hello?nonce=<32 hex characters>` | without token, from 1.11.0: the app's home-network check, see below |
+| `GET /api/info` | version, hostname, measuring interval, measuring since; from 1.13.0 `config_persistent`, `token_source` (`env`, `file`, `new`) and `warnings` (`[{"code": "config_not_persistent", "de": …, "en": …}]`, with the fix); from 1.14.0 `host_os` (os-release mounted) and `host_fs` (folders under `/host/fs`); from 1.15.0 `api_level` (number, 15), `features` (enabled extras: `boots`, `disktemps`, `health`, `smart`, `backups`, `raid`, `net`, `logs`; from 1.16.0 `discover` and `discover_keys`, `api_level` 16), `last_boot`, `boots_7d`, `sampling_ok` |
+| `GET /api/now` | current values (measured anew at most every 2 s) |
+| `GET /api/history?hours=24` | up to 192 h all measurements, beyond that hourly values (`res=hour` forces hourly values) |
+| `GET /api/today?hours=24` | "Today": events from all sources, newest first, with a summary and which sources are missing |
+| `GET /api/prices` | Disk prices (from 1.5.0): per disk in the NAS the price of its own model (from 1.12.0, with the cheapest alternative), otherwise per size the best price with shop, Swiss shops, abroad, history, 90-day low/high, "cheap" |
+| `GET /api/prices/watch` | without token, private networks only: which disk series the app additionally watches (for an external price list, see below) |
+| `POST /api/config` | `ntfy_url`, `price_alerts` (`{"hdd28": 900}`), `price_watch` (`[{"series": "ironwolfpro", "tb": 16}]`), `price_country` (`"DE"`, from 1.10.0; with `price_country_if_unset: true` only if none is chosen yet). `price_alerts` and `price_watch` each replace the whole list; an empty value (`{}`, `[]`, `null`) deletes all price limits or watched series |
+| `GET /api/wakes?hours=168` | Disks that spun up after `DISK_IDLE_MINUTES` (30) of rest, with the programs running at that moment |
+| `GET /api/files/tree?path=` · `GET /api/files/largest?path=&limit=` | Storage analysis (from 1.7.0) |
+| `GET /api/files/duplicates?min_mb=100&limit=100` | duplicate files (from 1.8.0), see below |
+| `GET /api/inventory` | Media inventory: movies, series, gaps, new since the last index (from 1.8.0) |
+| `GET /api/cache/shares` | Usage of each share on the cache (from 1.8.1; path `/mnt/cache` → `/host/mnt/cache` read-only, several pools with `CACHE_ROOTS`) |
+| `GET /api/discover` | from 1.16.0: discovered services with port, SSL, URL base and API key (see "From 1.16.0"); `DISCOVER_KEYS=0` or query `?keys=0` without keys (`apiKey: null`, codes unchanged; the app only counts them this way), `Cache-Control: no-store`, at most 10 calls per minute (`429`) |
+| `GET /api/appdata` | Size of each container folder under appdata (from 1.8.2; measures in the background at most every 6 h, needs `/mnt/user` → `/host/mnt/user` read-only) |
+| `GET /api/wireguard` | WireGuard tunnels and devices, without keys (from 1.8.0) |
+| `GET /api/host` | Linux server (from 1.14.0): `hostname`, `os` (from `/host/os-release`: `name`, `version`, `id`, `pretty`, `available`), `kernel`, `uptime_s`, `boot_time`, `cpu` (`model`, `cores`, `threads`), `load` (1/5/15 min), `mem` (bytes), `net` (interfaces with MAC, state, speed, IPv4) |
+| `GET /api/filesystems` | Linux server (from 1.14.0): `filesystems` (`device`, `mount`, `fstype`, `size`, `used`/`free` only with `measured: true`, `label`), `disks` (`dev`, `model`, `size`, `rotational`, `kind`, `temp`), `mounts_from` (`host` or `container`), `measured` (names under `/host/fs`) |
+| `GET /api/health` | without token, from 1.15.0: `200 {"ok": true, "sample_age_s", "interval"}`, `503` if the measuring loop has stalled for more than 2 intervals (+15 s) (Docker health check) |
+| `GET /api/boots?days=30` | from 1.15.0: `boots: [{boot_time, previous_uptime_s (or null), planned: "unknown"}]`, newest first |
+| `GET /api/disktemps?days=7&res=` | from 1.15.0: `devices: {sda: {model, latest, points}}`, `res` = `raw` (up to 2 days, points `[t, °C]` every 5 min), `hour` (up to 14 days) or `day` (points `[t, mean, max]`), `fields`, `interval_s` |
+| `GET /api/net?days=1&res=` | from 1.15.0: `enabled`, `targets` (`gateway`, `internet`), `latest` (`{gateway: {t, rtt, loss}}`), `series` (`{gateway: {rtt: [...], loss: [...]}}`, ms and %), `res`/`fields` as above |
+| `GET /api/smart` | from 1.15.0, only with `NZBLAB_SMART=1`: `enabled`, `checked`, `error`, `disks: [{device, device_name, model_name, serial_number, firmware, capacity, rotational_speed, device_protocol, smart_passed, power_on_hours, power_cycle_count, temp, reallocated, pending, uncorrectable, crc, media_errors, percentage_used, unsafe_shutdowns, standby, attrs}]` (`attrs` as in Scrutiny: by ID `"5"` or, for NVMe, by name `media_errors`, `percentage_used` …, each with `raw_value`) |
+| `GET /api/smart/history?days=90` | from 1.15.0: one daily value per disk (last reading, temperature = maximum): `disks: [{serial, model, device, rows: [{day, realloc, pending, uncorr, crc, media, temp_max, hours, wear, passed}]}]`, 2 years |
+| `GET /api/backups` | from 1.15.0: `backups: [{kind (restic, borg, kopia, rsync, log, unknown), name, path, last_success, last_error, error_text, snapshots, source, found_by (path, auto)}]`, `checked`, `paths`; unknown = `null` |
+| `GET /api/raid` | from 1.15.0: `pools: [...]` (mdadm: `level`, `devices`, `total`, `active`, `degraded`, `sync {action, percent, finish_min}`; ZFS: `state`; Btrfs: `profiles`, `devices` with `missing` and `errors`; Unraid: pointer to `/api/array`), `degraded`, `sources {mdadm, zfs: kstat/zpool/none/unavailable, btrfs}` |
+| `GET /api/logs?hours=24&max=200` | from 1.15.0, only with `NZBLAB_LOGS=1`: `lines: [{t, level (err, warn), src, text, n}]`, `files`, `redacted: true`; otherwise `403` |
 
-## Heimnetz-Prüfung (ab 1.11.0)
+## Home-network check (from 1.11.0)
 
-Bevor die App Schlüssel über `http://` an eine Adresse im Heimnetz schickt, prüft sie, ob dort wirklich das eigene NAS
-antwortet (ein fremdes WLAN kann denselben Adressbereich haben, z. B. 192.168.1.x). Dazu fragt sie ohne Token
-`GET /api/hello?nonce=<32 Zeichen 0-9a-f>`. Der Agent antwortet mit:
+Before the app sends keys over `http://` to an address in the home network, it checks that your own NAS really
+answers there (a foreign Wi-Fi can use the same address range, e.g. 192.168.1.x). To do so it asks, without a token,
+`GET /api/hello?nonce=<32 characters 0-9a-f>`. The agent answers with:
 
-- `id`: feste Zufalls-Kennung, beim ersten Start in `settings.json` angelegt (keine Namen, keine Adressen)
-- `proof`: HMAC-SHA256 mit dem Token als Schlüssel über `nzblab-hello:<nonce>`, als Hex-Text
-- `tls_proof` (ab 1.20.0, nur über HTTPS): HMAC-SHA256 mit dem Token über `nzblab-tls:<nonce>|<Fingerabdruck>`, wobei der
-  Fingerabdruck der SHA-256 des ausgelieferten Zertifikats ist («AB:CD:…»). Die App rechnet mit dem Fingerabdruck, den sie
-  selbst in der TLS-Verbindung gesehen hat; stimmt der Wert, heftet sie das Zertifikat ohne Abtippen an.
+- `id`: a fixed random identifier, created on first start in `settings.json` (no names, no addresses)
+- `proof`: HMAC-SHA256 with the token as key over `nzblab-hello:<nonce>`, as hex text
+- `tls_proof` (from 1.20.0, HTTPS only): HMAC-SHA256 with the token over `nzblab-tls:<nonce>|<fingerprint>`, where the
+  fingerprint is the SHA-256 of the certificate that was served ("AB:CD:…"). The app computes with the fingerprint it
+  saw itself in the TLS connection; if the value matches, it pins the certificate without any typing.
 
-Ab 1.19.0 ohne `version`. Die App rechnet denselben Wert mit ihrem gespeicherten Token nach und vergleicht in konstanter Zeit. Der Token selbst
-verlässt weder App noch Agent. Andere Nonce als 32 Zeichen `0-9a-f`: 400. Fremder Name im `Host`-Header: 403 (wie bei den
-anderen Endpunkten ohne Token). Den Agent deshalb weiterhin nicht ins Internet freigeben.
+From 1.19.0 without `version`. The app computes the same value with its stored token and compares in constant time. The token itself
+never leaves the app or the agent. A nonce other than 32 characters `0-9a-f`: 400. A foreign name in the `Host` header: 403 (as with the
+other endpoints without a token). So still do not expose the agent to the internet.
 
-## Testen
+## Testing
 
 ```bash
-python3 test_agent.py        # im Ordner mit nzblab_agent.py (im App-Repo: agent/)
+python3 test_agent.py        # in the folder with nzblab_agent.py (in the app repo: agent/)
 ```
 
-## Datei-Index (ab 1.1.0)
+## File index (from 1.1.0)
 
-Mit dem Pfad `/host/mnt/user` (nur lesen) baut der Agent alle 6 Stunden einen Index aller Ordner und Dateien der Freigaben
-(ohne `appdata`, `system`, `domains`, `isos`; änderbar mit `FILES_EXCLUDE`, Intervall mit `FILES_EVERY_HOURS`).
-Die App sucht dann direkt darin. Endpunkte: `GET /api/files/status`, `GET /api/files/search?q=…`, `POST /api/files/refresh`.
+With the path `/host/mnt/user` (read-only), the agent builds an index of all folders and files of the shares every 6 hours
+(without `appdata`, `system`, `domains`, `isos`; changeable with `FILES_EXCLUDE`, interval with `FILES_EVERY_HOURS`).
+The app then searches directly in it. Endpoints: `GET /api/files/status`, `GET /api/files/search?q=…`, `POST /api/files/refresh`.
 
 
-## Plattenpreise selbst holen (ab 1.10.0)
+## Fetching disk prices yourself (from 1.10.0)
 
-Ab 1.10.0 holt der Agent die Preise **selbst** (nur Python-Standardbibliothek), einmal am Tag ab 06:00, für die
-Plattengrössen in diesem NAS (aus `/sys/block`, ab 0.5 TB, HDD/SSD/NVMe getrennt) und die in der App beobachteten Serien.
-Das Land wählt man in der App (Plattenpreise › Land); die App schickt beim Einrichten das Land ihrer Spracheinstellung,
-ändert aber nie ein schon gewähltes. Ohne App: Variable `PRICE_COUNTRY` (z. B. `DE`). Ohne Land holt der Agent nichts.
+From 1.10.0 the agent fetches the prices **itself** (Python standard library only), once a day from 06:00, for the
+disk sizes in this NAS (from `/sys/block`, from 0.5 TB, HDD/SSD/NVMe separately) and the series watched in the app.
+You choose the country in the app (Disk prices › Country); when setting up, the app sends the country of its language setting
+but never changes one that was already chosen. Without the app: variable `PRICE_COUNTRY` (e.g. `DE`). Without a country the agent fetches nothing.
 
-| Land | Quelle | Anfragen pro Tag |
+| Country | Source | Requests per day |
 |---|---|---|
-| CH | Toppreise.ch (Suche nach Preis pro TB) | eine pro Grösse, dazu eine (selten zwei) pro Plattenmodell |
-| DE, AT | Geizhals.de / .at, **nur wenn deren robots.txt es erlaubt**; sonst Amazon.de über diskprices.com | eine pro Grösse bzw. eine für alle |
-| US, GB, FR, IT, ES, CA, AU, SE, IE, IN | Amazon über diskprices.com (eine Tabelle für alle Grössen) | eine |
-| andere | nächster Amazon-Markt (z. B. NL → Amazon.de), sonst Amazon USA | eine |
+| CH | Toppreise.ch (search by price per TB) | one per size, plus one (rarely two) per disk model |
+| DE, AT | Geizhals.de / .at, **only if their robots.txt allows it**; otherwise Amazon.de via diskprices.com | one per size, or one for all |
+| US, GB, FR, IT, ES, CA, AU, SE, IE, IN | Amazon via diskprices.com (one table for all sizes) | one |
+| others | nearest Amazon market (e.g. NL → Amazon.de), otherwise Amazon US | one |
 
-Höflich: vorher `robots.txt` der Seite lesen (einmal pro Lauf; verbietet sie die Suche, wird nicht abgefragt), ehrlicher
-User-Agent `NZBLab-Agent/<Version>`, 20 s Timeout, 5 s Pause zwischen Anfragen (`PRICE_PAUSE_S`), keine Cookies, keine
-Wiederholung. Stand 28.10.2026: Geizhals verbietet in seiner robots.txt die Suche (`/?fs=`, `*?*sort=`) für alle Bots,
-darum fragt der Agent Geizhals in der Praxis nicht ab.
+Polite: it reads the site's `robots.txt` first (once per run; if it forbids the search, no request is made), honest
+user agent `NZBLab-Agent/<version>`, 20 s timeout, 5 s pause between requests (`PRICE_PAUSE_S`), no cookies, no
+retries. As of 28 Oct 2026, Geizhals forbids the search (`/?fs=`, `*?*sort=`) for all bots in its robots.txt,
+so in practice the agent does not query Geizhals.
 
-**Nie erfundene Zahlen:** Ist eine Seite gesperrt (HTTP 403/429), eine Prüfseite («Sichere Verbindung wird überprüft»),
-von robots.txt verboten oder hat sie ein unbekanntes Layout, steht bei der Grösse «Preise gerade nicht lesbar» und
-`browser_url`: Die App zeigt dann den Knopf «Im Browser suchen». Beträge stehen in der Währung des Landes (`currency`);
-das Feld heisst aus Kompatibilität weiter `chf`.
+**Never invented numbers:** If a page is blocked (HTTP 403/429), is a check page ("Checking your connection securely"),
+is forbidden by robots.txt or has an unknown layout, the size shows "Prices currently not readable" and
+`browser_url`: the app then shows the button "Search in browser". Amounts are in the country's currency (`currency`);
+for compatibility the field is still called `chf`.
 
-**Quellen und Werbelinks (Plattenpreise P1):** Jede Quelle steht in `PRICE_SOURCES` (`toppreise`, `geizhals`, `diskprices`) mit
-Name, Seite, `terms` (`pending` = schriftliche Erlaubnis offen) und `amazon`. Abschalten: Einstellung `price_sources_off`
-(Liste von IDs) oder Variable `PRICE_SOURCES_OFF=toppreise,geizhals`; dann kein Abruf, `/api/prices` meldet `search_only: true`
-und pro Grösse nur `search_url`. `/api/prices` liefert zusätzlich `sources` (id, label, url, allowed, terms, amazon), pro Grösse
-`source`, `source_id`, `fetched_at`, `no_alert` und am Angebot `source` und `t`. Amazon-Preise (diskprices) lösen nie «günstig»
-aus und bekommen nie einen Werbelink. Werbelinks: `/config/affiliate.json`, z. B. `{"galaxus": {"id": "…", "program": "…"}}`;
-ohne Kennung gibt es kein `ad_link`. Der normale `link` bleibt immer unverändert, `ad_link` kommt nur dazu (https, öffentliche
-Ziele, Amazon nie). `ads_available` zeigt der App, ob sie den Schalter «Werbelinks zeigen» anbieten soll.
+**Sources and affiliate links (disk prices P1):** Each source is listed in `PRICE_SOURCES` (`toppreise`, `geizhals`, `diskprices`) with
+name, site, `terms` (`pending` = written permission outstanding) and `amazon`. To switch off: setting `price_sources_off`
+(list of IDs) or variable `PRICE_SOURCES_OFF=toppreise,geizhals`; then no fetching, `/api/prices` reports `search_only: true`
+and only `search_url` per size. `/api/prices` additionally returns `sources` (id, label, url, allowed, terms, amazon), per size
+`source`, `source_id`, `fetched_at`, `no_alert` and on the offer `source` and `t`. Amazon prices (diskprices) never trigger "cheap"
+and never get an affiliate link. Affiliate links: `/config/affiliate.json`, e.g. `{"galaxus": {"id": "…", "program": "…"}}`;
+without an ID there is no `ad_link`. The normal `link` always stays unchanged, `ad_link` is only added (https, public
+targets, never Amazon). `ads_available` tells the app whether to offer the "Show affiliate links" switch.
 
-Ergebnis pro Land in `/config/prices-<Land>.json` (Verlauf 400 Tage). Für die Schweiz hat eine **frische** externe `prices.json`
-(höchstens 36 Stunden alt, siehe «Externe Preisliste») Vorrang; ist sie älter oder fehlt sie,
-holt der Agent selbst. Die Tests (`test_agent.py`, Klasse `PriceFetchTest`) prüfen die Leser mit Beispielseiten in
-`test_fixtures/` (Toppreise-, Geizhals- und diskprices-Seiten nachgebaut nach dem bekannten Aufbau; Sperr-/Prüfseiten und
-robots.txt echt, gekürzt), ohne Netz.
+Result per country in `/config/prices-<country>.json` (400 days of history). For Switzerland a **fresh** external `prices.json`
+(at most 36 hours old, see "External price list") takes precedence; if it is older or missing,
+the agent fetches itself. The tests (`test_agent.py`, class `PriceFetchTest`) check the readers with sample pages in
+`test_fixtures/` (Toppreise, Geizhals and diskprices pages replicated from the known structure; block/check pages and
+robots.txt real, shortened), without a network.
 
-`GET /api/prices` liefert dazu: `country`, `country_set`, `currency`, `countries` (Auswahl für die App) und pro Grösse
+`GET /api/prices` also returns: `country`, `country_set`, `currency`, `countries` (choice for the app) and per size
 `unreadable`, `browser_url`.
 
-### Preis des eigenen Modells (ab 1.12.0)
+### Price of your own model (from 1.12.0)
 
-Bis 1.11.0 war der Preis «die günstigste Platte gleicher Grösse», also oft eine Exos statt der IronWolf Pro im NAS. Ab
-1.12.0 liest der Agent das **Modell jeder Platte** aus sysfs (nur lesen, nie die Seriennummer):
+Until 1.11.0 the price was "the cheapest disk of the same size", so often an Exos instead of the IronWolf Pro in the NAS. From
+1.12.0 the agent reads the **model of each disk** from sysfs (read-only, never the serial number):
 
-- SATA: voller Modellname aus der ATA-Information `device/vpd_pg89` (nur die Modell-Bytes), sonst `device/model`
-  (höchstens 16 Zeichen, z. B. `ST28000NT000-4AB`); NVMe: `device/model` bzw. `/sys/class/nvme/nvmeX/model`.
-  Funktioniert mit `/host/sys` (Container) und `/sys`.
-- Teilenummer und Serie per Tabelle: Seagate `ST…NT/NE` IronWolf Pro, `VN` IronWolf, `NM` Exos, `DM` BarraCuda,
+- SATA: full model name from the ATA information `device/vpd_pg89` (only the model bytes), otherwise `device/model`
+  (at most 16 characters, e.g. `ST28000NT000-4AB`); NVMe: `device/model` or `/sys/class/nvme/nvmeX/model`.
+  Works with `/host/sys` (container) and `/sys`.
+- Part number and series via a table: Seagate `ST…NT/NE` IronWolf Pro, `VN` IronWolf, `NM` Exos, `DM` BarraCuda,
   `VX/VE` SkyHawk; WD `EFPX/EFZX/EFRX` Red Plus, `EFAX` Red (SMR), `FFBX/KFBX/KFGX` Red Pro, `PURZ` Purple,
-  `WUH…/HUH…` Ultrastar; Toshiba `HDWG` N300, `HDWR` X300, `HDWT` S300, `MG…` Enterprise; SSDs nach Name
-  (Samsung 990 PRO, WD Red SN700 …). Garantie aus der Tabelle, nur wo belegt (IronWolf Pro, Exos, Red Pro, Ultrastar,
-  MG, 990 PRO 5 Jahre; IronWolf, Red Plus, N300 3; BarraCuda 2). Quellen stehen im Code bei `MODEL_SERIES`.
-- Mehrere gleiche Platten = ein Eintrag (`disks` listet alle). Mehrere Modelle gleicher Grösse: das häufigste behält
-  den Schlüssel `hdd3`, die anderen heissen z. B. `hdd3-wd30ezrx` (Preisgrenzen aus der App gelten weiter).
+  `WUH…/HUH…` Ultrastar; Toshiba `HDWG` N300, `HDWR` X300, `HDWT` S300, `MG…` Enterprise; SSDs by name
+  (Samsung 990 PRO, WD Red SN700 …). Warranty from the table, only where documented (IronWolf Pro, Exos, Red Pro, Ultrastar,
+  MG, 990 PRO 5 years; IronWolf, Red Plus, N300 3; BarraCuda 2). Sources are in the code at `MODEL_SERIES`.
+- Several identical disks = one entry (`disks` lists all). Several models of the same size: the most common one keeps
+  the key `hdd3`, the others are called e.g. `hdd3-wd30ezrx` (price limits from the app continue to apply).
 
-Ablauf pro Modell: zuerst die **genaue Teilenummer** suchen (Toppreise `?q=ST28000NT000`, springt meist direkt auf die
-Produktseite); zählt nur, was die Teilenummer im Namen trägt (`match: exact`). Nichts gefunden: Suche nach Serie und
-Grösse (`Seagate IronWolf Pro 28TB`), nur Angebote derselben Serie (`match: series`, «gleiche Serie»). Unbekannte Modelle:
-Suche nach dem Modellnamen selbst. Zusätzlich wie bisher die Suche nach der Grösse: deren günstigstes Angebot eines
-**anderen** Modells erscheint als `alternative`, nur wenn es billiger ist als das eigene. Jede Suche höchstens einmal
-pro Tag, gleiche Regeln (robots.txt, Pausen, «Preise gerade nicht lesbar»). Ohne lesbares Modell: wie bis 1.11.0.
+Procedure per model: first search for the **exact part number** (Toppreise `?q=ST28000NT000`, usually jumps straight to the
+product page); only offers that carry the part number in their name count (`match: exact`). If nothing is found: search by series and
+size (`Seagate IronWolf Pro 28TB`), only offers of the same series (`match: series`, "same series"). Unknown models:
+search for the model name itself. In addition, as before, the search by size: its cheapest offer of a
+**different** model appears as `alternative`, only if it is cheaper than your own. Each search at most once
+a day, same rules (robots.txt, pauses, "Prices currently not readable"). Without a readable model: as until 1.11.0.
 
-Neue Felder pro Eintrag in `GET /api/prices`: `model` («Seagate IronWolf Pro 28 TB»), `part` («ST28000NT000»), `series`,
-`warranty_years`, `match` (`exact`/`series`), `match_label` («exakt»/«gleiche Serie»), `alternative` (Angebot mit `model`),
-`alt_search_url`. `best`, Verlauf, «günstig» und Preisgrenzen gelten für das eigene Modell. Alte `prices-<Land>.json`
-laufen weiter: der alte Verlauf (günstigste Platte) wird beim ersten Lauf zu `alt_history`, bis dahin erscheint der
-alte Preis als Alternative. Bei einer externen `prices.json` nimmt der Agent den Preis aus `models_now` (Verlauf aus
-`model_history`, falls vorhanden) und das dortige `best` als Alternative.
+New fields per entry in `GET /api/prices`: `model` ("Seagate IronWolf Pro 28 TB"), `part` ("ST28000NT000"), `series`,
+`warranty_years`, `match` (`exact`/`series`), `match_label` ("exact"/"same series"), `alternative` (offer with `model`),
+`alt_search_url`. `best`, history, "cheap" and price limits apply to your own model. Old `prices-<country>.json` files
+keep working: the old history (cheapest disk) becomes `alt_history` on the first run, until then the
+old price appears as an alternative. With an external `prices.json` the agent takes the price from `models_now` (history from
+`model_history`, if present) and the `best` there as the alternative.
 
-## Externe Preisliste (optional)
+## External price list (optional)
 
-Wer Preise lieber selbst sammelt (z. B. mit einem eigenen Skript), legt eine `prices.json` im gleichen Format wie
-`/config/prices-CH.json` ab. Der Agent liest sie nur, schreibt nie hinein:
+If you prefer to collect prices yourself (e.g. with your own script), put a `prices.json` in the same format as
+`/config/prices-CH.json`. The agent only reads it, never writes to it:
 
-- Variable `PRICES_FILE` = Pfad im Container (z. B. `/host/mnt/user/daten/nzblab-prices/prices.json`), oder
-- ohne Variable: die erste Freigabe unter `/host/mnt/user` (alphabetisch), die `nzblab-prices/prices.json` enthält
-  (gesucht höchstens alle 6 Stunden).
+- Variable `PRICES_FILE` = path in the container (e.g. `/host/mnt/user/daten/nzblab-prices/prices.json`), or
+- without the variable: the first share under `/host/mnt/user` (alphabetically) that contains `nzblab-prices/prices.json`
+  (searched at most every 6 hours).
 
-Welche Serien die App zusätzlich beobachtet, liefert `GET /api/prices/watch` (ohne Token, nur aus privaten Netzen).
-«Günstig» heisst: unter der eigenen Grenze, oder tiefster Preis seit 90 Tagen und mindestens 3 % unter dem 30-Tage-Mittel
-(ab 7 Tagen Verlauf). Der Agent meldet das per ntfy, die App als Benachrichtigung.
+Which series the app additionally watches is returned by `GET /api/prices/watch` (without token, private networks only).
+"Cheap" means: below your own limit, or the lowest price in 90 days and at least 3% below the 30-day mean
+(from 7 days of history). The agent reports this via ntfy, the app as a notification.
 
 
-## Doppelte Dateien (ab 1.8.0)
+## Duplicate files (from 1.8.0)
 
-`GET /api/files/duplicates?min_mb=100&limit=100`: Kandidaten sind Dateien mit genau gleicher Grösse (ab `min_mb` MB, aus dem
-Datei-Index). Ob sie wirklich gleich sind, prüft der Agent mit einer Teil-Prüfsumme (SHA-1 aus dem ersten und letzten MiB
-plus Grösse): Er liest also höchstens 2 MiB pro Datei, auch bei einem 40-GB-Film. Das läuft in einem Hintergrund-Thread mit
-tiefer Priorität, höchstens `DUP_MAX_FILES` (2000) Dateien pro Lauf, grösste zuerst. Solange er läuft, ist das Ergebnis
-unvollständig (`running: true`, `pending` = noch ungeprüfte Dateien); die App fragt einfach später nochmals. Die Prüfsummen
-bleiben in `files.db` gespeichert und gelten, solange Grösse und Änderungszeit gleich bleiben.
-`wasted` = Platz, der frei würde, wenn von jeder Gruppe nur eine Datei bliebe (über alle Gruppen).
+`GET /api/files/duplicates?min_mb=100&limit=100`: candidates are files of exactly the same size (from `min_mb` MB, taken from the
+file index). Whether they are really identical is checked by the agent with a partial checksum (SHA-1 of the first and last MiB
+plus the size): so it reads at most 2 MiB per file, even for a 40 GB movie. This runs in a background thread with
+low priority, at most `DUP_MAX_FILES` (2000) files per run, largest first. While it is running the result is
+incomplete (`running: true`, `pending` = files not yet checked); the app simply asks again later. The checksums
+stay stored in `files.db` and remain valid as long as size and modification time stay the same.
+`wasted` = space that would be freed if only one file remained from each group (across all groups).
 
-**Nur lesen:** Der Agent löscht und verschiebt nie etwas. Aufräumen macht man selbst.
+**Read-only:** The agent never deletes or moves anything. Cleaning up is up to you.
 
-**Vorgerechnet (ab 1.13.0):** Die Kandidaten (ab 100 MB) und den Medien-Bestand rechnet der Agent nach jedem Index-Lauf
-(und einmal nach dem Start) im Hintergrund; eine Anfrage liest nur noch das fertige Ergebnis (`computed_at`, `building: false`).
-Gerechnet wird ausserhalb der Sperre des Index (erst Zeilen lesen, dann verarbeiten), Suche und Speicher-Analyse bleiben schnell.
-Fehlt das Ergebnis noch (z. B. kleinere Stufe als 100 MB oder direkt nach dem Start), wartet die Anfrage höchstens 2 Sekunden
-und antwortet sonst sofort mit `building: true`, leerer Liste und dem Stand des Index (`status`); die App fragt dann nach.
+**Precomputed (from 1.13.0):** The agent computes the candidates (from 100 MB) and the media inventory in the background after every index run
+(and once after start); a request only reads the finished result (`computed_at`, `building: false`).
+The computation happens outside the index lock (first read rows, then process), so search and storage analysis stay fast.
+If the result is still missing (e.g. a smaller tier than 100 MB or right after start), the request waits at most 2 seconds
+and otherwise answers immediately with `building: true`, an empty list and the state of the index (`status`); the app then asks again.
 
-## Medien-Bestand (ab 1.8.0)
+## Media inventory (from 1.8.0)
 
-`GET /api/inventory` rechnet direkt auf dem NAS aus dem Datei-Index:
+`GET /api/inventory` calculates directly on the NAS from the file index:
 
-- Film-Ordner heissen `Filme`, `Movies` oder `Film`, Serien-Ordner `Serien`, `Series`, `TV` oder `Shows` (Ebene 1 oder 2, z. B. `Media/Filme`).
+- Movie folders are called `Filme`, `Movies` or `Film`, series folders `Serien`, `Series`, `TV` or `Shows` (level 1 or 2, e.g. `Media/Filme`).
   Videos: `mkv mp4 avi m4v ts iso`.
-- Jeder Unterordner ist ein Film bzw. eine Serie. Titel, Jahr und IMDb-ID aus dem Ordnernamen, z. B. `Babylon 5 (1994) [imdbid-tt0105946]`.
-- Folgen aus dem Dateinamen: `S01E02`, `s1e2`, `S01E01E02`, `1x02`. `S01E001` (drei und mehr Stellen) gilt als durchlaufende
-  Nummer wie bei One Piece: Lücken dann über die ganze Nummernfolge (`S01E492`, `S01E780-S01E782`). Staffel 0 (Specials) ohne Lücken.
-  `mixed_numbering`: in einer Serie gibt es beides.
-- «Neu» vergleicht die letzten zwei Index-Läufe (alle 6 Stunden): Am Ende jedes Laufs merkt sich der Agent die Videodateien des
-  vorherigen Laufs (Tabelle `inv_prev`). Nach dem ersten Lauf ist noch nichts «neu» (`previous: 0`).
+- Each subfolder is a movie or a series. Title, year and IMDb ID come from the folder name, e.g. `Babylon 5 (1994) [imdbid-tt0105946]`.
+- Episodes from the file name: `S01E02`, `s1e2`, `S01E01E02`, `1x02`. `S01E001` (three or more digits) counts as a continuous
+  number as with One Piece: gaps are then computed over the whole number sequence (`S01E492`, `S01E780-S01E782`). Season 0 (specials) without gaps.
+  `mixed_numbering`: a series contains both.
+- "New" compares the last two index runs (every 6 hours): at the end of each run the agent remembers the video files of the
+  previous run (table `inv_prev`). After the first run nothing is "new" yet (`previous: 0`).
 
-## WireGuard (ab 1.8.0)
+## WireGuard (from 1.8.0)
 
-`GET /api/wireguard` zeigt die Tunnel (`wg0` …) und pro Gerät: Name, Endpunkt, erlaubte IPs, letzter Handshake, Daten, online
-(Handshake vor weniger als 3 Minuten). **Private und Preshared Keys gibt der Agent nie heraus**, vom öffentlichen Schlüssel
-nur die ersten 8 Zeichen als Kennung.
+`GET /api/wireguard` shows the tunnels (`wg0` …) and per device: name, endpoint, allowed IPs, last handshake, data, online
+(handshake less than 3 minutes ago). **The agent never hands out private or preshared keys**; of the public key it returns
+only the first 8 characters as an identifier.
 
-Ehrlich: **Im Standard-Aufbau liefert der Endpunkt nichts** (`available: false`). Die App zeigt dann den Grund:
+Honestly: **In the standard setup the endpoint returns nothing** (`available: false`). The app then shows the reason:
 
-| `reason` | Bedeutung | Abhilfe |
+| `reason` | Meaning | Fix |
 |---|---|---|
-| `no_wg` | Das Image `python:3.12-alpine` enthält das Programm `wg` nicht | `wireguard-tools` im Container nachinstallieren (z. B. `apk add --no-cache wireguard-tools` in `start.sh`) |
-| `no_interfaces` | `wg` läuft, sieht aber keinen Tunnel: Im Netzwerktyp «Bridge» hat der Container sein eigenes Netz | Netzwerktyp **Host** |
-| `no_permission` | `wg show` wird verweigert | zusätzlich die Capability `NET_ADMIN`: Extra Parameters `--cap-add=NET_ADMIN` (nicht «Privilegiert»). Die Vorlage setzt das bewusst nicht |
+| `no_wg` | The image `python:3.12-alpine` does not contain the `wg` program | Install `wireguard-tools` in the container (e.g. `apk add --no-cache wireguard-tools` in `start.sh`) |
+| `no_interfaces` | `wg` runs but sees no tunnel: in network type "Bridge" the container has its own network | Network type **Host** |
+| `no_permission` | `wg show` is denied | additionally the capability `NET_ADMIN`: Extra Parameters `--cap-add=NET_ADMIN` (not "Privileged"). The template deliberately does not set this |
 
-Peer-Namen (z. B. «Peer 1», «Laptop») sind optional: Pfad `/boot/config/wireguard` **nur lesen** nach
-`/host/boot/config/wireguard` einbinden (anderer Ort: Variable `WG_CONFIG_DIR`). Der Agent liest daraus nur die Namen
-(Kommentar im `[Peer]`-Block von `wg0.conf` oder `NAME:n`/`PUBLIC:n` in `wg0.cfg`). Achtung: In diesen Dateien steht auch der
-private Schlüssel des NAS. Der Agent gibt ihn nie weiter, aber der Container könnte ihn lesen. Ohne den Pfad fehlen nur die Namen.
+Peer names (e.g. "Peer 1", "Laptop") are optional: mount the path `/boot/config/wireguard` **read-only** at
+`/host/boot/config/wireguard` (other location: variable `WG_CONFIG_DIR`). The agent reads only the names from it
+(comment in the `[Peer]` block of `wg0.conf` or `NAME:n`/`PUBLIC:n` in `wg0.cfg`). Note: these files also contain the NAS's
+private key. The agent never passes it on, but the container could read it. Without the path only the names are missing.
 
-## Lizenz
+## Licence
 
-Kostenlos und Open Source unter der **GNU Affero General Public License 3.0** (`AGPL-3.0-only`), siehe
-[`LICENSE`](LICENSE) und <https://www.gnu.org/licenses/agpl-3.0.html>. Copyright (c) 2026 Tuxxler.
+Free and open source under the **GNU Affero General Public License 3.0** (`AGPL-3.0-only`), see
+[`LICENSE`](LICENSE) and <https://www.gnu.org/licenses/agpl-3.0.html>. Copyright (c) 2026 Tuxxler.
 
-- **Erlaubt:** den Agenten kostenlos nutzen, auch geschäftlich; den Code ansehen, ändern und weitergeben.
-- **Pflicht:** Wer den Agenten verändert und die veränderte Version weitergibt oder als Dienst über ein Netzwerk anbietet,
-  muss den Quellcode seiner Änderungen ebenfalls unter der AGPL-3.0 offenlegen.
+- **Allowed:** using the agent free of charge, also commercially; viewing, changing and sharing the code.
+- **Required:** anyone who modifies the agent and distributes the modified version or offers it as a service over a network
+  must also publish the source code of their changes under the AGPL-3.0.
 
-English: free and open source (GNU AGPL-3.0-only). You may use, study, change and share it, also commercially. If you
-modify it and distribute it or offer it as a network service, you must make your changes available under the same
-license. Full text: [`LICENSE`](LICENSE).
+Full text: [`LICENSE`](LICENSE).
 
 
-## Changelog (Deutsch)
+## Changelog
 
-Funktionen und Korrekturen nach Agent-Version.
+Features and fixes by agent version.
 
-### Ab 1.20.0: HTTPS, Schlüssel-Fenster, Token erneuern
-Grund (Gesamtprüfung 14.11.2026): Der Agent sprach nur HTTP. Wer im selben WLAN mithörte, las den Token und holte über `/api/discover?keys=1` alle Dienst-Schlüssel.
+### From 1.20.0: HTTPS, key window, token rotation
+Reason (full review 14 Nov 2026): The agent only spoke HTTP. Anyone listening on the same Wi-Fi read the token and fetched all service keys via `/api/discover?keys=1`.
 
-- **HTTPS auf demselben Port (8099).** Das erste Byte einer Verbindung entscheidet (`0x16` = TLS-Handshake → HTTPS, sonst Klartext). Alte Apps (`http://…:8099`) laufen weiter, neue nehmen `https://…:8099`. Kein zweiter Port, keine zweite Freigabe in Docker, Unraid, Router.
-- **Eigenes Zertifikat.** Beim ersten Start erzeugt der Agent (mit `openssl`, im Image installiert) ein selbstsigniertes Zertifikat (EC P-256, 10 Jahre, SAN: Hostname, `localhost`, Loopback, gefundene LAN-Adressen und `NZBLAB_TLS_SAN`) nach `/config/tls/agent-cert.pem` und `agent-key.pem` (Rechte 600). Es wird wiederverwendet: der Fingerabdruck bleibt gleich, auch wenn sich die IP ändert. Neu erzeugt wird nur, wenn es in unter 30 Tagen abläuft. Im Bridge-Netz kennt der Container die LAN-Adresse des NAS nicht: sie in `NZBLAB_TLS_SAN` eintragen (nur nötig für Browser; die App prüft den Fingerabdruck).
-- **Eigenes Zertifikat verwenden:** `cert.pem` und `key.pem` (PEM, Schlüssel ohne Passwort) nach `/config/tls/` legen; der Agent nimmt sie und fasst sie nie an.
-- **Fingerabdruck (SHA-256)** steht beim Start im Log («NZBLab-Agent Fingerabdruck: AB:CD:…»), im Browser-Dashboard (Karte «Agent»), in `GET /api/tls` (ohne Token) und in `/api/health`, `/api/info`.
-- **`NZBLAB_HTTP`** (Standard `1` in 1.20: Klartext bleibt für alte Apps in der Übergangszeit). `0` = nur noch HTTPS; Klartext-Verbindungen bekommen eine kurze 403-Antwort. Ohne Zertifikat (z. B. `openssl` fehlt) startet der Agent dann nicht.
-- **Schlüssel-Ausgabe im Log.** Das Fenster öffnet sich nach jedem Neustart wieder; jede Ausgabe von Schlüsseln steht mit Absender-Adresse und Anzahl Dienste im Log (nie die Schlüssel).
-- **Hinter einem TLS-Proxy.** Meldet der Proxy `X-Forwarded-Proto: http` (Gross-/Kleinschreibung egal), gilt die Anfrage für Schlüssel und Token erneuern als unsicher (403). Der Kopf dient nur zum Verbieten, nie zum Erlauben.
-- **Zertifikat-Fallen.** `NZBLAB_TLS_SAN`-Einträge mit `%` (Zonen-Kennung) oder Link-lokale Adressen werden mit Warnung übersprungen. Lässt sich ein eigenes `cert.pem`/`key.pem` nicht laden, steht eine laute Warnung im Log und der Agent nimmt das selbst erzeugte Zertifikat. Ist TLS aus, steht eine Warnzeile im Log (`tls: false`).
-- **Empfehlung:** `NZBLAB_HTTP=0` (nur HTTPS), sobald alle Apps auf 2.77 oder neuer sind; Standard bleibt vorerst `1`. / Recommended: set `NZBLAB_HTTP=0` once all apps are on 2.77+; the default stays `1` for now.
-- **Schlüssel nie über HTTP.** `GET /api/discover` mit Schlüsseln (`keys=1`, auch ohne Angabe) antwortet über Klartext mit `403 {"error": "keys_need_tls"}`. `keys=0` (nur zählen) bleibt über beide Wege offen.
-- **Schlüssel-Fenster.** Schlüssel gibt es nur 30 Minuten nach dem Start des Agenten, danach `403 {"error": "keys_locked", "hint": "…"}`. Wieder öffnen (10 Minuten): Container neu starten (dann wieder 30 Minuten) **oder** auf dem NAS die leere Datei `keys-unlock` in `/config` anlegen (der Agent löscht sie beim nächsten Abruf). Ein Token allein entsperrt bewusst nie: sonst nützte die Sperre gegen einen gestohlenen Token nichts. `DISCOVER_KEYS=0` bleibt «nie», neu `DISCOVER_KEYS=always` = ohne Fenster (altes Verhalten, für Fortgeschrittene, weiterhin nur über HTTPS).
-- **Token erneuern:** `POST /api/token/rotate` (Token nötig, nur über HTTPS) erzeugt einen neuen Zufalls-Token (`secrets.token_urlsafe(32)`), schreibt ihn atomar nach `/config/token.txt` (Rechte 600) und antwortet damit; der alte Token ist sofort ungültig. Über HTTP `403 tls_required`. Zusätzlich nur bei offenem Schlüssel-Fenster (30 Min. nach dem Start oder 10 Min. nach der Datei `keys-unlock`), sonst `403 keys_locked` mit Hinweis: ein gestohlener Token kann den Besitzer so nicht aussperren. Jede Erneuerung (auch abgelehnte) steht mit der Absender-Adresse im Log, nie der Token. Ist der Token per `NZBLAB_AGENT_TOKEN` fest gesetzt: `409 token_fixed` («Token ist in der Vorlage fest eingetragen»). Höchstens 5 Aufrufe pro Minute und Absender; falsche Tokens zählen in der gewohnten Bremse.
-- Neu: `GET /api/keys/status` (mit Token), `features`: `tls`, `token_rotate`, `keys_window`; `api_level` 17; `/api/info` mit `tls`, `fingerprint`, `http`, `secure`, `keys`.
-- Gesundheitsprüfung des Images: `python3 nzblab_agent.py --healthcheck` (HTTPS, sonst HTTP).
+- **HTTPS on the same port (8099).** The first byte of a connection decides (`0x16` = TLS handshake → HTTPS, otherwise plain text). Old apps (`http://…:8099`) keep working, new ones use `https://…:8099`. No second port, no second forwarding in Docker, Unraid, router.
+- **Own certificate.** On first start the agent creates (with `openssl`, installed in the image) a self-signed certificate (EC P-256, 10 years, SAN: hostname, `localhost`, loopback, discovered LAN addresses and `NZBLAB_TLS_SAN`) in `/config/tls/agent-cert.pem` and `agent-key.pem` (mode 600). It is reused: the fingerprint stays the same even if the IP changes. A new one is only created if it expires in under 30 days. In a bridge network the container does not know the NAS's LAN address: enter it in `NZBLAB_TLS_SAN` (only needed for browsers; the app checks the fingerprint).
+- **Use your own certificate:** put `cert.pem` and `key.pem` (PEM, key without password) into `/config/tls/`; the agent uses them and never touches them.
+- **Fingerprint (SHA-256)** is shown at start in the log ("NZBLab-Agent Fingerabdruck: AB:CD:…"), in the browser dashboard (card "Agent"), in `GET /api/tls` (without token) and in `/api/health`, `/api/info`.
+- **`NZBLAB_HTTP`** (default `1` in 1.20: plain text stays for old apps during the transition period). `0` = HTTPS only; plain-text connections get a short 403 response. Without a certificate (e.g. `openssl` missing) the agent then does not start.
+- **Key output in the log.** The window opens again after every restart; every output of keys is logged with the sender address and number of services (never the keys).
+- **Behind a TLS proxy.** If the proxy reports `X-Forwarded-Proto: http` (case does not matter), the request counts as insecure for keys and token rotation (403). The header is only used to forbid, never to allow.
+- **Certificate pitfalls.** `NZBLAB_TLS_SAN` entries with `%` (zone identifier) or link-local addresses are skipped with a warning. If your own `cert.pem`/`key.pem` cannot be loaded, a loud warning appears in the log and the agent uses the self-generated certificate. If TLS is off, a warning line appears in the log (`tls: false`).
+- **Recommendation:** `NZBLAB_HTTP=0` (HTTPS only) once all apps are on 2.77 or newer; the default stays `1` for now.
+- **Keys never over HTTP.** `GET /api/discover` with keys (`keys=1`, also when not specified) answers over plain text with `403 {"error": "keys_need_tls"}`. `keys=0` (count only) stays open both ways.
+- **Key window.** Keys are only available for 30 minutes after the agent starts, afterwards `403 {"error": "keys_locked", "hint": "…"}`. Reopen (10 minutes): restart the container (then 30 minutes again) **or** create the empty file `keys-unlock` in `/config` on the NAS (the agent deletes it on the next call). A token alone deliberately never unlocks: otherwise the lock would be useless against a stolen token. `DISCOVER_KEYS=0` stays "never", new `DISCOVER_KEYS=always` = without a window (old behaviour, for advanced users, still HTTPS only).
+- **Token rotation:** `POST /api/token/rotate` (token required, HTTPS only) creates a new random token (`secrets.token_urlsafe(32)`), writes it atomically to `/config/token.txt` (mode 600) and answers with it; the old token is invalid immediately. Over HTTP `403 tls_required`. Additionally only while the key window is open (30 min after start or 10 min after the file `keys-unlock`), otherwise `403 keys_locked` with a hint: a stolen token cannot lock the owner out this way. Every rotation (also rejected ones) is logged with the sender address, never the token. If the token is fixed via `NZBLAB_AGENT_TOKEN`: `409 token_fixed` ("Token is fixed in the template"). At most 5 calls per minute and sender; wrong tokens count in the usual brake.
+- New: `GET /api/keys/status` (with token), `features`: `tls`, `token_rotate`, `keys_window`; `api_level` 17; `/api/info` with `tls`, `fingerprint`, `http`, `secure`, `keys`.
+- Image health check: `python3 nzblab_agent.py --healthcheck` (HTTPS, otherwise HTTP).
 
-### Ab 1.15.0: Neustarts, Plattentemperaturen, Netz, SMART, Backups, RAID, Logs
+### From 1.15.0: reboots, disk temperatures, network, SMART, backups, RAID, logs
 
-**Versionen:** `/api/info` liefert `api_level` (15 für 1.15.0) und `features`. Die App vergleicht `api_level` mit ihrem
-Minimum und zeigt «neuer Agent verfügbar». Der Agent aktualisiert sich **nie selbst**: neue Version = Image neu holen
-(Unraid «update ready», Compose `docker compose pull && docker compose up -d`).
+**Versions:** `/api/info` returns `api_level` (15 for 1.15.0) and `features`. The app compares `api_level` with its
+minimum and shows "newer agent available". The agent **never updates itself**: new version = pull the image again
+(Unraid "update ready", Compose `docker compose pull && docker compose up -d`).
 
-Immer an (nur lesen, nichts Neues einzubinden):
+Always on (read-only, nothing new to mount):
 
-- **Neustarts:** beim Start und jede Minute `btime` aus `/proc/stat` und `/proc/uptime`. Neu gespeichert, wenn die
-  Betriebszeit kleiner ist als zuletzt gesehen oder das System erst nach dem letzten Lebenszeichen des Agenten gestartet ist.
-  `previous_uptime_s` = zuletzt gesehene Betriebszeit davor (war der Agent vorher gestoppt: Mindestwert). Ob ein Neustart
-  geplant war, weiss der Agent nicht (`planned: "unknown"`). 2 Jahre.
-- **Plattentemperatur pro Gerät:** alle 5 Minuten aus drivetemp (SATA) bzw. nvme-hwmon, mit SMART auch von Platten ohne
-  hwmon. Rohwerte 2 Tage, danach Stundenwerte (Mittel, Tief, Hoch) für 400 Tage.
-- **RAID/Pools:** mdadm aus `/proc/mdstat` (ausgefallen, Resync/Recovery mit Prozent), ZFS aus `/proc/spl/kstat/zfs/<pool>/state`
-  (ohne `zpool`; gibt es `zpool` im Container, wird es gefragt, sonst `unavailable`), Btrfs aus `/sys/fs/btrfs` (Profile,
-  fehlende Geräte, Fehlerzähler). Unraid-Array weiter über `/api/array`.
-- **Netz/Latenz** (`NZBLAB_NET=0` schaltet aus): jede Minute (`NZBLAB_NET_INTERVAL`) je 3 TCP-Verbindungsaufbauten zum Router
-  (Standard-Gateway des NAS, Port `NZBLAB_NET_GATEWAY_PORT` = 53; eine Ablehnung zählt auch als Antwort) und zu
-  `NZBLAB_NET_TARGET` (Standard `1.1.1.1:443`). Gespeichert: Median in ms und Verlust in %. Kein ICMP, keine Rechte nötig,
-  es werden keine Daten gesendet (nur Verbindungsaufbau und sofort schliessen).
-- **Backups** (best effort): Ordner in `NZBLAB_BACKUP_PATHS` (Komma, Pfade im Container, nur lesend eingebunden) und
-  Suche unter `/host/mnt/user` bzw. `/host/fs` (`NZBLAB_BACKUP_AUTO=0` schaltet sie aus): oberste Ebene jeder Freigabe, darunter
-  nur Ordner mit Backup-Namen (backup, restic, borg, kopia, sicherung, rsync …), höchstens 3 Ebenen, alle 6 Stunden.
-  restic (`config` + `snapshots/` + `data/` + `keys/`): neueste Datei in `snapshots/`; borg (`README`): Zeit von
-  `index.N`/`hints.N`; Kopia (`kopia.repository.f`): neueste Index-/Metadaten-Blobs. Die Werkzeuge werden nie gestartet, verschlüsselte
-  Inhalte nie gelesen. Log-Dateien (rsync, cron-Skripte): letzte Erfolgszeile (`sent … bytes received`, `total size is`,
-  `backup completed` …) und letzte Fehlerzeile (gefiltert wie die Logs). Was sich nicht bestimmen lässt, ist `null`.
+- **Reboots:** at start and every minute `btime` from `/proc/stat` and `/proc/uptime`. Newly stored if the
+  uptime is smaller than last seen or the system only started after the agent's last sign of life.
+  `previous_uptime_s` = last seen uptime before that (if the agent was stopped before: a minimum value). Whether a reboot
+  was planned, the agent does not know (`planned: "unknown"`). 2 years.
+- **Disk temperature per device:** every 5 minutes from drivetemp (SATA) or nvme-hwmon, with SMART also from disks without
+  hwmon. Raw values 2 days, then hourly values (mean, low, high) for 400 days.
+- **RAID/pools:** mdadm from `/proc/mdstat` (failed, resync/recovery with percent), ZFS from `/proc/spl/kstat/zfs/<pool>/state`
+  (without `zpool`; if `zpool` exists in the container it is asked, otherwise `unavailable`), Btrfs from `/sys/fs/btrfs` (profiles,
+  missing devices, error counters). Unraid array still via `/api/array`.
+- **Network/latency** (`NZBLAB_NET=0` switches off): every minute (`NZBLAB_NET_INTERVAL`) 3 TCP connection attempts each to the router
+  (the NAS's default gateway, port `NZBLAB_NET_GATEWAY_PORT` = 53; a refusal also counts as an answer) and to
+  `NZBLAB_NET_TARGET` (default `1.1.1.1:443`). Stored: median in ms and loss in %. No ICMP, no privileges needed,
+  no data is sent (only connect and close immediately).
+- **Backups** (best effort): folders in `NZBLAB_BACKUP_PATHS` (comma-separated, paths in the container, mounted read-only) and
+  a search under `/host/mnt/user` or `/host/fs` (`NZBLAB_BACKUP_AUTO=0` switches it off): top level of each share, below it
+  only folders with backup-like names (backup, restic, borg, kopia, sicherung, rsync …), at most 3 levels, every 6 hours.
+  restic (`config` + `snapshots/` + `data/` + `keys/`): newest file in `snapshots/`; borg (`README`): time of
+  `index.N`/`hints.N`; Kopia (`kopia.repository.f`): newest index/metadata blobs. The tools are never started, encrypted
+  content is never read. Log files (rsync, cron scripts): last success line (`sent … bytes received`, `total size is`,
+  `backup completed` …) and last error line (filtered like the logs). Anything that cannot be determined is `null`.
 
-Freiwillig (eigener Compose-Block in `docker-compose.yml`):
+Optional (own Compose block in `docker-compose.yml`):
 
-| Block | Schalter | Liest | Braucht |
+| Block | Switch | Reads | Needs |
 |---|---|---|---|
-| S SMART | `NZBLAB_SMART=1` (`NZBLAB_SMART_MINUTES`, Standard 60) | `smartctl --scan` und `smartctl --json -a -n standby` pro Platte: Modell, Seriennummer, Betriebsstunden, neu zugewiesene, instabile und nicht korrigierbare Sektoren, CRC- und Medienfehler, Verschleiss, Temperatur. Nie Selbsttests, nie Schreiben, schlafende Platten bleiben schlafen | `devices:` jede Platte, `cap_add: SYS_RAWIO` (NVMe zusätzlich `SYS_ADMIN`), Start als root mit PUID (nicht `user:`) |
-| L Logs | `NZBLAB_LOGS=1` | (auch «Heute» braucht den Schalter, ab 1.18.0, geschwärzt) Fehler-/Warnzeilen der letzten Stunden aus `syslog`, `messages`, `kern.log`, `daemon.log` (Textdateien; journald-Binärdateien nicht) | `/var/log:/host/log:ro` |
-| N Heimnetz | `NZBLAB_LAN=1` (Standard aus, ab 1.18.0) | Geräteliste des Heimnetzes: alle 30 Min ein leeres UDP-Paket an jede Adresse des /24-Netzes, ARP-Tabelle, Reverse-DNS, Push bei neuen Geräten. Router/IDS können das als Port-Scan melden | `/proc:/host/proc:ro` (oder Host-Netz) |
-| B2 Backups | `NZBLAB_BACKUP_PATHS` | Repository-Ordner (nur Dateinamen und -zeiten) und Log-Dateien | die Pfade `:ro` |
+| S SMART | `NZBLAB_SMART=1` (`NZBLAB_SMART_MINUTES`, default 60) | `smartctl --scan` and `smartctl --json -a -n standby` per disk: model, serial number, power-on hours, reallocated, pending and uncorrectable sectors, CRC and media errors, wear, temperature. Never self-tests, never writes, sleeping disks stay asleep | `devices:` each disk, `cap_add: SYS_RAWIO` (NVMe additionally `SYS_ADMIN`), start as root with PUID (not `user:`) |
+| L Logs | `NZBLAB_LOGS=1` | ("Today" also needs the switch, from 1.18.0, redacted) error/warning lines of the last hours from `syslog`, `messages`, `kern.log`, `daemon.log` (text files; journald binary files not) | `/var/log:/host/log:ro` |
+| N Home network | `NZBLAB_LAN=1` (default off, from 1.18.0) | Device list of the home network: every 30 min an empty UDP packet to each address of the /24 network, ARP table, reverse DNS, push for new devices. Routers/IDS may report this as a port scan | `/proc:/host/proc:ro` (or host network) |
+| B2 Backups | `NZBLAB_BACKUP_PATHS` | Repository folders (file names and times only) and log files | the paths `:ro` |
 
-**SMART und Rechte:** smartctl braucht root und `CAP_SYS_RAWIO`. Damit der Agent selbst trotzdem ohne Rechte läuft, startet
-er (als root gestartet, `NZBLAB_SMART=1`) vor dem Wechsel auf PUID einen kleinen Helfer-Prozess, der root bleibt und über ein
-privates Socket-Paar nur zwei Befehle annimmt (`--scan`, `-a -n standby` für Gerätenamen wie `/dev/sda`, `/dev/nvme0`).
-Der Agent selbst verliert beim Wechsel auf PUID alle Capabilities. Gruppen-IDs für `/dev` sind darum nicht nötig. Mit
-`user:` im Compose (Linux-Einzeldatei) gibt es keinen root-Start: SMART meldet dann einen Rechtefehler (Docker gibt
-Nicht-root-Prozessen kein `SYS_RAWIO`, auch nicht mit `group_add: [disk]` = GID 6). Image: `smartmontools` aus Alpine,
-rund 3 MB; ohne `NZBLAB_SMART=1` wird es nie gestartet. Mit dem alten Setup (offizielles `python:3.12-alpine`, Code
-eingebunden) fehlt smartctl: `/api/smart` meldet «smartctl fehlt im Image».
+**SMART and permissions:** smartctl needs root and `CAP_SYS_RAWIO`. So that the agent itself still runs without privileges, it
+starts (when started as root, `NZBLAB_SMART=1`) a small helper process before switching to PUID, which stays root and accepts only two commands over a
+private socket pair (`--scan`, `-a -n standby` for device names like `/dev/sda`, `/dev/nvme0`).
+The agent itself loses all capabilities when switching to PUID. Group IDs for `/dev` are therefore not needed. With
+`user:` in Compose (single-file Linux) there is no root start: SMART then reports a permission error (Docker does not give
+non-root processes `SYS_RAWIO`, not even with `group_add: [disk]` = GID 6). Image: `smartmontools` from Alpine,
+about 3 MB; without `NZBLAB_SMART=1` it is never started. With the old setup (official `python:3.12-alpine`, code
+mounted in) smartctl is missing: `/api/smart` reports "smartctl fehlt im Image".
 
-**Datenschutz der Logs:** Vor der Antwort entfernt der Agent IPv4/IPv6-, MAC- und E-Mail-Adressen, Tokens, Schlüssel und
-Passwörter (`key=…`, `password: …`, `Bearer …`, `user:pass@`), Benutzernamen (`user …`, `for invalid user …`),
-Heimordner (`/home/<user>`), Datei- und Ordnernamen unter den Freigaben (`/mnt/user/<Freigabe>/…`) und lange Zufallsketten.
-Gleiche Meldungen werden zu einer Zeile mit Anzahl. Der Agent schickt Logs nie von selbst irgendwohin; nur die App holt
-sie mit Token.
+**Log privacy:** Before answering, the agent removes IPv4/IPv6, MAC and email addresses, tokens, keys and
+passwords (`key=…`, `password: …`, `Bearer …`, `user:pass@`), user names (`user …`, `for invalid user …`),
+home folders (`/home/<user>`), file and folder names under the shares (`/mnt/user/<share>/…`) and long random strings.
+Identical messages become one line with a count. The agent never sends logs anywhere by itself; only the app fetches
+them with the token.
 
-**Weitere Schalter:** `NZBLAB_BIND` (Standard `0.0.0.0`; z. B. die LAN-Adresse oder `127.0.0.1` hinter einem Proxy, IPv6 `::`),
-`NZBLAB_AUTH_FAILS` (Token-Bremse, Standard 10 pro Minute).
+**More switches:** `NZBLAB_BIND` (default `0.0.0.0`; e.g. the LAN address or `127.0.0.1` behind a proxy, IPv6 `::`),
+`NZBLAB_AUTH_FAILS` (token brake, default 10 per minute).
 
-**Gesundheitsprüfung:** Der `HEALTHCHECK` im Image fragt `/api/health`: Er schlägt auch fehl, wenn die Messschleife hängt
-(letzte Messung älter als 2 Intervalle + 15 s). `/api/ping` bleibt billig und ändert sich nicht im Verhalten.
+**Health check:** The `HEALTHCHECK` in the image asks `/api/health`: it also fails if the measuring loop hangs
+(last measurement older than 2 intervals + 15 s). `/api/ping` stays cheap and does not change its behaviour.
 
-**Getestete Architekturen:** Das Image wird für amd64 und arm64 gebaut (GitHub Actions, Smoke-Test auf amd64). Im Dauereinsatz:
-Unraid 7.x (amd64). 1.15.0 ist mit den Tests und einem Probelauf auf Unraid (amd64) geprüft, noch nicht als Image. arm64 (Raspberry Pi 4/5 mit 64-Bit-System) wird gebaut, aber nicht auf echter
-Hardware geprüft; 32-Bit-ARM (armv7) gibt es nicht.
+**Tested architectures:** The image is built for amd64 and arm64 (GitHub Actions, smoke test on amd64). In continuous use:
+Unraid 7.x (amd64). 1.15.0 is verified with the tests and a trial run on Unraid (amd64), not yet as an image. arm64 (Raspberry Pi 4/5 with a 64-bit system) is built but not verified on real
+hardware; 32-bit ARM (armv7) is not available.
 
-### Ab 1.16.0: Dienste finden («Alles in einer Minute verbunden»)
+### From 1.16.0: finding services ("Everything connected in one minute")
 
-`GET /api/discover` (nur mit Token) sucht **nur lesend** in den appdata-Ordnern nach bekannten Diensten und liest ihre
-API-Keys aus den Einstellungsdateien. Die App kann damit «7 Dienste gefunden, alle verbinden?» anbieten. Der Ordnername ist
-egal (`binhex-sonarr`, `sonarr`, `tv4k` …), erkannt wird über den Inhalt und den Namen.
+`GET /api/discover` (token only) searches the appdata folders **read-only** for known services and reads their
+API keys from the settings files. The app can then offer "7 services found, connect all?". The folder name
+does not matter (`binhex-sonarr`, `sonarr`, `tv4k` …); detection is based on content and name.
 
-**Standard an.** `DISCOVER_KEYS=0` schaltet das Auslesen der Schlüssel aus: Der Endpunkt meldet dann nur, welche Dienste
-es gibt (`apiKey: null`, `code: "keys_off"`), `features` enthält nur `discover`, nicht `discover_keys`.
+**On by default.** `DISCOVER_KEYS=0` switches off reading the keys: the endpoint then only reports which services
+exist (`apiKey: null`, `code: "keys_off"`), `features` contains only `discover`, not `discover_keys`.
 
-| Dienst (`service`) | Datei | Gelesen | Port ohne Angabe |
+| Service (`service`) | File | Read | Port if unspecified |
 |---|---|---|---|
-| `sonarr`, `radarr`, `prowlarr` | `config.xml` | `ApiKey`, `Port`, `SslPort`/`EnableSsl`, `UrlBase`; Typ aus `<InstanceName>`, sonst Ordnername, sonst Standard-Port | 8989, 7878, 9696 |
+| `sonarr`, `radarr`, `prowlarr` | `config.xml` | `ApiKey`, `Port`, `SslPort`/`EnableSsl`, `UrlBase`; type from `<InstanceName>`, otherwise folder name, otherwise default port | 8989, 7878, 9696 |
 | `sab` (SABnzbd) | `sabnzbd.ini` | `[misc]` `api_key`, `port`, `https_port`/`enable_https`, `url_base` | 8080 |
 | `tautulli` | `config.ini` | `[General]` `api_key`, `http_port`, `http_root`, `enable_https` | 8181 |
-| `seerr` (`variant` overseerr, jellyseerr, seerr) | `settings.json` | nur `main.apiKey` | 5055 |
-| `plex` | `Preferences.xml` im Ordner «Plex Media Server» | **nichts**: die Datei wird nie geöffnet (Konto-Token) → «Token selbst eintragen» | 32400 |
-| `jellyfin` (`variant` jellyfin, emby) | `network.xml` (oder Ordnername) | `InternalHttpPort`, `BaseUrl`, `EnableHttps`; ein API-Key steht in keiner Datei → «in der Weboberfläche erstellen» | 8096 |
+| `seerr` (`variant` overseerr, jellyseerr, seerr) | `settings.json` | only `main.apiKey` | 5055 |
+| `plex` | `Preferences.xml` in the folder "Plex Media Server" | **nothing**: the file is never opened (account token) → "enter the token yourself" | 32400 |
+| `jellyfin` (`variant` jellyfin, emby) | `network.xml` (or folder name) | `InternalHttpPort`, `BaseUrl`, `EnableHttps`; an API key is in no file → "create it in the web interface" | 8096 |
 
-Lidarr, Readarr, Whisparr und andere Dienste werden nicht gemeldet.
+Lidarr, Readarr, Whisparr and other services are not reported.
 
-**Wo gesucht wird:** `DISCOVER_ROOTS` (Container-Pfade, Komma), sonst `<FILES_ROOT>/appdata` (Unraid: `/mnt/user` →
-`/host/mnt/user`, schon in der Vorlage), wenn es den nicht gibt `<FILES_ROOT>/apps` (TrueNAS, eigene Datasets wie in
-`compose/truenas.yml`) und `<FILES_ROOT>/docker` (Synology `/volume1/docker`). TrueNAS-Katalog-Apps liegen unter
-`/mnt/.ix-apps/app_mounts`: bei Bedarf zusätzlich nur lesend einbinden und `DISCOVER_ROOTS` setzen. Der Agent hat kein
-`docker.sock` und braucht keins.
+**Where it searches:** `DISCOVER_ROOTS` (container paths, comma-separated), otherwise `<FILES_ROOT>/appdata` (Unraid: `/mnt/user` →
+`/host/mnt/user`, already in the template); if that does not exist `<FILES_ROOT>/apps` (TrueNAS, own datasets as in
+`compose/truenas.yml`) and `<FILES_ROOT>/docker` (Synology `/volume1/docker`). TrueNAS catalog apps live under
+`/mnt/.ix-apps/app_mounts`: if needed also mount it read-only and set `DISCOVER_ROOTS`. The agent has no
+`docker.sock` and needs none.
 
-**Grenzen und Sicherheit:**
+**Limits and security:**
 
-- höchstens 3 Ordner-Ebenen unter jedem Container-Ordner, 3000 Einträge pro Container-Ordner (über alle Ebenen), 500 Ordner
-  unter jeder Wurzel (gleiche Ordnernamen unter einer zweiten Wurzel zählen nur einmal); grosse Datenordner (Cache, Logs,
-  Backups, MediaCover, Metadata, Datenbank-Ordner wie `pgdata`, `mysql`, `model-cache` …) und versteckte Ordner werden nicht
-  betreten; Postgres-/MariaDB-Container werden ganz übersprungen
-- höchstens rund 8 Sekunden Suchzeit (App-Zeitlimit 10 s), danach kommt, was bis dahin gefunden wurde, mit `partial: true`; die
-  Antwort ohne Schlüssel (`?keys=0`) merkt sich der Agent 60 Sekunden
-- `partial: true` heisst ab 1.16.1: Zeitbudget oder Ordnerzahl erreicht, oder ein Ordner, der nach einem bekannten Dienst
-  aussieht, wurde abgebrochen, bevor seine Einstellungsdatei gefunden war. Ein abgebrochener fremder Ordner (z. B. Nextcloud
-  `data`) zählt nicht mehr
-- Symlinks werden nie verfolgt (Ordner nicht, Dateien nicht: `O_NOFOLLOW`), nur normale Dateien bis 1 MB
-- XML mit `DOCTYPE`/`ENTITY` wird nicht ausgewertet; Schlüssel nur, wenn sie wie ein Schlüssel aussehen (16–128 Zeichen
+- at most 3 folder levels below each container folder, 3000 entries per container folder (across all levels), 500 folders
+  under each root (identical folder names under a second root count only once); large data folders (cache, logs,
+  backups, MediaCover, Metadata, database folders like `pgdata`, `mysql`, `model-cache` …) and hidden folders are not
+  entered; Postgres/MariaDB containers are skipped entirely
+- at most about 8 seconds of search time (app time limit 10 s), after that whatever was found so far is returned with `partial: true`; the
+  answer without keys (`?keys=0`) is cached by the agent for 60 seconds
+- from 1.16.1, `partial: true` means: time budget or folder count reached, or a folder that looks like a known service
+  was cut off before its settings file was found. A cut-off foreign folder (e.g. Nextcloud
+  `data`) no longer counts
+- symlinks are never followed (neither folders nor files: `O_NOFOLLOW`), only regular files up to 1 MB
+- XML with `DOCTYPE`/`ENTITY` is not evaluated; keys only if they look like a key (16–128 characters
   `A-Z a-z 0-9 _ - + / =`)
-- Antwort nur mit diesen Feldern, keine anderen Dateiinhalte (Passwörter, Plex-Token, Usenet-Zugänge bleiben liegen), kein
-  Pfad ausser dem Ordnernamen; `Cache-Control: no-store`
-- höchstens 10 Abrufe pro Minute (für alle zusammen), danach `429` mit `Retry-After`; falsche Tokens bremst weiterhin die
-  Token-Bremse
-- Schlüssel stehen nie im Log, auch nicht im Fehlerfall (`500 {"error": "Suche fehlgeschlagen"}` ohne Einzelheiten), nicht
-  in «Heute», im Verlauf oder in der Weboberfläche
-- liest der Agent als PUID 99 einen Ordner oder eine Datei nicht: `code: "unreadable"` (ab 1.16.1 auch für nicht lesbare
-  Ordner, wenn der Ordnername nach Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Seerr, Plex, Jellyfin oder Emby aussieht), Abhilfe PUID=0
-- Tautulli wird nur erkannt mit Abschnitt `[PMS]` in `config.ini` oder «tautulli» im Ordnernamen (ab 1.16.1; Headphones,
-  LazyLibrarian, Mylar & Co. haben auch `[General] http_root`, sind aber keine); Emby und Jellyfin vor 10.9 lesen den Port aus
+- the answer contains only these fields, no other file contents (passwords, Plex token, Usenet credentials stay where they are), no
+  path except the folder name; `Cache-Control: no-store`
+- at most 10 calls per minute (all together), then `429` with `Retry-After`; wrong tokens are still slowed down by the
+  token brake
+- keys never appear in the log, not even on error (`500 {"error": "Suche fehlgeschlagen"}` without details), not
+  in "Today", the history or the web interface
+- if the agent as PUID 99 cannot read a folder or file: `code: "unreadable"` (from 1.16.1 also for unreadable
+  folders if the folder name looks like Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Seerr, Plex, Jellyfin or Emby), fix PUID=0
+- Tautulli is only detected with a `[PMS]` section in `config.ini` or "tautulli" in the folder name (from 1.16.1; Headphones,
+  LazyLibrarian, Mylar & co. also have `[General] http_root` but are not Tautulli); Emby and Jellyfin before 10.9 read the port from
   `system.xml` (`HttpServerPortNumber`)
-- `?keys=` akzeptiert `0`, `false`, `no`, `off`, `nein` (ab 1.16.1, wie die Umgebungsvariablen); `keys` in der Antwort zeigt, ob
-  wirklich Schlüssel mitkommen
+- `?keys=` accepts `0`, `false`, `no`, `off`, `nein` (from 1.16.1, like the environment variables); `keys` in the answer shows whether
+  keys are really included
 
-**Antwort:**
+**Response:**
 
 ```json
 {"available": true, "keys": true, "partial": false, "at": 1762500000,
@@ -571,152 +561,154 @@ Lidarr, Readarr, Whisparr und andere Dienste werden nicht gemeldet.
    "code": "plex_token", "note": "Gefunden; Plex-Token selbst eintragen …", "portSource": "default"}]}
 ```
 
-`code`: `ok`, `keys_off`, `plex_token`, `jellyfin_key`, `emby_key`, `unreadable`, `broken` (Datei kaputt oder ohne gültigen
-Schlüssel). `port` ist bei SSL der HTTPS-Port, `httpPort` dann der unverschlüsselte. **Wichtig:** Die Ports gelten im
-Container. Im Bridge-Netz kann Docker sie am NAS anders abbilden (z. B. 8989 → 18989); das muss die App über die
-Containerliste des NAS (Portzuordnung) lösen. `partial: true` = eine Grenze wurde erreicht (siehe oben).
+(The `ports_note` and `note` texts are returned in German by the agent.)
 
-**Teststand:** nur mit erfundenen Testdaten geprüft (`test_fixtures/discover/`, Unit-Tests), **noch nicht gegen echte appdata**
-und nicht auf echtem Unraid.
+`code`: `ok`, `keys_off`, `plex_token`, `jellyfin_key`, `emby_key`, `unreadable`, `broken` (file broken or without a valid
+key). With SSL, `port` is the HTTPS port and `httpPort` the unencrypted one. **Important:** The ports apply inside the
+container. In a bridge network Docker may map them differently on the NAS (e.g. 8989 → 18989); the app has to resolve that through the
+NAS's container list (port mapping). `partial: true` = a limit was reached (see above).
 
-### Ab 1.19.0: Host-Prüfung, knappe Token-Fehler, Bremse je /64
+**Test status:** only tested with made-up test data (`test_fixtures/discover/`, unit tests), **not yet against real appdata**
+and not on real Unraid.
 
-Gleiche Schnittstelle (`api_level` 16). Geändert:
+### From 1.19.0: host check, terse token errors, brake per /64
 
-- `/api/ping` und `/api/health` antworten nur, wenn der Host-Header eine IP-Adresse, `localhost`, ein Name ohne Punkt oder ein
-  Heimnetz-Name (`.local`, `.lan`, `.home.arpa`, `.internal`, `.localdomain`, `.ts.net` für Tailscale) ist, sonst `403` (gegen DNS-Rebinding).
-  Weitere Namen (ZeroTier, WireGuard, eigene Domain): `NZBLAB_HOSTS=nas.example.org,.vpn.example.net` (kommagetrennt, exakt oder mit
-  führendem Punkt als Endung). `/api/ping` nennt
-  `version` nur mit gültigem Token; `ok`, `api_level`, `config_persistent` und `sampling_ok` bleiben ohne Token.
-- `503` bei unbrauchbarer `token.txt`: nach aussen nur `{"error": …, "token_error": "<code>"}` (`short`, `simple`, `chars`, `empty`,
-  `corrupt`, `unreadable`, `unwritable`). Länge, Pfad und Fehlertext stehen nur im Log des Containers
-  (auch nicht für `127.0.0.1`, weil ein Reverse-Proxy im Host-Modus Internet-Verkehr als 127.0.0.1 weiterreicht).
-  `/api/hello` nennt keine Version mehr. `NZBLAB_HOSTS` weist zu breite Einträge (`*`, `.com`) mit Warnung ab.
-- **Token-Bremse:** IPv6-Absender zählen je /64 (Token-Bremse und `/api/hello`). Der richtige Token wird weiterhin nie gebremst.
-  Ein selbst gewählter Token (`NZBLAB_AGENT_TOKEN`) wird beim Start im Log als weniger sicher als ein zufälliger gemeldet
-  (Regel wie bisher: mindestens 32 Zeichen, mindestens 8 verschiedene).
-- **ntfy:** Programm- und Container-Namen («Meiste Last») stehen nur in Meldungen an einen ntfy-Server im Heimnetz (private IP oder
-  lokaler Name) oder mit `NZBLAB_NTFY_ALL=1` / `NZBLAB_NTFY_NAMES=1` (eigener Server unter eigener Domain). Ein ungültiger
-  `NTFY_URL` (nötig: `https://server/thema`, Thema 8–64 Zeichen) wird mit Warnung im Log ignoriert, ntfy bleibt aus.
-- Synology-Vorlage läuft nicht mehr als root (siehe oben).
+Same interface (`api_level` 16). Changed:
 
-### Ab 1.18.0: Korrekturen aus dem Sicherheits-Audit vom 12.11.2026
+- `/api/ping` and `/api/health` only answer if the Host header is an IP address, `localhost`, a name without a dot or a
+  home-network name (`.local`, `.lan`, `.home.arpa`, `.internal`, `.localdomain`, `.ts.net` for Tailscale), otherwise `403` (against DNS rebinding).
+  Further names (ZeroTier, WireGuard, own domain): `NZBLAB_HOSTS=nas.example.org,.vpn.example.net` (comma-separated, exact or with a
+  leading dot as a suffix). `/api/ping` names
+  `version` only with a valid token; `ok`, `api_level`, `config_persistent` and `sampling_ok` stay without a token.
+- `503` for an unusable `token.txt`: outwardly only `{"error": …, "token_error": "<code>"}` (`short`, `simple`, `chars`, `empty`,
+  `corrupt`, `unreadable`, `unwritable`). Length, path and error text appear only in the container log
+  (not even for `127.0.0.1`, because a reverse proxy in host mode forwards internet traffic as 127.0.0.1).
+  `/api/hello` no longer names a version. `NZBLAB_HOSTS` rejects entries that are too broad (`*`, `.com`) with a warning.
+- **Token brake:** IPv6 senders are counted per /64 (token brake and `/api/hello`). The correct token is still never slowed down.
+  A self-chosen token (`NZBLAB_AGENT_TOKEN`) is reported in the log at start as less secure than a random one
+  (rule as before: at least 32 characters, at least 8 distinct).
+- **ntfy:** Program and container names ("top load") only appear in messages to an ntfy server in the home network (private IP or
+  local name) or with `NZBLAB_NTFY_ALL=1` / `NZBLAB_NTFY_NAMES=1` (own server under your own domain). An invalid
+  `NTFY_URL` (required: `https://server/topic`, topic 8–64 characters) is ignored with a warning in the log, ntfy stays off.
+- The Synology template no longer runs as root (see above).
 
-Gleiche Schnittstelle (`api_level` 16), neue Felder nur ergänzend (alte Apps lesen sie nicht). Geändert:
+### From 1.18.0: fixes from the security audit of 12 Nov 2026
 
-- **Heimnetz-Suche ist standardmässig aus (`NZBLAB_LAN=1` schaltet sie ein).** Eingeschaltet schickt der Agent alle 30 Minuten
-  ein leeres UDP-Paket (Port 9) an jede Adresse jedes /24-Netzes aus der ARP-Tabelle des NAS, damit die Geräteliste sich füllt,
-  fragt per Reverse-DNS nach Namen neuer Geräte und meldet neue Geräte (Name, IP, MAC) per Push, wenn eine ntfy-Adresse gesetzt
-  ist. Router oder Einbruchserkennung können das als Port-Scan melden. Aus: kein Paket, keine Geräteliste. `/api/info` meldet
-  `lan_enabled`, `/api/devices` meldet `enabled` und `reason: "off"`; `POST /api/devices/scan` antwortet `202` mit `started: false`.
-  Die App zeigt dann «LAN-Scan aus» statt eines Fehlers.
-- **«Heute» (`/api/today`) liefert Syslog-Zeilen nur noch mit `NZBLAB_LOGS=1`**, dann mit derselben Schwärzung wie `/api/logs`
-  (IP, MAC, Benutzer, E-Mail, Pfade, Geheimnisse). Ohne den Schalter: keine Syslog-Inhalte, `sources.syslog` ist `false`.
-- **Besitzer von `/config`:** Der Agent ändert den Besitzer rekursiv nur, wenn `/config` leer ist oder auf der obersten
-  Ebene nur eigene Einträge liegen (die Markierungsdatei `.nzblab-agent-config` allein genügt nicht) (`token.txt`, `settings.json`, `history.db`, `files.db`,
-  `devices.db`, `crashes/`, `prices-*.json`). Liegen fremde Dateien darin (z. B. ganzes `appdata` eingebunden), ändert er nichts an
-  ihnen, besitzt nur seine eigenen Einträge um und warnt laut im Log. Eigenen Unterordner nehmen: `/mnt/user/appdata/nzblab-agent`.
-- **Warnung statt stilles root:** Kann der Agent `/config` nicht an `PUID` geben (NFS mit root_squash, ACLs, fremde Dateien), läuft er
-  weiter als root und meldet das in `/api/info` unter `warnings` (`running_as_root`) und im Log.
-- **Token-Bremse:** Ein richtiger Token wird nie gebremst, auch wenn von derselben Adresse (Proxy, Docker-Gateway) falsche kamen.
-  Falsche Tokens bleiben nach 10 Fehlversuchen pro Minute 5 Minuten gesperrt.
-- **Vorlagen:** `/var/log` und `/var/lib/docker/containers` sind nicht mehr vorausgefüllt (Syslog nur mit `NZBLAB_LOGS=1`; die
-  Container-Ordner enthalten die Umgebungsvariablen aller Container, der Agent behält nur die Namen). Neue Variable `NZBLAB_LAN`.
+Same interface (`api_level` 16), new fields are only additions (old apps do not read them). Changed:
 
-- **ntfy nur noch für Kritisches (Standard).** Der Agent schickt per ntfy nur noch: Platte ausgefallen oder neue Lese-/Schreibfehler,
-  Array gestoppt, CPU über der kritischen Grenze (`HEAT_ALERT_C`, Standard 95 °C, nach 5 Minuten). Ntfy ist der Notfall-Weg, wenn
-  das Handy schläft; die App meldet den Rest. **Info-Meldungen** (günstige Platten, neue Geräte im Heimnetz, «wieder normal») kommen
-  per ntfy nur noch mit **`NZBLAB_NTFY_ALL=1`** (Standard `0`). In «Heute» in der App erscheinen sie unverändert. Dieselbe Sache
-  höchstens 1× in 24 Stunden, ausser sie wird schlimmer (mehr Fehler, heisser); eine Entwarnung hebt die Sperre auf (Entwarnung selbst:
-  nur mit `NZBLAB_NTFY_ALL=1`, ohne Ton). Die Sperre liegt im Speicher und gilt bis zum Neustart. `/api/info` meldet `ntfy_all`.
-- **Log-Schwärzung:** Benutzernamen in PAM-/sshd-Zeilen («authentication failure for bob from …», «Accepted … for bob from …»,
-  «user bob», `logname=`, `ruser=`, `rhost=`) werden geschwärzt; «login failed for user=bob» lässt «failed» stehen.
+- **The home-network search is off by default (`NZBLAB_LAN=1` switches it on).** When on, the agent sends an empty UDP packet (port 9) every 30 minutes
+  to every address of every /24 network from the NAS's ARP table so that the device list fills up,
+  asks reverse DNS for the names of new devices and reports new devices (name, IP, MAC) by push if an ntfy address
+  is set. Routers or intrusion detection may report this as a port scan. Off: no packet, no device list. `/api/info` reports
+  `lan_enabled`, `/api/devices` reports `enabled` and `reason: "off"`; `POST /api/devices/scan` answers `202` with `started: false`.
+  The app then shows "LAN scan off" instead of an error.
+- **"Today" (`/api/today`) only returns syslog lines with `NZBLAB_LOGS=1`**, then with the same redaction as `/api/logs`
+  (IP, MAC, user, email, paths, secrets). Without the switch: no syslog content, `sources.syslog` is `false`.
+- **Owner of `/config`:** The agent changes the owner recursively only if `/config` is empty or only its own entries lie at the top
+  level (the marker file `.nzblab-agent-config` alone is not enough) (`token.txt`, `settings.json`, `history.db`, `files.db`,
+  `devices.db`, `crashes/`, `prices-*.json`). If foreign files are in it (e.g. the whole `appdata` mounted), it changes nothing on
+  them, only takes ownership of its own entries and warns loudly in the log. Use a subfolder of its own: `/mnt/user/appdata/nzblab-agent`.
+- **Warning instead of silent root:** If the agent cannot give `/config` to `PUID` (NFS with root_squash, ACLs, foreign files), it continues
+  as root and reports this in `/api/info` under `warnings` (`running_as_root`) and in the log.
+- **Token brake:** A correct token is never slowed down, even if wrong ones came from the same address (proxy, Docker gateway).
+  Wrong tokens stay blocked for 5 minutes after 10 failed attempts per minute.
+- **Templates:** `/var/log` and `/var/lib/docker/containers` are no longer pre-filled (syslog only with `NZBLAB_LOGS=1`; the
+  container folders contain the environment variables of all containers, the agent keeps only the names). New variable `NZBLAB_LAN`.
 
-**Genau wie dokumentiert, was den Server verlässt:** TCP-Verbindung zum Router (Port 53) und zu `1.1.1.1:443` einmal pro Minute
-(Netz-Messung, `NZBLAB_NET=0` schaltet aus); Speedtest zu `speed.cloudflare.com` (25 MB Download, 10 MB Upload) nur auf Knopfdruck;
-Preisabruf einmal pro Tag, sobald ein Land gesetzt ist (`PRICE_COUNTRY` oder durch Öffnen der Preis-Seite in der App, die das Land
-des Handys einmal übergibt), die Suchbegriffe enthalten die eigenen Plattenmodelle; Push an die selbst gesetzte ntfy-Adresse.
-Ohne Token antworten nur die Seite `/`, `/api/ping`, `/api/health`, `/api/hello` (Signatur, kein Token) und `/api/prices/watch`
-(nur Heimnetz); alles andere braucht den Token. Der Zugriff läuft unverschlüsselt über HTTP: nur im vertrauten Heimnetz oder über
-VPN beziehungsweise einen Reverse-Proxy mit TLS benutzen.
+- **ntfy only for critical things (default).** The agent now sends via ntfy only: disk failed or new read/write errors,
+  array stopped, CPU above the critical limit (`HEAT_ALERT_C`, default 95 °C, after 5 minutes). Ntfy is the emergency route when
+  the phone is asleep; the app reports the rest. **Info messages** (cheap disks, new devices in the home network, "back to normal") are sent
+  via ntfy only with **`NZBLAB_NTFY_ALL=1`** (default `0`). In "Today" in the app they appear unchanged. The same thing
+  at most once in 24 hours unless it gets worse (more errors, hotter); an all-clear lifts the block (the all-clear itself:
+  only with `NZBLAB_NTFY_ALL=1`, without sound). The block is kept in memory and applies until restart. `/api/info` reports `ntfy_all`.
+- **Log redaction:** User names in PAM/sshd lines ("authentication failure for bob from …", "Accepted … for bob from …",
+  "user bob", `logname=`, `ruser=`, `rhost=`) are redacted; "login failed for user=bob" leaves "failed" in place.
 
-### Ab 1.17.0: Grenzwerte, Synology-Plattennamen, Mover-Stand aus dem Protokoll
+**Exactly as documented, what leaves the server:** TCP connection to the router (port 53) and to `1.1.1.1:443` once per minute
+(network measurement, `NZBLAB_NET=0` switches off); speed test to `speed.cloudflare.com` (25 MB download, 10 MB upload) only on button press;
+price fetch once a day as soon as a country is set (`PRICE_COUNTRY` or by opening the price page in the app, which passes the phone's country
+once), the search terms contain your own disk models; push to the ntfy address you set yourself.
+Without a token only the page `/`, `/api/ping`, `/api/health`, `/api/hello` (signature, no token) and `/api/prices/watch`
+(home network only) answer; everything else needs the token. Access runs unencrypted over HTTP: use it only in a trusted home network or via
+VPN or a reverse proxy with TLS.
 
-Gleiche Schnittstelle (`api_level` 16), drei Ergänzungen:
+### From 1.17.0: limits, Synology disk names, mover state from the log
 
-- **`limits` in `/api/now`:** Grenzwert je Sensor laut hwmon (`temp*_crit`, sonst `temp*_max`, nur 40–150 °C). Die App
-  nimmt daraus die Grenze der CPU (vor der Hersteller-Tabelle); fehlt der Wert, bleibt alles wie vorher.
-- **Synology DSM 7:** Platten heissen dort `sata1…`, `sas1…` oder `usb1…` statt `sda`. Der Agent erkennt diese Namen jetzt bei
-  Plattenzugriffen (`disks`, `disk_rw`, Platten-Wecker), Plattentemperaturen (`/api/disktemps`) und als SMART-Gerät
-  (`/dev/sata1`). Nur mit erfundenen Testdaten geprüft, noch nicht auf einem echten Synology.
-- **`mover` in `/api/logs`** (nur mit `NZBLAB_LOGS=1` und eingebundenem `/var/log`): letzter Mover-Start und letztes Ende aus
-  syslog/messages (`{"state": "running"|"finished"|null, "started": t, "ended": t}`, Start ohne Ende höchstens 12 Stunden
-  alt). Die App meldet «Mover hängt» nur, wenn das Protokoll den Lauf noch offen zeigt und 30 Minuten nichts verschoben wurde;
-  ohne Protokoll bleibt es eine beschriftete Schätzung. Keine Dateinamen, keine Pfade.
+Same interface (`api_level` 16), three additions:
 
-**Teststand:** Unit-Tests mit Testdaten (`test_agent.py`); nicht auf echtem Unraid oder Synology geprüft. Sicherheits-Audit und
-Code-Review des Diffs seit 1.16.2 am 11.11.2026: zwei kleine Fehler behoben (Grenzwert: `max`, wenn `crit` unbrauchbar ist;
-Mover: doppelte Startzeile in syslog und messages setzt das Ende nicht zurück).
+- **`limits` in `/api/now`:** limit per sensor according to hwmon (`temp*_crit`, otherwise `temp*_max`, only 40–150 °C). The app
+  takes the CPU's limit from it (before the manufacturer table); if the value is missing, everything stays as before.
+- **Synology DSM 7:** Disks there are called `sata1…`, `sas1…` or `usb1…` instead of `sda`. The agent now recognises these names for
+  disk activity (`disks`, `disk_rw`, disk wake-ups), disk temperatures (`/api/disktemps`) and as a SMART device
+  (`/dev/sata1`). Only tested with made-up test data, not yet on a real Synology.
+- **`mover` in `/api/logs`** (only with `NZBLAB_LOGS=1` and `/var/log` mounted): last mover start and last end from
+  syslog/messages (`{"state": "running"|"finished"|null, "started": t, "ended": t}`, start without end at most 12 hours
+  old). The app reports "Mover stuck" only if the log still shows the run as open and nothing has been moved for 30 minutes;
+  without a log it stays a labelled estimate. No file names, no paths.
 
-### Ab 1.16.1: Korrekturen aus Sicherheitsaudit und Code-Reviews
+**Test status:** Unit tests with test data (`test_agent.py`); not tested on real Unraid or Synology. Security audit and
+code review of the diff since 1.16.2 on 11 Nov 2026: two small bugs fixed (limit: `max` if `crit` is unusable;
+mover: a duplicate start line in syslog and messages does not reset the end).
 
-Gleiche Schnittstelle (`api_level` 16). Geändert:
+### From 1.16.1: fixes from the security audit and code reviews
 
-- **Token:** `NZBLAB_AGENT_TOKEN` und `token.txt` unter 32 Zeichen (oder mit Leer-/Steuerzeichen) lehnt der Agent mit klarer
-  Meldung im Log und `503`/`token_error` ab (nie mit dem Token im Log); `token.txt` wird mit `O_NOFOLLOW` geöffnet.
-- **`/api/crashes`:** nur noch mit Token, auch vom NAS selbst (Audit Lauf 2: ein Reverse-Proxy auf dem NAS ohne
-  Weiterleitungs-Kopf sah sonst wie Loopback aus); alle Felder werden beim Speichern geschwärzt, kurze Felder auf 200 Zeichen gekürzt.
-- **Toppreise:** `og:title` wird auf 500 Zeichen gekappt und linear geteilt (keine quadratische Regex mehr).
-- **Dienste finden:** Tautulli-Erkennung strenger, `partial` nur noch bei abgeschnittenem Dienst-Ordner, Datenbank-Ordner
-  übersprungen, `unreadable` auch für nicht lesbare Ordner, Zeitbudget 8 s, 60-s-Zwischenspeicher ohne Schlüssel, `?keys=0|false|no|off`
-  mit ehrlichem `keys`, Emby-/Jellyfin-Port aus `system.xml`.
+Same interface (`api_level` 16). Changed:
 
-### Ab 1.16.1: Härtung (Audit Lauf 2)
+- **Token:** `NZBLAB_AGENT_TOKEN` and `token.txt` under 32 characters (or with whitespace/control characters) are rejected by the agent with a clear
+  message in the log and `503`/`token_error` (never with the token in the log); `token.txt` is opened with `O_NOFOLLOW`.
+- **`/api/crashes`:** only with a token, even from the NAS itself (audit run 2: a reverse proxy on the NAS without a
+  forwarding header otherwise looked like loopback); all fields are redacted when saved, short fields truncated to 200 characters.
+- **Toppreise:** `og:title` is capped at 500 characters and split linearly (no more quadratic regex).
+- **Finding services:** stricter Tautulli detection, `partial` only for a truncated service folder, database folders
+  skipped, `unreadable` also for unreadable folders, time budget 8 s, 60-second cache without keys, `?keys=0|false|no|off`
+  with an honest `keys`, Emby/Jellyfin port from `system.xml`.
 
-- **Kopfzeilen:** Alle Antworten (JSON und Fehlerseiten wie `501` für `HEAD`) mit `Cache-Control: no-store`,
-  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` und
-  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` (die Browser-Seite behält ihre eigene CSP und
-  `no-cache`). Server-Kopf ohne Python-Version.
-- **Browser-Seite:** CSP ohne `'unsafe-inline'` für Skripte; erlaubt ist nur der SHA-256 des eigenen Skripts (beim Start aus
-  `web.html` berechnet). Stile bleiben `'unsafe-inline'` (Balken und Farben über `style="…"`; alle Daten laufen durch `esc()`).
+### From 1.16.1: hardening (audit run 2)
+
+- **Headers:** All responses (JSON and error pages such as `501` for `HEAD`) with `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and
+  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` (the browser page keeps its own CSP and
+  `no-cache`). Server header without the Python version.
+- **Browser page:** CSP without `'unsafe-inline'` for scripts; only the SHA-256 of its own script is allowed (computed at start from
+  `web.html`). Styles stay `'unsafe-inline'` (bars and colours via `style="…"`; all data goes through `esc()`).
   `X-Frame-Options: DENY`.
-- **Token:** zusätzlich mindestens 8 verschiedene Zeichen (`aaaa…`, `1234…` sind trotz 32 Zeichen leicht zu erraten).
-- **`/api/hello`:** höchstens 30 Anfragen pro Minute und Absender (danach `429` mit `Retry-After`; die App wertet das als
-  «nicht erkannt», nicht als «fremdes Gerät»). Der Beweis bleibt `HMAC-SHA256(Token, "nzblab-hello:" + Nonce)`: Eine langsame
-  Ableitung (PBKDF2/scrypt) würde alle bisherigen App-Versionen brechen (sie rechnen genau diesen Wert) und hilft nur, wenn der
-  alte Beweis ganz wegfällt. Schutz gegen Offline-Raten sind darum die Mindestlänge, die Zeichenvielfalt und der zufällige
-  Standard-Token (192 Bit).
-- **Verbindungen:** höchstens 32 gleichzeitig offene Verbindungen je Absender und 256 insgesamt (`NZBLAB_MAX_CONN_PER_IP`,
-  `NZBLAB_MAX_CONN`); halbe Anfragen (Slowloris) belegen so nicht beliebig viele Fäden. Token-Bremse räumt höchstens einmal
-  pro Sekunde auf.
-- **Sammler:** `README` in Backup-Ordnern nur die ersten 300 Bytes, kaputtes UTF-8 bricht die Backup-Suche nicht mehr ab;
-  E-Mail-Regel beim Schwärzen linear, Logzeilen vor dem Schwärzen auf 4000 Zeichen gekürzt; Geräteliste: höchstens 64 neue
-  Geräte je Suchlauf (der erste Suchlauf übernimmt alle, ohne Meldung), 5 Einzelmeldungen plus eine Sammelmeldung, höchstens 2000 Geräte, Namen nur druckbar (253 Zeichen);
-  Syslog-Zeilen für «Heute» werden geschwärzt (key=wert, Bearer, Cookie …); Cookie-Zeilen werden ganz geschwärzt.
-- **/config:** neue Dateien nur noch für den Agenten lesbar (`umask 077`: Datei-Index, Verlauf, Absturzberichte).
-  Bestehende Dateien behalten ihre Rechte.
-- **Container:** Vorlagen (Compose, TrueNAS, Synology, Unraid) mit `cap_drop: ALL` und nur `CHOWN`, `DAC_OVERRIDE`, `FOWNER`,
-  `SETUID`, `SETGID` (Start als root für `/config`, dann Wechsel auf PUID ohne Rechte), dazu wie bisher `read_only`,
-  `no-new-privileges`. SMART braucht zusätzlich `SYS_RAWIO`. Kein `USER` im Dockerfile: bestehende Installationen besitzen
-  `/config` noch als root, und der SMART-Helfer braucht root. Basis-Image per Digest festgenagelt.
-- **Workflow:** Rechte nur im Job (`contents: read`, `packages: write`), Actions auf Commit-SHA, Checkout ohne gespeicherte
-  Zugangsdaten, kein `pull_request_target`; das Image wird zuerst lokal gebaut und mit den Rechten der Vorlagen getestet,
-  erst dann werden Versions-Tag und `latest` hochgeladen. Der Token wird im Log nie ausgegeben.
+- **Token:** additionally at least 8 distinct characters (`aaaa…`, `1234…` are easy to guess despite 32 characters).
+- **`/api/hello`:** at most 30 requests per minute and sender (then `429` with `Retry-After`; the app treats this as
+  "not recognised", not as "foreign device"). The proof stays `HMAC-SHA256(token, "nzblab-hello:" + nonce)`: a slow
+  derivation (PBKDF2/scrypt) would break all previous app versions (they compute exactly this value) and only helps if the
+  old proof is dropped entirely. Protection against offline guessing is therefore the minimum length, the character variety and the random
+  default token (192 bits).
+- **Connections:** at most 32 simultaneously open connections per sender and 256 in total (`NZBLAB_MAX_CONN_PER_IP`,
+  `NZBLAB_MAX_CONN`); half-finished requests (Slowloris) thus cannot occupy arbitrarily many threads. The token brake cleans up at most once
+  per second.
+- **Collectors:** `README` in backup folders only the first 300 bytes, broken UTF-8 no longer aborts the backup search;
+  email rule when redacting is linear, log lines truncated to 4000 characters before redacting; device list: at most 64 new
+  devices per scan (the first scan adopts all, without a notification), 5 individual notifications plus one summary notification, at most 2000 devices, names printable only (253 characters);
+  syslog lines for "Today" are redacted (key=value, Bearer, Cookie …); cookie lines are redacted entirely.
+- **/config:** new files are readable only by the agent (`umask 077`: file index, history, crash reports).
+  Existing files keep their permissions.
+- **Container:** templates (Compose, TrueNAS, Synology, Unraid) with `cap_drop: ALL` and only `CHOWN`, `DAC_OVERRIDE`, `FOWNER`,
+  `SETUID`, `SETGID` (start as root for `/config`, then switch to PUID without privileges), plus as before `read_only`,
+  `no-new-privileges`. SMART additionally needs `SYS_RAWIO`. No `USER` in the Dockerfile: existing installations still own
+  `/config` as root, and the SMART helper needs root. Base image pinned by digest.
+- **Workflow:** permissions only in the job (`contents: read`, `packages: write`), actions pinned to commit SHA, checkout without stored
+  credentials, no `pull_request_target`; the image is first built locally and tested with the templates' permissions,
+  only then are the version tag and `latest` uploaded. The token is never printed in the log.
 
-### Ab 1.16.1: Audit Restteile
+### From 1.16.1: remaining audit items
 
-- **WireGuard:** Konfiguration höchstens 256 KiB je Datei gelesen; Kommentare oder `NAME`-Felder, die nach Schlüssel aussehen
-  («Private Key», «Preshared», «PSK», lange Base64-Folge; «Mein privater Laptop» bleibt ein Name), werden nie Peer-Namen; Fehler beim Auswerten melden nur `reason: "error"`
-  ohne Text. Private und Preshared Keys verlassen den Agent wie bisher nie.
-- **Doppelte Dateien:** Teil-Prüfsummen nur für echte Dateien innerhalb der Freigaben (`O_NOFOLLOW`, kein Symlink, keine Pipe,
-  die `open()` sonst für immer blockierte); solche Einträge gelten als nicht lesbar.
-- **Auslöser:** Speedtest und Test-Push höchstens einmal gleichzeitig (sonst `409` «läuft schon»); Gerätesuche und
-  Index-Neuaufbau prüfen und setzen «läuft» in einem Schritt, ein zweiter Auslöser antwortet `202` mit `started: false`.
-- **Preise:** nur `https` auf öffentliche Adressen, auch bei Weiterleitungen (höchstens 5; nie ins Heimnetz, Loopback,
-  Link-local, CGNAT, auch nicht über NAT64 oder IPv4 in IPv6; DNS-Fehler = blockiert); Seite höchstens 4 MB in 60 Sekunden; Links aus fremden Seiten nur `https://`.
+- **WireGuard:** configuration read at most 256 KiB per file; comments or `NAME` fields that look like a key
+  ("Private Key", "Preshared", "PSK", long Base64 sequence; "Mein privater Laptop" stays a name) never become peer names; errors while parsing report only `reason: "error"`
+  without text. Private and preshared keys still never leave the agent.
+- **Duplicate files:** partial checksums only for real files within the shares (`O_NOFOLLOW`, no symlink, no pipe,
+  which `open()` would otherwise block on forever); such entries count as unreadable.
+- **Triggers:** speed test and test push at most one at a time (otherwise `409` "already running"); device search and
+  index rebuild check and set "running" in one step, a second trigger answers `202` with `started: false`.
+- **Prices:** only `https` to public addresses, also on redirects (at most 5; never into the home network, loopback,
+  link-local, CGNAT, not even via NAT64 or IPv4 in IPv6; DNS error = blocked); page at most 4 MB in 60 seconds; links from foreign pages only `https://`.
 
-**Bestehende Installationen:** Nichts muss geändert werden. Wer einen eigenen Token mit weniger als 8 verschiedenen Zeichen
-gesetzt hat, bekommt `503` mit Grund und muss ihn ersetzen (oder leer lassen). Wer `/api/crashes` von Hand ohne Token
-abgefragt hat: `curl -H "Authorization: Bearer $(cat /config/token.txt)" http://127.0.0.1:8099/api/crashes`. Die neuen
-Container-Rechte gelten nur für neue Vorlagen; eigene Compose-Dateien und gespeicherte Unraid-Vorlagen bleiben, wie sie sind
-(freiwillig übernehmen: die Zeilen `cap_drop`/`cap_add` bzw. die «Extra Parameters» aus der neuen Vorlage).
+**Existing installations:** Nothing needs to be changed. Anyone who set a custom token with fewer than 8 distinct characters
+gets `503` with a reason and has to replace it (or leave it empty). Anyone who queried `/api/crashes` by hand without a token:
+`curl -H "Authorization: Bearer $(cat /config/token.txt)" http://127.0.0.1:8099/api/crashes`. The new
+container permissions apply only to new templates; your own Compose files and saved Unraid templates stay as they are
+(adopt voluntarily: the `cap_drop`/`cap_add` lines or the "Extra Parameters" from the new template).
