@@ -18,10 +18,10 @@ services:
       - "8099:8099"
     environment:
       # TZ: "Europe/Zurich"   # Beispiel: nur setzen, wenn Zeiten im Log falsch sind; deine eigene Zeitzone eintragen
-      # Ab 1.19.0 läuft der Agent nicht mehr als root: eigene Nummer deines DSM-Benutzers (SSH: «id»), hier Beispiel 1026 / PGID 100.
-      # Dieser Benutzer braucht Leserecht auf die Ordner, die der Agent ansehen soll. PUID=0 (root) nur, wenn der Datei-Index sonst
+      # Ab 1.19.0 läuft der Agent nicht mehr als root: eigene, sonst unbenutzte Nummer 8099 / PGID 100 (nicht die deines DSM-Benutzers: sonst läuft er wie deine anderen Container).
+      # Diese Nummer braucht Leserecht auf die Ordner, die der Agent ansehen soll; dafür der Gruppe «users» (PGID 100) bei jeder Freigabe «Nur Lesen» geben (Systemsteuerung › Freigegebener Ordner › Bearbeiten › Berechtigungen › Lokale Gruppen). PUID=0 (root) nur, wenn der Datei-Index sonst
       # wegen DSM-ACLs Ordner nicht lesen kann, und davon wird abgeraten (root im Container = mehr Folgen bei einem Fehler).
-      PUID: "1026"
+      PUID: "8099"
       PGID: "100"
       FILES_EXCLUDE: "@*,#*,docker"
       CACHE_ROOTS: ""
@@ -36,6 +36,7 @@ services:
       - /volume1/docker/nzblab-agent:/config            # Verlauf, Datei-Index, token.txt (lesen/schreiben)
       - /sys:/host/sys:ro
       - /proc:/host/proc:ro
+      - /etc/hostname:/host/etc/hostname:ro                # Name des NAS (sonst zeigt die App die Container-Kennung)
       - /volume1:/host/mnt/user:ro                      # Volume nur lesend: Datei-Index und Suche
     read_only: true
     tmpfs:

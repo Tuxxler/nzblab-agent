@@ -1,4 +1,6 @@
 """Tests für den NZBLab-Agenten mit nachgebautem /sys und /proc (kein echtes NAS nötig)."""
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -131,7 +133,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.20.1")
+        self.assertEqual(info["version"], "1.20.2")
         srv.shutdown()
 
 
@@ -2092,9 +2094,9 @@ class Agent115Test(unittest.TestCase):
         write(f"{sysd}/block/sdb/size", "1")           # ohne Temperatur (schläft): kommt aus SMART, falls bekannt
         os.makedirs(f"{sysd}/block/loop0", exist_ok=True)
         smart = {"/dev/sdb": {"device_name": "sdb", "temp": 31, "standby": False}}
-        self.assertEqual(a.disk_temps(sysd, smart), {"sda": 35, "nvme0n1": 42, "sdb": 31})
+        self.assertEqual(a.disk_temps(sysd, smart, proc=f"{self.d}/keine-proc"), {"sda": 35, "nvme0n1": 42, "sdb": 31})
         st = a.Store(":memory:")
-        a.record_disk_temps(st, sysd, now=1_760_000_000)
+        a.record_disk_temps(st, sysd, now=1_760_000_000, proc=f"{self.d}/keine-proc")
         self.assertEqual(st.latest_series("disk:")["sda"]["v"], 35)
 
     def test_reihen_verdichtet_nach_zwei_tagen(self):
@@ -4080,7 +4082,8 @@ class Agent120Test(unittest.TestCase):
         now[0] += 2 * 60
         code, body = self.call(port, "/api/discover?keys=1", "https", "GET")
         self.assertEqual((code, body["error"]), (403, "keys_locked"))
-        self.assertIn("neu starten", body["hint"])
+        self.assertIn("Neustart öffnet", body["hint"])     # ab 1.20.2: nach der ersten Ausgabe kein Rat «neu starten» mehr
+        self.assertNotIn("Container neu starten", body["hint"])
         self.assertIn("keys-unlock", body["hint"])
         self.assertNotIn("0000sonarr", json.dumps(body))
         self.assertEqual(self.call(port, "/api/discover?keys=0", "https", "GET")[0], 200)
@@ -4374,6 +4377,290 @@ class Agent120Test(unittest.TestCase):
             self.assertEqual(a.healthcheck(), 0)
         with patch.object(a, "PORT", 1), patch.object(a, "BIND", "127.0.0.1"):
             self.assertEqual(a.healthcheck(), 1)
+
+
+class Agent1202Test(unittest.TestCase):
+    """1.20.2: Schlüssel-Marker und Hinweis, feste 500-Texte, Zahlenfelder, drivetemp, Verlauf, Heimnetz, zvols, Preise, Index, Hostname."""
+
+    setUpClass = classmethod(Agent120Test.setUpClass.__func__)
+    setUp = Agent120Test.setUp
+    start = Agent120Test.start
+    call = Agent120Test.call
+    fixture_root = Agent120Test.fixture_root
+
+    def post_json(self, port, path, body):
+        req = urllib.request.Request(f"https://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), method="POST",
+                                     headers={"Authorization": "Bearer " + "geheim" * 6, "Content-Type": "application/json"})
+        ctx = self.ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, self.ssl.CERT_NONE
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    # --- Schlüssel (G2, G3, G4)
+    def test_marker_nicht_bei_leerer_suche(self):
+        port = self.start(root=tempfile.mkdtemp())          # keine Dienste
+        a.KEYS.restart()
+        code, body = self.call(port, "/api/discover?keys=1", "https", "GET")
+        self.assertEqual((code, body["services"]), (200, []))
+        self.assertFalse(a.keys_issued())
+
+    def test_marker_bei_echter_ausgabe_und_hinweis_passt(self):
+        a.KEYS.restart()
+        self.assertIn("Container neu starten", a.keys_hint())
+        port = self.start(root=self.fixture_root())
+        self.assertEqual(self.call(port, "/api/discover?keys=1", "https", "GET")[0], 200)
+        self.assertTrue(a.keys_issued())
+        self.assertNotIn("Container neu starten", a.keys_hint())
+        self.assertIn("keys-unlock", a.keys_hint())
+        self.assertTrue(a.keys_state()["issued"])
+
+    def test_marker_alt_bei_neustart_kein_fenster(self):
+        a.mark_keys_issued()
+        a.KEYS.restart()
+        self.assertEqual(a.KEYS.seconds_left(), 0)
+
+    # --- feste 500-Texte (G11)
+    def test_interner_fehler_ohne_einzelheiten(self):
+        port = self.start()
+        with patch.object(a, "host_info", side_effect=RuntimeError("geheimer Pfad /mnt/user/appdata/x token=abcdef")):
+            code, body = self.call(port, "/api/host", "https", "GET")
+        self.assertEqual(code, 500)
+        self.assertEqual(body["error"], a.INTERNAL_ERROR)
+        self.assertNotIn("geheimer", json.dumps(body))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            a.log_internal_error("/api/host", RuntimeError("Fehler token=abcdefghijkl123456"))
+        self.assertIn("Fehler in /api/host", out.getvalue())
+        self.assertNotIn("abcdefghijkl123456", out.getvalue())
+
+    # --- Zahlenfelder (G6)
+    def test_leere_zahlenfelder(self):
+        with patch.dict(os.environ, {"X_LEER": "", "X_MUELL": "abc", "X_OK": " 7 ", "X_F": "2.5"}):
+            self.assertEqual(a.env_num("X_LEER", 30), 30)
+            self.assertEqual(a.env_num("X_MUELL", 30), 30)
+            self.assertEqual(a.env_num("X_OK", 30), 7)
+            self.assertEqual(a.env_num("X_F", 1, float), 2.5)
+            self.assertEqual(a.env_num("X_FEHLT", "5", float), 5.0)
+
+    # --- /api/config strenger (G10)
+    def test_config_typen(self):
+        port = self.start()
+        ids = a.PRICE_SERIES[0]
+        tb = ids["sizes"][0]
+        self.assertEqual(self.post_json(port, "/api/config", {"price_watch": [{"series": [ids["id"]], "tb": tb}]})[0], 400)
+        self.assertEqual(self.post_json(port, "/api/config", {"price_watch": [{"series": ids["id"], "tb": True}]})[0], 400)
+        self.assertEqual(self.post_json(port, "/api/config", {"price_country": "CH", "price_country_if_unset": "ja"})[0], 400)
+
+    # --- ntfy ohne Weiterleitung (G14)
+    def test_ntfy_folgt_keiner_weiterleitung(self):
+        import http.server
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.path)
+                if self.path == "/a":
+                    self.send_response(307)
+                    self.send_header("Location", "/b")
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+
+            def log_message(self, *x):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.assertTrue(any(isinstance(h, a._NoRedirect) for h in a.NTFY_OPENER.handlers))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), a._NoRedirect())
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/a", data=b"x", method="POST")
+        with self.assertRaises(urllib.error.HTTPError):
+            opener.open(req, timeout=5)
+        self.assertEqual(hits, ["/a"])
+
+    # --- drivetemp (A27)
+    def test_drivetemp_nicht_in_temps_und_limits(self):
+        sysd = f"{self.cfg}/sys"
+        write(f"{sysd}/class/hwmon/hwmon1/name", "drivetemp")
+        write(f"{sysd}/class/hwmon/hwmon1/temp1_input", "35000")
+        write(f"{sysd}/class/hwmon/hwmon1/temp1_crit", "70000")
+        write(f"{sysd}/class/hwmon/hwmon2/name", "coretemp")
+        write(f"{sysd}/class/hwmon/hwmon2/temp1_input", "50000")
+        write(f"{sysd}/class/hwmon/hwmon2/temp1_label", "Package id 0")
+        write(f"{sysd}/class/hwmon/hwmon2/temp1_crit", "100000")
+        sm = a.Sampler(sys_dir=sysd)
+        self.assertEqual(sm.temps(), {"CPU": 50.0})
+        self.assertEqual(sm.limits(), {"CPU": 100.0})
+
+    def test_plattentemperatur_nur_bei_zugriffen(self):
+        sysd = f"{self.cfg}/sys2"
+        write(f"{sysd}/block/sda/device/hwmon/hwmon3/temp1_input", "35000")
+        write(f"{sysd}/block/nvme0n1/device/hwmon2/temp1_input", "41000")
+        proc = f"{self.cfg}/proc2"
+        line = lambda n, r: f"   8       0 {n} {r} 0 100 0 5 0 10 0 0 0 0\n"
+        write(f"{proc}/diskstats", line("sda", 10) + line("nvme0n1", 10))
+        with patch.dict(a._DISK_IO_SEEN, clear=True), patch.dict(a._LAST_DISK_TEMP, clear=True):
+            self.assertEqual(a.disk_temps(sysd, proc=proc), {"sda": 35, "nvme0n1": 41})     # erster Durchgang: lesen
+            self.assertEqual(a.disk_temps(sysd, proc=proc), {"nvme0n1": 41})                  # nichts bewegt sich: sda schläft evtl., nicht lesen
+            write(f"{proc}/diskstats", line("sda", 11) + line("nvme0n1", 10))
+            self.assertEqual(a.disk_temps(sysd, proc=proc), {"sda": 35, "nvme0n1": 41})
+            self.assertEqual(a.disk_temp_cached(sysd, "sda"), 35)
+
+    # --- Verlauf (A11)
+    def test_verlauf_ueber_48h_verdichtet(self):
+        st = a.Store(":memory:")
+        t0 = 1_760_000_000 // 600 * 600
+        for i in range(40):         # 20 Minuten alle 30 s
+            st.add({"t": t0 + i * 30, "cpu": 10.0 + (i % 2) * 10, "cores": [1, 3], "temps": {"CPU": 50.0 + i % 2}, "fans": {}, "gpu": {},
+                    "mem": {"total": 100, "used": 50, "percent": 50.0}, "disks": {"sda": 100.0}, "top": [["x", 1.0]],
+                    "net": {"eth0": {"rx": 10, "tx": 20}}, "mover": i == 3, "disk_rw": {"sda": [1.0, 2.0]}, "limits": {"CPU": 100.0}})
+        rows = st.raw_condensed(0)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(set(rows[0]), set(st.raw(0)[0]))        # gleiche Felder
+        self.assertEqual(rows[0]["cpu"], 15.0)
+        self.assertEqual(rows[0]["cores"], [1, 3])
+        self.assertEqual(rows[0]["net"]["eth0"], {"rx": 10, "tx": 20})
+        self.assertEqual(rows[0]["mem"]["total"], 100)
+        self.assertTrue(rows[0]["mover"])
+        self.assertFalse(rows[1]["mover"])
+
+    def test_verlauf_endpunkt(self):
+        st = a.Store(":memory:")
+        now = int(time.time())
+        for i in range(60):
+            st.add({"t": now - 100 * 3600 + i * 30, "cpu": 5.0, "cores": [], "temps": {}, "fans": {}, "gpu": {}, "mem": {}, "disks": {}, "top": [], "net": {}})
+            st.add({"t": now - 3600 + i * 30, "cpu": 5.0, "cores": [], "temps": {}, "fans": {}, "gpu": {}, "mem": {}, "disks": {}, "top": [], "net": {}})
+        ctx = a.setup_tls()
+        srv = a.make_server("127.0.0.1", 0, a.make_handler(st, lambda: {}, "geheim" * 6, discover=a.Discover(roots=[])), tls=ctx, http=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.servers.append(srv)
+        code, r = self.call(srv.server_port, "/api/history?hours=24", "https", "GET")
+        self.assertEqual((code, r["res"], len(r["rows"]), r.get("bucket_s")), (200, "raw", 60, None))
+        code, r = self.call(srv.server_port, "/api/history?hours=120", "https", "GET")
+        self.assertEqual((code, r["res"], r["bucket_s"]), (200, "raw", 600))
+        self.assertLess(len(r["rows"]), 120)
+
+    # --- Heimnetz (A12, A13)
+    def test_heimnetz_schnittstellen_und_private_netze(self):
+        for n in ("eth0", "br0", "enp3s0", "eno1", "ovs_eth0", "bond0", "wlan0"):
+            self.assertTrue(a.LanScan.iface_ok(n), n)
+        for n in ("docker0", "veth12ab", "br-1234abcd", "lo", "virbr0", "wg0", "tun0", ""):
+            self.assertFalse(a.LanScan.iface_ok(n), n)
+        for ip in ("192.168.1.5", "10.0.0.2", "172.16.4.4", "172.31.255.1"):
+            self.assertTrue(a.LanScan.private_v4(ip), ip)
+        for ip in ("8.8.8.8", "203.0.113.5", "169.254.1.1", "127.0.0.1", "172.32.0.1", "100.64.0.1", "fd00::1", "kein"):
+            self.assertFalse(a.LanScan.private_v4(ip), ip)
+        arp = f"{self.cfg}/arp"
+        write(arp, "IP address       HW type     Flags       HW address            Mask     Device\n"
+                   "192.168.1.5      0x1         0x2         aa:bb:cc:00:00:01     *        enp3s0\n"
+                   "203.0.113.1      0x1         0x2         aa:bb:cc:00:00:02     *        eth0\n"
+                   "172.17.0.2       0x1         0x2         aa:bb:cc:00:00:03     *        docker0\n")
+        lan = a.LanScan(os.path.join(self.cfg, "d.db"), lambda *x: None)
+        with patch.object(lan, "arp_path", return_value=arp):
+            self.assertEqual(lan.arp(), {"aa:bb:cc:00:00:01": "192.168.1.5"})
+
+    # --- zvols (A14), Wecker (A28)
+    def test_zvols_keine_platten(self):
+        sysd = f"{self.cfg}/sys3"
+        for dev in ("sda", "zd0", "zd16"):
+            write(f"{sysd}/block/{dev}/size", str(2 * 10**12 // 512))
+            write(f"{sysd}/block/{dev}/queue/rotational", "1")
+        self.assertEqual([d["dev"] for d in a.local_disks(sysd)], ["sda"])
+        self.assertEqual([d["dev"] for d in a.host_disks(sysd)], ["sda"])
+
+    def test_wecker_nur_drehende_platten(self):
+        sysd = f"{self.cfg}/sys4"
+        write(f"{sysd}/block/sda/queue/rotational", "1")
+        write(f"{sysd}/block/sdb/queue/rotational", "0")
+        write(f"{sysd}/block/sdc/queue/rotational", "1")
+        write(f"{sysd}/block/sdc/removable", "1")
+        write(f"{sysd}/block/sata1/queue/rotational", "1")
+        with patch.object(a, "HOST_SYS", sysd):
+            w = a.Watcher(a.Store(":memory:"), lambda *x, **k: None)
+            self.assertEqual([w.spinning(d) for d in ("sda", "sdb", "sdc", "sata1")], [True, False, False, True])
+
+    # --- Preise (A31, A33)
+    def test_kleine_platten_in_gb(self):
+        self.assertEqual(a.tb_term(0.5), "500GB")
+        self.assertEqual(a.tb_term(2), "2TB")
+        self.assertTrue(a._size_ok("Samsung 870 EVO 500GB SATA", 0.5))
+        self.assertTrue(a._size_ok("Samsung 870 EVO 500 GB", 0.5))
+        self.assertFalse(a._size_ok("Samsung 870 EVO 1500GB", 0.5))
+        self.assertTrue(a._size_ok("WD Red 4 TB", 4))
+        self.assertIn("500GB", a.price_search_url({"id": "toppreise"}, 0.5, "ssd"))
+
+    def test_nur_neue_schluessel_holen(self):
+        targets = [{"key": "k1", "label": "a", "tb": 4, "kind": "hdd"}, {"key": "k2", "label": "b", "tb": 8, "kind": "hdd"}]
+        asked = []
+        src = {"label": "Testquelle", "id": "toppreise", "currency": "CHF"}
+
+        def fake_search(sources, t, *args, **kw):
+            asked.append(t["key"])
+            return src, "none", "", [], "http://x"
+        with patch.object(a, "price_targets", return_value=targets), patch.object(a, "_search", fake_search), \
+                patch.object(a, "source_allowed", return_value=True):
+            a.fetch_own_prices("CH", pause=0, only_keys={"k2"})
+        self.assertEqual(asked, ["k2"])
+
+    # --- Index (A30), Cache (A29)
+    def test_index_behaelt_alten_bei_leerem_lauf(self):
+        root = tempfile.mkdtemp()
+        os.makedirs(f"{root}/Media")
+        for i in range(120):
+            write(f"{root}/Media/f{i}.mkv", "x")
+        ix = a.FileIndex(os.path.join(self.cfg, "idx.db"), root=root, exclude=set())
+        ix.build()
+        self.assertEqual(ix.status()["files"], 120)
+        shutil_rm = __import__("shutil").rmtree
+        shutil_rm(f"{root}/Media")
+        ix.build()
+        self.assertTrue(ix.status()["error"])
+        self.assertEqual(len(ix.search("f1")), len(ix.search("f1")))
+        self.assertTrue(ix.search("f10"))                  # alter Index bleibt durchsuchbar
+
+    def test_cache_freigaben_im_hintergrund(self):
+        root = tempfile.mkdtemp()
+        write(f"{root}/share1/a.bin", "x" * 10)
+        cs = a.CacheShares(roots=[root], ttl=300, budget=30)
+        r = cs.get_async(wait=5)
+        self.assertEqual([x["name"] for x in r["shares"]], ["share1"])
+        self.assertFalse(r["measuring"])
+        cs2 = a.CacheShares(roots=[root])
+        with patch.object(cs2, "compute", side_effect=lambda: (time.sleep(1), {"shares": [], "at": 0})[1]):
+            r2 = cs2.get_async(wait=0)
+        self.assertTrue(r2["measuring"])
+        self.assertEqual(r2["shares"], [])
+
+    # --- Name des NAS (G15), Drehzahl
+    def test_hostname_aus_datei(self):
+        f = f"{self.cfg}/hostname"
+        write(f, "mein-nas\n")
+        with patch.object(a, "HOST_HOSTNAME_FILE", f):
+            self.assertEqual(a.nas_hostname(), "mein-nas")
+        write(f, "böse name; rm\n")
+        with patch.object(a, "HOST_HOSTNAME_FILE", f):
+            self.assertEqual(a.nas_hostname(), a.socket.gethostname())
+        with patch.object(a, "HOST_HOSTNAME_FILE", f + ".fehlt"):
+            self.assertEqual(a.nas_hostname(), a.socket.gethostname())
+
+    def test_drehzahl_null_bleibt_null_fehlt_bleibt_none(self):
+        base = {"device": {"name": "/dev/sdx"}, "model_name": "M", "smart_status": {"passed": True}}
+        self.assertIsNone(a.parse_smart(json.dumps(base), "/dev/sdx")["rotational_speed"])
+        self.assertEqual(a.parse_smart(json.dumps(dict(base, rotation_rate=0)), "/dev/sdx")["rotational_speed"], 0)
+        self.assertEqual(a.parse_smart(json.dumps(dict(base, rotation_rate=7200)), "/dev/sdx")["rotational_speed"], 7200)
+
+    # --- SABnzbd-Verlauf auch unter apps/ und docker/ (A32)
+    def test_sab_verlauf_auf_truenas_und_synology(self):
+        for sub in ("apps", "docker"):
+            root = tempfile.mkdtemp()
+            write(f"{root}/{sub}/sabnzbd/admin/history1.db", "x")
+            t = a.Today(a.Store(":memory:"), files_root=root)
+            self.assertTrue((t.sab_db() or "").endswith("history1.db"), sub)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@
 **Security notes.**
 - Read-only: all host paths are mounted read-only; only `/config` is writable.
 - Token: a random token is created on first start (`/config/token.txt`, mode 600) and printed to the container log exactly once. All endpoints except ping/health/hello need `Authorization: Bearer <token>`. Wrong tokens are rate-limited.
-- HTTPS (from 1.20.0): on first start the agent creates its own certificate in `/config/tls` (EC P-256, 10 years) and logs its SHA-256 fingerprint. Own certificate: put `cert.pem` and `key.pem` into `/config/tls`. `NZBLAB_HTTP=0` switches plain HTTP off. Service API keys (`/api/discover?keys=1`) and token rotation (`POST /api/token/rotate`) are only served over HTTPS; keys only in a 30-minute window after start (or 10 minutes after creating an empty file `keys-unlock` in `/config`); a token alone never unlocks.
+- HTTPS (from 1.20.0): on first start the agent creates its own certificate in `/config/tls` (EC P-256, 10 years) and logs its SHA-256 fingerprint. Own certificate: put `cert.pem` and `key.pem` into `/config/tls`. `NZBLAB_HTTP=0` switches plain HTTP off. Service API keys (`/api/discover?keys=1`) and token rotation (`POST /api/token/rotate`) are only served over HTTPS; keys only in a 30-minute window after start, until keys were handed out once (from 1.20.1; afterwards only 10 minutes after creating an empty file `keys-unlock` in `/config`); a token alone never unlocks.
 - Port 8099 is for your home network or VPN only; never expose it to the internet.
 - Licence: GNU AGPL-3.0-only, see [`LICENSE`](LICENSE). Free to use, also commercially; if you distribute a modified version or offer it as a network service, you must publish your changes under the same licence.
 - Beta status: TrueNAS, Synology and Linux support is beta (tested with virtual machines and sample data, not on real hardware).
@@ -71,7 +71,7 @@ spaces, better leave it empty** (from 1.16.1; shorter values or values with fewe
 
 **The `/config` path is mandatory:** the agent stores its token and history there. Without a path of its own, both live only inside the
 container and are gone after every update: you get a new token each time and the app can no longer connect. Unraid:
-Docker › nzblab-agent › Edit › path `/config` → `/mnt/user/appdata/nzblab-agent` (read/write) › Apply.
+Docker › NASlab-Agent › Edit › path `/config` → `/mnt/user/appdata/nzblab-agent` (read/write) › Apply.
 Compose: `- ./nzblab-agent:/config` (or the path in the templates).
 
 From 1.13.0 the agent guards against this:
@@ -88,11 +88,11 @@ From 1.13.0 the agent guards against this:
 - If `settings.json` is damaged (not valid JSON), it moves it aside before the next save as
   `settings.json.broken-<time>` and reports this in the log instead of silently overwriting it.
 
-**Without root:** The image sets `PUID=99`, `PGID=100` (nobody:users). The agent starts as root, creates the token, reads the
+**Without root:** The image sets `PUID=8099`, `PGID=100` (its own, otherwise unused user number: other containers run as 99 on Unraid, 568 on TrueNAS or your own number on Synology, and a process with the same user and group number could reach their files through `/host/proc`). The agent starts as root, creates the token, reads the
 container names (`/host/docker/containers`, readable by root only), gives `/config` to this user and then continues without root.
 If it cannot hand over `/config` (e.g. NFS with root_squash), it stays root and says so in the log. `PUID=0` = always root:
-needed only for appdata sizes of other containers with strict permissions. TrueNAS template: 568:568 (user "apps");
-Synology template from 1.19.0: its own number (example 1026:100, SSH `id`). **`PUID=0` (root) is discouraged**, only if DSM ACLs would otherwise block the file index.
+needed only for appdata sizes of other containers with strict permissions. TrueNAS template: 8099:568;
+Synology template: 8099:100 (its own number; only if DSM permissions deny access to the folders, enter the number of your DSM user, SSH `id`). **`PUID=0` (root) is discouraged**, only if DSM ACLs would otherwise block the file index.
 
 **Hardening in all templates:** `--read-only` (root filesystem), `/tmp` as tmpfs, `no-new-privileges`, 512 MB RAM, 1 CPU,
 no `privileged`, `cap_drop: ALL` and only five capabilities for the start (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`; after that the agent runs without root). HEALTHCHECK in the image: the agent's `--healthcheck`, which checks `/api/health`.
@@ -101,7 +101,7 @@ More variables for other systems: `FILES_EXCLUDE` (top-level folders, also patte
 default `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (empty = no cache).
 
 Optional: push notification on overheating while you are away: variable `NTFY_URL` = `https://ntfy.sh/<long-secret-word>` and subscribe
-to the same topic in the app's "ntfy". Threshold: `HEAT_ALERT_C` (default 95 °C, after 5 minutes). From 1.18.0 ntfy sends
+to the same topic in the app's "ntfy". Threshold: `HEAT_ALERT_C` (default 95 °C) and `HEAT_ALERT_MINUTES` (default 5 minutes). From 1.18.0 ntfy sends
 only critical things by default (see section 1.18.0, `NZBLAB_NTFY_ALL`).
 
 ## Linux (Debian, Ubuntu …) (from 1.14.0)
@@ -156,14 +156,14 @@ If a network mount under `/host/fs` hangs (NFS/SMB gone), the agent waits at mos
 and marks it with `timeout: true`. It recalculates `/api/host` and `/api/filesystems` at most every `HOST_CACHE_S`
 seconds (default 15).
 
-The templates for Unraid (99:100), TrueNAS (568:568) and Synology (own number, no longer root from 1.19.0) are unchanged by this.
+The templates for Unraid, TrueNAS and Synology use the own number 8099 (from 1.20.2; existing installations keep their saved number; whoever switches, the agent takes over its `/config` folder at the next start).
 
 Unraid, TrueNAS and Synology therefore do not change: the new paths are only additional.
 
 ## Overview in the browser (from 1.4.0)
 
 Open `https://<NAS-IP>:8099` (e.g. `https://192.168.1.10:8099`) in the browser (PC, tablet, phone on Wi-Fi or via
-WireGuard). The browser warns once because the agent uses its own certificate: compare the fingerprint with the line in the container log. Setup (finding services) only works within 30 minutes after the start; otherwise restart the container. The first time, paste the token (see "Token" above); it stays stored in this browser only, "Sign out" deletes it.
+WireGuard). The browser warns once because the agent uses its own certificate: compare the fingerprint with the line in the container log. Setup (finding services) only works within 30 minutes after the first start; otherwise restart the container. Once keys were handed out, a restart no longer opens the window: create an empty file `keys-unlock` in `/config` instead. The first time, paste the token (see "Token" above); it stays stored in this browser only, "Sign out" deletes it.
 
 Shown live, every 5 seconds: CPU and CPU temperature with history (12 h), memory, network, array with
 disks, internet speed ("Measure now" button), all temperatures, top load, disk activity, GPU,
@@ -412,6 +412,23 @@ Full text: [`LICENSE`](LICENSE).
 
 Features and fixes by agent version.
 
+### From 1.20.2: fixes and hardening
+- **Own user number 8099** in the image, the Unraid template and all compose files (instead of 99, 568 or your own DSM number), so the agent does not run under the same number as your other containers. Existing installations keep their saved number; the agent takes over its `/config` folder itself when you switch.
+- **Key window.** The "keys handed out" marker is only set when at least one service was really handed out (not on an empty search). The hint in the app, the browser page and the API names only the file `keys-unlock` once keys were handed out; `GET /api/info` shows `keys.issued`.
+- **Fixed texts on errors.** An internal error answers `500` with a fixed text; the details go (redacted) to the container log only.
+- **ntfy** does not follow redirects any more.
+- **Empty fields** in the Unraid template (e.g. `PORT`, `INTERVAL`) no longer stop the agent: an empty or invalid number counts as not set.
+- **`POST /api/config`** checks types strictly (price series, sizes, `price_country_if_unset`).
+- **Browser page:** warning when the token is typed in over plain `http://`; the NAS name and the fingerprint wrap on narrow phones.
+- **Disks stay asleep.** The `drivetemp` sensors are no longer read every 30 seconds; the disk temperature comes every 5 minutes and only for disks that had accesses since the last time (NVMe always).
+- **`/api/history`:** raw values up to 48 hours, up to 8 days averages per 10 minutes (same fields, `bucket_s: 600`), above that hourly values.
+- **Home-network search:** all real network interfaces (also `enp…`, `eno…`, `ovs_eth0`), but only private networks (10.x, 172.16–31.x, 192.168.x).
+- **Disks:** ZFS volumes (`zd0` …) are not listed as disks; "disk spun up" only for rotating, built-in disks (also Synology `sata1` …); `rotational_speed` is passed on as `null` when the disk does not report it.
+- **Disk prices:** disks under 1 TB are searched as `500GB`; adding a watched series only fetches the new series; SABnzbd history is also found under `apps/` (TrueNAS) and `docker/` (Synology).
+- **File index:** a run that found (almost) no files keeps the old index. **Cache shares** are measured in the background (the request returns the last state and `measuring`).
+- **NAS name** instead of the container ID, if `/etc/hostname` is mounted read-only to `/host/etc/hostname`.
+- Texts name the container "NASlab-Agent"; `HEAT_ALERT_MINUTES` is documented.
+
 ### From 1.20.0: HTTPS, key window, token rotation
 Reason (full review 14 Nov 2026): The agent only spoke HTTP. Anyone listening on the same Wi-Fi read the token and fetched all service keys via `/api/discover?keys=1`.
 
@@ -420,12 +437,12 @@ Reason (full review 14 Nov 2026): The agent only spoke HTTP. Anyone listening on
 - **Use your own certificate:** put `cert.pem` and `key.pem` (PEM, key without password) into `/config/tls/`; the agent uses them and never touches them.
 - **Fingerprint (SHA-256)** is shown at start in the log ("NZBLab-Agent Fingerabdruck: AB:CD:…"), in the browser dashboard (card "Agent"), in `GET /api/tls` (without token) and in `/api/health`, `/api/info`.
 - **`NZBLAB_HTTP`** (default `1` in 1.20: plain text stays for old apps during the transition period). `0` = HTTPS only; plain-text connections get a short 403 response. Without a certificate (e.g. `openssl` missing) the agent then does not start.
-- **Key output in the log.** The window opens again after every restart; every output of keys is logged with the sender address and number of services (never the keys).
+- **Key output in the log.** The window opens at the first start until keys were handed out once (afterwards only via `keys-unlock`); every output of keys is logged with the sender address and number of services (never the keys).
 - **Behind a TLS proxy.** If the proxy reports `X-Forwarded-Proto: http` (case does not matter), the request counts as insecure for keys and token rotation (403). The header is only used to forbid, never to allow.
 - **Certificate pitfalls.** `NZBLAB_TLS_SAN` entries with `%` (zone identifier) or link-local addresses are skipped with a warning. If your own `cert.pem`/`key.pem` cannot be loaded, a loud warning appears in the log and the agent uses the self-generated certificate. If TLS is off, a warning line appears in the log (`tls: false`).
 - **Recommendation:** `NZBLAB_HTTP=0` (HTTPS only) once all apps are on 2.77 or newer; the default stays `1` for now.
 - **Keys never over HTTP.** `GET /api/discover` with keys (`keys=1`, also when not specified) answers over plain text with `403 {"error": "keys_need_tls"}`. `keys=0` (count only) stays open both ways.
-- **Key window.** Keys are only available for 30 minutes after the agent starts, afterwards `403 {"error": "keys_locked", "hint": "…"}`. Reopen (10 minutes): restart the container (then 30 minutes again) **or** create the empty file `keys-unlock` in `/config` on the NAS (the agent deletes it on the next call). A token alone deliberately never unlocks: otherwise the lock would be useless against a stolen token. `DISCOVER_KEYS=0` stays "never", new `DISCOVER_KEYS=always` = without a window (old behaviour, for advanced users, still HTTPS only).
+- **Key window.** Keys are only available for 30 minutes after the agent starts, afterwards `403 {"error": "keys_locked", "hint": "…"}`. Reopen (10 minutes): before keys were ever handed out, restart the container (then 30 minutes again); afterwards (from 1.20.1, marker `/config/keys-issued`) only by creating the empty file `keys-unlock` in `/config` on the NAS (the agent deletes it on the next call). A token alone deliberately never unlocks: otherwise the lock would be useless against a stolen token. `DISCOVER_KEYS=0` stays "never", new `DISCOVER_KEYS=always` = without a window (old behaviour, for advanced users, still HTTPS only).
 - **Token rotation:** `POST /api/token/rotate` (token required, HTTPS only) creates a new random token (`secrets.token_urlsafe(32)`), writes it atomically to `/config/token.txt` (mode 600) and answers with it; the old token is invalid immediately. Over HTTP `403 tls_required`. Additionally only while the key window is open (30 min after start or 10 min after the file `keys-unlock`), otherwise `403 keys_locked` with a hint: a stolen token cannot lock the owner out this way. Every rotation (also rejected ones) is logged with the sender address, never the token. If the token is fixed via `NZBLAB_AGENT_TOKEN`: `409 token_fixed` ("Token is fixed in the template"). At most 5 calls per minute and sender; wrong tokens count in the usual brake.
 - New: `GET /api/keys/status` (with token), `features`: `tls`, `token_rotate`, `keys_window`; `api_level` 17; `/api/info` with `tls`, `fingerprint`, `http`, `secure`, `keys`.
 - Image health check: `python3 nzblab_agent.py --healthcheck` (HTTPS, otherwise HTTP).
@@ -539,7 +556,7 @@ Lidarr, Readarr, Whisparr and other services are not reported.
   token brake
 - keys never appear in the log, not even on error (`500 {"error": "Suche fehlgeschlagen"}` without details), not
   in "Today", the history or the web interface
-- if the agent as PUID 99 cannot read a folder or file: `code: "unreadable"` (from 1.16.1 also for unreadable
+- if the agent as PUID 8099 cannot read a folder or file: `code: "unreadable"` (from 1.16.1 also for unreadable
   folders if the folder name looks like Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Seerr, Plex, Jellyfin or Emby), fix PUID=0
 - Tautulli is only detected with a `[PMS]` section in `config.ini` or "tautulli" in the folder name (from 1.16.1; Headphones,
   LazyLibrarian, Mylar & co. also have `[General] http_root` but are not Tautulli); Emby and Jellyfin before 10.9 read the port from
@@ -616,7 +633,7 @@ Same interface (`api_level` 16), new fields are only additions (old apps do not 
   container folders contain the environment variables of all containers, the agent keeps only the names). New variable `NZBLAB_LAN`.
 
 - **ntfy only for critical things (default).** The agent now sends via ntfy only: disk failed or new read/write errors,
-  array stopped, CPU above the critical limit (`HEAT_ALERT_C`, default 95 °C, after 5 minutes). Ntfy is the emergency route when
+  array stopped, CPU above the critical limit (`HEAT_ALERT_C`, default 95 °C, for `HEAT_ALERT_MINUTES`, default 5 minutes). Ntfy is the emergency route when
   the phone is asleep; the app reports the rest. **Info messages** (cheap disks, new devices in the home network, "back to normal") are sent
   via ntfy only with **`NZBLAB_NTFY_ALL=1`** (default `0`). In "Today" in the app they appear unchanged. The same thing
   at most once in 24 hours unless it gets worse (more errors, hotter); an all-clear lifts the block (the all-clear itself:

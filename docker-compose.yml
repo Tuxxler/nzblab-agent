@@ -18,8 +18,8 @@ services:
     # network_mode: host     # A (Linux): echte Netzwerkkarten, Heimnetz-Geräte. Dann «ports» oben löschen
     environment:
       # TZ: "Europe/Zurich"   # Beispiel: nur setzen, wenn Zeiten im Log falsch sind; deine eigene Zeitzone eintragen
-      PUID: "99"              # Benutzer nach dem Start (Unraid 99 = nobody); TrueNAS 568, Synology eigene Nummer (z. B. 1026), Linux 65534; 0 = root (nicht empfohlen)
-      PGID: "100"             # Gruppe (Unraid 100 = users); TrueNAS 568, Synology 100, Linux 65534
+      PUID: "8099"            # Benutzer nach dem Start: eigene, sonst unbenutzte Nummer (nicht 99/568, damit nicht dieselbe wie bei anderen Containern); 0 = root (nicht empfohlen)
+      PGID: "100"             # Gruppe (Unraid 100 = users)
       # NZBLAB_AGENT_TOKEN: ""        # besser leer lassen (Agent erzeugt selbst einen); eigener: mindestens 32 zufällige Zeichen, sonst Fehler
       # NTFY_URL: "https://ntfy.sh/ein-langes-geheimes-wort"
       # NZBLAB_NTFY_ALL: "1"   # ab 1.18.0: ntfy auch für Info-Meldungen (günstige Platten, neue Geräte, «wieder normal»). Standard 0 = nur Kritisches (Platte/Array/Hitze)
@@ -55,6 +55,7 @@ services:
       - ./nzblab-agent:/config                          # Verlauf, Datei-Index, token.txt (lesen/schreiben)
       - /sys:/host/sys:ro                               # Temperaturen, Grafikchip, Btrfs-Zustand
       - /proc:/host/proc:ro                             # CPU-Last, Programme, Plattenzugriffe, Neustarts, mdadm/ZFS-Zustand
+      - /etc/hostname:/host/etc/hostname:ro                # Name des NAS (sonst zeigt die App die Container-Kennung)
       # --- Unraid (Standard):
       - /mnt/user:/host/mnt/user:ro                     # Freigaben: Datei-Index, Suche, Backup-Suche (optional)
       # - /mnt/cache:/host/mnt/cache:ro                 # Cache-Pool: was auf den Mover wartet (optional, Unraid)

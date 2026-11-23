@@ -38,23 +38,34 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.20.1"
+VERSION = "1.20.2"
+
+
+def env_num(name, default, kind=int):
+    """Zahl aus der Umgebung. Ein leeres oder ungültiges Feld (z. B. leer gelassenes Feld in der Unraid-Vorlage) gilt als nicht gesetzt,
+    sonst stürzte der Agent beim Start ab und der Container startete endlos neu (ab 1.20.2)."""
+    raw = os.environ.get(name, "")
+    try:
+        return kind(str(raw).strip()) if str(raw).strip() else kind(default)
+    except (ValueError, OverflowError):
+        return kind(default)
+
 
 # Host-Ordner (Vorlage: /host/sys und /host/proc, nur lesen). Fehlen sie, die eigenen des Containers: Temperaturen,
 # Grafikchip, CPU, RAM und Platten sind dort auch sichtbar, nur die Programme des NAS (Liste «meiste Last») nicht.
 HOST_SYS = os.environ.get("HOST_SYS") or ("/host/sys" if os.path.isdir("/host/sys/class") else "/sys")
 HOST_PROC = os.environ.get("HOST_PROC") or ("/host/proc" if os.path.exists("/host/proc/stat") else "/proc")
 CONFIG = os.environ.get("CONFIG_DIR", "/config")
-PORT = int(os.environ.get("PORT", "8099"))
-INTERVAL = int(os.environ.get("INTERVAL", "30"))
+PORT = env_num("PORT", 8099, int)
+INTERVAL = env_num("INTERVAL", 30, int)
 WEB_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web.html")
 PRICES_FILE = os.environ.get("PRICES_FILE", "")  # leer = erste <Freigabe>/nzblab-prices/prices.json unter FILES_ROOT (optional)
 NOTIFY_DIR = os.environ.get("NOTIFY_DIR", "/host/notifications")   # Unraid: /tmp/notifications
 LOG_DIR = os.environ.get("LOG_DIR", "/host/log")                    # Unraid: /var/log
-HEAT_ALERT = float(os.environ.get("HEAT_ALERT_C", "95"))
-HEAT_MINUTES = int(os.environ.get("HEAT_ALERT_MINUTES", "5"))
+HEAT_ALERT = env_num("HEAT_ALERT_C", 95, float)
+HEAT_MINUTES = env_num("HEAT_ALERT_MINUTES", 5, int)
 NTFY_URL = os.environ.get("NTFY_URL", "").strip()          # z. B. https://ntfy.sh/mein-geheimes-thema
-IDLE_MIN = int(os.environ.get("DISK_IDLE_MINUTES", "30"))  # so lange ohne Zugriff gilt eine Platte als ruhend
+IDLE_MIN = env_num("DISK_IDLE_MINUTES", 30, int)  # so lange ohne Zugriff gilt eine Platte als ruhend
 # Datei-Index: Freigaben des NAS (Vorlage: /mnt/user nur lesen nach /host/mnt/user), ohne Systemordner
 FILES_ROOT = os.environ.get("FILES_ROOT", "/host/mnt/user")
 FILES_EXCLUDE = {x.strip() for x in os.environ.get("FILES_EXCLUDE", "appdata,system,domains,isos").split(",") if x.strip()}
@@ -130,6 +141,35 @@ class CacheShares:
             self.cached = self.compute()
             return self.cached
 
+    def get_async(self, wait=2.0):
+        """Ab 1.20.2: wie AppdataSizes: nie länger als [wait] Sekunden auf das Messen warten. Liefert den letzten Stand (auch einen
+        älteren) plus «measuring»; ohne Stand eine leere Liste mit measuring=true. Die Messung läuft im Hintergrund."""
+        with self.lock:
+            fresh = self.cached and time.time() - self.cached["at"] < self.ttl
+            if not fresh and (getattr(self, "thread", None) is None or not self.thread.is_alive()):
+                self.thread = threading.Thread(target=self._bg, daemon=True, name="cacheshares")
+                self.thread.start()
+            t = getattr(self, "thread", None)
+        if not fresh and wait and t is not None:
+            t.join(wait)
+        with self.lock:
+            if self.cached:
+                res = dict(self.cached)
+            else:
+                roots = self.available()
+                res = {"available": bool(roots), "roots": roots, "partial": False, "at": 0, "shares": []}
+            res["measuring"] = bool(getattr(self, "thread", None) and self.thread.is_alive())
+            return res
+
+    def _bg(self):
+        try:
+            res = self.compute()
+        except Exception as e:  # noqa: BLE001
+            print(redact_log(f"Cache-Freigaben: {type(e).__name__}: {e}")[:200], flush=True)
+            return
+        with self.lock:
+            self.cached = res
+
 class AppdataSizes:
     """Grösse jedes Container-Ordners unter appdata (ab 1.8.2, für die App-Seite «appdata pro Container»).
     Nur lesen. Misst im Hintergrund höchstens alle [ttl] Sekunden (Standard 6 Stunden), die Abfrage wartet nie auf
@@ -173,9 +213,9 @@ class AppdataSizes:
             return res
 
 
-FILES_EVERY_H = float(os.environ.get("FILES_EVERY_HOURS", "6"))
+FILES_EVERY_H = env_num("FILES_EVERY_HOURS", 6, float)
 # Doppelte Dateien (ab 1.8.0): höchstens so viele Dateien pro Lauf prüfen, je Datei nur erstes und letztes MiB lesen
-DUP_MAX_FILES = int(os.environ.get("DUP_MAX_FILES", "2000"))
+DUP_MAX_FILES = env_num("DUP_MAX_FILES", 2000, int)
 DUP_PRE_MB = 100            # ab 1.13.0: Duplikat-Kandidaten ab dieser Grösse nach jedem Index-Lauf vorrechnen (kleinste Stufe der App)
 CALC_WAIT = 2.0             # so lange wartet eine Anfrage höchstens auf ein Ergebnis, das noch gerechnet wird; danach «building»
 CALC_RETRY = 300.0          # Rechnen fehlgeschlagen: frühestens nach so vielen Sekunden neu versuchen (oder beim nächsten Index-Lauf)
@@ -189,6 +229,19 @@ VIDEO_SQL = "(" + " OR ".join(f"name LIKE '%.{e}'" for e in VIDEO_EXT) + ")"
 WG_CONFIG_DIR = os.environ.get("WG_CONFIG_DIR", "/host/boot/config/wireguard")
 CRASH_KEEP = 200            # Absturzberichte der App (CONFIG/crashes), höchstens so viele
 CRASH_MAX_BYTES = 64000
+
+
+HOST_HOSTNAME_FILE = os.environ.get("HOST_HOSTNAME_FILE", "/host/etc/hostname")
+
+
+def nas_hostname():
+    """Ab 1.20.2: Name des NAS statt der Container-Kennung (im Bridge-Netz ist gethostname() die Container-ID). Quelle: eingebundene
+    Datei /host/etc/hostname (nur lesen), sonst der Name des Containers wie bisher. Nur gültige Namen (Buchstaben, Ziffern, Punkt, Bindestrich)."""
+    name = (read_head(HOST_HOSTNAME_FILE, 256) or "").strip().splitlines()[0:1]
+    name = name[0].strip() if name else ""
+    if name and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", name):
+        return name
+    return socket.gethostname()
 
 
 def read(path, default=None):
@@ -251,6 +304,8 @@ class Sampler:
         for h in sorted(os.listdir(base)) if os.path.isdir(base) else []:
             d = f"{base}/{h}"
             name = read(f"{d}/name", h)
+            if name == "drivetemp":
+                continue    # ab 1.20.2: jeder Lesezugriff ist ein ATA-Befehl an die Platte (kann sie am Einschlafen hindern): nur über disk_temps()
             # D1: AMD (k10temp) meldet Tctl (mit festem Zuschlag, bis +20 °C bei Ryzen 1000/2000X und Threadripper) und, wo es ihn
             # gibt, Tdie (echte Chip-Temperatur). Mit beiden zählt nur Tdie, sonst warnt die Hitze-Meldung zu früh.
             # (N3: nur, wenn Tdie auch einen gültigen Wert liefert; sonst bleibt Tctl der einzige Messwert)
@@ -282,6 +337,8 @@ class Sampler:
         for h in sorted(os.listdir(base)) if os.path.isdir(base) else []:
             d = f"{base}/{h}"
             name = read(f"{d}/name", h)
+            if name == "drivetemp":
+                continue    # ab 1.20.2: siehe temps()
             for f in sorted(os.listdir(d)):
                 m = re.match(r"temp(\d+)_input$", f)
                 if not m:
@@ -486,6 +543,39 @@ CONTAINER_NAMES = {}
 
 # ---------------------------------------------------------------- Speichern
 
+def _avg_value(vals):
+    """Mittelwert gleich aufgebauter Werte: Zahlen, Wörterbücher (je Schlüssel), Zahlenlisten (je Stelle); sonst der letzte Wert."""
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
+        m = sum(vals) / len(vals)
+        return round(m) if all(isinstance(v, int) for v in vals) else round(m, 1)
+    if all(isinstance(v, dict) for v in vals):
+        keys = []
+        for v in vals:
+            keys += [k for k in v if k not in keys]
+        return {k: _avg_value([v.get(k) for v in vals if k in v]) for k in keys}
+    if all(isinstance(v, list) for v in vals) and len({len(v) for v in vals}) == 1 and vals[0] \
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for v in vals for x in v):
+        return [_avg_value([v[i] for v in vals]) for i in range(len(vals[0]))]
+    return vals[-1]
+
+
+def _avg_samples(rows):
+    """Ein Block Messungen → eine Zeile mit denselben Feldern (t = Zeit der ersten Messung; mover = irgendwann aktiv; top und limits = letzter Stand)."""
+    out = {"t": rows[0]["t"]}
+    for k in sorted({k for r in rows for k in r} - {"t"}):
+        vals = [r[k] for r in rows if k in r]
+        if k == "mover":
+            out[k] = any(bool(v) for v in vals)
+        elif k in ("top", "limits"):
+            out[k] = vals[-1]
+        else:
+            out[k] = _avg_value(vals)
+    return out
+
+
 class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path, check_same_thread=False)
@@ -529,6 +619,21 @@ class Store:
     def raw(self, since):
         with self.lock:
             return [json.loads(j) for (j,) in self.db.execute("SELECT j FROM raw WHERE t >= ? ORDER BY t", (since,))]
+
+    def raw_condensed(self, since, bucket=600):
+        """Ab 1.20.2: Rohwerte in Blöcken zu [bucket] Sekunden (Mittelwert je Block), gleiche Felder wie raw(). Für lange Zeiträume:
+        sieben Tage roh wären rund 20 000 Zeilen (35–40 MB) pro Abruf."""
+        out, cur, key = [], [], None
+        for r in self.raw(since):
+            k = r["t"] // bucket
+            if k != key and cur:
+                out.append(_avg_samples(cur))
+                cur = []
+            key = k
+            cur.append(r)
+        if cur:
+            out.append(_avg_samples(cur))
+        return out
 
     def roll_hour(self, hour):
         """Stunde zusammenfassen: Höchst- und Mittelwert jedes Sensors, CPU- und GPU-Last, meiste Programme."""
@@ -674,11 +779,25 @@ class Watcher:
         self.hot_since = None
         self.alerted = False
         self.gate = AlertGate()
+        self._spin = {}
+
+    def spinning(self, disk):
+        """Ab 1.20.2: nur drehende, fest eingebaute Platten zählen (queue/rotational=1, nicht removable): SATA-SSDs und der Unraid-USB-Stick
+        (auch sdX) wecken nie. Namen von Synology (sata1 …) gehören dazu. Ist sysfs nicht lesbar: wie früher alle «sd*»."""
+        if disk in self._spin:
+            return self._spin[disk]
+        base = f"{HOST_SYS}/block/{disk}"
+        rot = read(f"{base}/queue/rotational")
+        if rot is None:
+            return disk.startswith("sd")        # nicht zwischenspeichern: sysfs könnte später da sein
+        ok = rot.strip() == "1" and (read(f"{base}/removable", "0") or "0").strip() != "1" and not disk.startswith("nvme")
+        self._spin[disk] = ok
+        return ok
 
     def feed(self, s):
         now = s["t"]
         for disk, kibs in (s.get("disks") or {}).items():
-            if not disk.startswith("sd"):
+            if not self.spinning(disk):
                 continue
             if kibs < 1:
                 self.quiet_since.setdefault(disk, now)
@@ -882,6 +1001,16 @@ def alerter(kind, level, critical=False):
     return send
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Ab 1.20.2: ntfy folgt keiner Weiterleitung (ein fremder Server könnte die Meldung sonst an einen anderen Ort schicken lassen)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+NTFY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect())
+
+
 def ntfy(title, text, tags="warning", priority="high"):
     url = ntfy_url()
     if not url:
@@ -889,7 +1018,7 @@ def ntfy(title, text, tags="warning", priority="high"):
     try:
         req = urllib.request.Request(url, data=text.encode(), headers={"Title": title.encode("utf-8").decode("latin-1", "ignore"),
                                                                     "Tags": tags, "Priority": priority})
-        urllib.request.urlopen(req, timeout=10).close()
+        NTFY_OPENER.open(req, timeout=10).close()
         return True
     except Exception as e:   # auch ValueError bei einer Adresse ohne https://
         # Das Thema in der Adresse ist geheim (wer es kennt, liest mit): nie ins Log schreiben
@@ -969,7 +1098,22 @@ class LanScan:
     """Geräte im Heimnetz: kurz jede Adresse im eigenen /24-Netz anstossen (ein UDP-Paket, das NAS fragt dann per ARP nach),
     danach die ARP-Tabelle des NAS lesen (/proc/1/net/arp des Hosts). Neue Geräte (nach der ersten Suche) → Push."""
 
-    LAN_IF = ("br0", "eth0", "eth1", "bond0", "wlan0")
+    # Ab 1.20.2: jede echte Schnittstelle (auch enp…/eno…, ovs_eth0), ausser Docker/VM/Tunnel
+    LAN_SKIP = ("lo", "docker", "veth", "br-", "shim-", "tunl", "virbr", "vnet", "bonding", "wg", "tun", "tap", "zt", "tailscale", "dummy", "sit")
+    PRIVATE_NETS = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+    @classmethod
+    def iface_ok(cls, name):
+        return bool(name) and not name.startswith(cls.LAN_SKIP)
+
+    @classmethod
+    def private_v4(cls, ip):
+        """Nur Heimnetze (RFC 1918). Öffentliche Adressen (gemieteter Server), Loopback und Link-local nie durchsuchen (ab 1.20.2)."""
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return a.version == 4 and any(a in n for n in cls.PRIVATE_NETS)
     MAX_NEW = 64            # ab 1.16.1: höchstens so viele neue Geräte je Durchgang speichern
     MAX_ALERTS = 5          # … und einzeln melden (danach eine Sammelmeldung)
     MAX_DEVICES = 2000      # … und insgesamt merken (90 Tage), /api/devices liefert höchstens so viele
@@ -1016,7 +1160,7 @@ class LanScan:
         path = self.arp_path()
         for line in ((read(path, "") if path else "") or "").splitlines()[1:]:
             f = line.split()
-            if len(f) >= 6 and f[2] == "0x2" and f[5] in self.LAN_IF and f[3] != "00:00:00:00:00:00":
+            if len(f) >= 6 and f[2] == "0x2" and self.iface_ok(f[5]) and f[3] != "00:00:00:00:00:00" and self.private_v4(f[0]):
                 out[f[3].lower()] = f[0]
         return out
 
@@ -1035,7 +1179,7 @@ class LanScan:
     def _scan(self):
         try:
             known = self.arp()
-            nets = {ip.rsplit(".", 1)[0] for ip in known.values() if ip.count(".") == 3}
+            nets = {ip.rsplit(".", 1)[0] for ip in known.values() if ip.count(".") == 3 and self.private_v4(ip)}
             for net in nets:
                 for i in range(1, 255):
                     try:
@@ -1337,6 +1481,15 @@ class FileIndex:
                     batch = []
             with self.lock:
                 self.db.executemany("INSERT OR REPLACE INTO files_new VALUES (?,?,?,?,?)", batch)
+                # Ab 1.20.2: fast nichts gefunden (Pool nicht eingehängt, Freigabe nicht lesbar): alten Index behalten, sonst findet
+                # die Suche bis zum nächsten Lauf nichts und der Medien-Bestand meldet danach alles als «neu»
+                old_files = int((self.db.execute("SELECT v FROM meta WHERE k='files'").fetchone() or ["0"])[0] or 0)
+                if (old_files > 0 and self.state["files"] == 0) or (old_files >= 100 and self.state["files"] < old_files * 0.1):
+                    self.db.execute("DROP TABLE IF EXISTS files_new")
+                    self.db.commit()
+                    self.state["error"] = ("Der Durchlauf fand fast keine Dateien (Freigaben nicht eingehängt oder nicht lesbar?). "
+                                           "Der bisherige Index bleibt.")
+                    return
                 # Medien-Bestand: Videodateien des bisherigen Index aufheben, bevor er ersetzt wird («neu» = seit dem vorletzten Lauf)
                 prev = self.db.execute("SELECT v FROM meta WHERE k='last'").fetchone()
                 self.db.execute("DROP TABLE IF EXISTS inv_prev")
@@ -1392,14 +1545,14 @@ class FileIndex:
             with self._calc_guard:
                 self._cache[name] = {"key": key, "value": value, "computed_at": int(time.time())}
         except Exception as e:  # noqa: BLE001 (Fehler melden statt den Agenten zu stoppen)
-            print(f"Datei-Index ({name}):", e, flush=True)
+            print(redact_log(f"Datei-Index ({name}): {type(e).__name__}: {e}")[:300], flush=True)
             # Fehler merken (mit Stand des Index): die Anfragen melden ihn, statt bei jeder Abfrage neu zu rechnen
             try:
                 key = key_fn() if key_fn else None
             except Exception:  # noqa: BLE001
                 key = None
             with self._calc_guard:
-                self._cache[name] = {"key": key, "error": f"{type(e).__name__}: {e}"[:200], "failed_at": time.time(), "computed_at": 0}
+                self._cache[name] = {"key": key, "error": redact_log(f"{type(e).__name__}: {e}")[:200], "failed_at": time.time(), "computed_at": 0}
 
     def _cached(self, name):
         """Fertiges Ergebnis (mit «value») oder None; ein gemerkter Fehler zählt nicht als Ergebnis."""
@@ -1933,10 +2086,10 @@ def run_indexer(index, stop):
 # ---------------------------------------------------------------- HTTP
 
 TOKEN_STATE = {"error": "", "source": "", "code": ""}      # source: env, file, new; error: warum kein Token geladen ist
-CONFIG_FIX_DE = ("Unraid › Docker › nzblab-agent › Bearbeiten › Pfad /config → /mnt/user/appdata/nzblab-agent "
-                 "(Zugriffsmodus Lesen/Schreiben) › Übernehmen")
-CONFIG_FIX_EN = ("Unraid › Docker › nzblab-agent › Edit › path /config → /mnt/user/appdata/nzblab-agent "
-                 "(access mode Read/Write) › Apply")
+CONFIG_FIX_DE = ("Container NASlab-Agent bearbeiten (Unraid: Docker › NASlab-Agent › Bearbeiten) › Pfad /config → ein Ordner auf dem NAS, "
+                 "z. B. /mnt/user/appdata/nzblab-agent (Zugriffsmodus Lesen/Schreiben) › Übernehmen")
+CONFIG_FIX_EN = ("Edit the NASlab-Agent container (Unraid: Docker › NASlab-Agent › Edit) › path /config → a folder on the NAS, "
+                 "e.g. /mnt/user/appdata/nzblab-agent (access mode Read/Write) › Apply")
 _ANON_VOLUME = re.compile(r"/volumes/[0-9a-f]{64}/_data$")
 
 
@@ -1981,7 +2134,7 @@ def token(announce=True):
     Ein neuer Token entsteht NUR, wenn token.txt gar nicht existiert. Ist die Datei da, aber leer, kaputt oder nicht
     lesbar (Rechte), bleibt sie unangetastet: Rückgabe "", Grund in TOKEN_STATE["error"], Abfragen mit Token geben 503
     (ab 1.13.0; vorher entstand bei leerer Datei still ein neuer Token und die App passte nicht mehr).
-    Ein neu erzeugter Token steht genau einmal im Container-Log (Installation für andere: Unraid › Docker › Logs),
+    Ein neu erzeugter Token steht genau einmal im Container-Log (Installation für andere: Log des Containers «NASlab-Agent»),
     danach nur noch in der Datei (Rechte 600). Wer das Log lesen kann, ist ohnehin Admin des NAS."""
     TOKEN_STATE.update(error="", source="", code="")
     t = os.environ.get("NZBLAB_AGENT_TOKEN", "").strip()
@@ -2210,7 +2363,8 @@ def drop_privileges():
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         return None
     try:
-        uid, gid = int(os.environ.get("PUID", "")), int(os.environ.get("PGID", os.environ.get("PUID", "")))
+        uid = int(os.environ.get("PUID", ""))
+        gid = int(os.environ.get("PGID", "").strip() or uid)       # leeres PGID-Feld: gleiche Nummer wie PUID (ab 1.20.2)
     except ValueError:
         return None
     if uid == 0:
@@ -2345,7 +2499,7 @@ def price_watchlist():
 
 PRICE_UA = f"NZBLab-Agent/{VERSION} (home NAS disk price check; each search at most once per day)"
 PRICE_TIMEOUT = 20
-PRICE_PAUSE = float(os.environ.get("PRICE_PAUSE_S", "5"))
+PRICE_PAUSE = env_num("PRICE_PAUSE_S", 5, float)
 PRICE_KICK = threading.Event()          # Land neu gesetzt: sofort holen statt erst beim nächsten Rundgang
 UNREADABLE = "Preise gerade nicht lesbar"
 
@@ -2389,15 +2543,20 @@ def _amazon_tld(loc):
     return {"us": "com", "uk": "co.uk", "au": "com.au", "in": "in"}.get(loc, loc)
 
 
+def tb_term(tb):
+    """Grössenwort für die Preissuche: ab 1 TB «2TB», darunter «500GB» (die Angebote heissen so; ab 1.20.2)."""
+    return f"{round(tb * 1000)}GB" if tb < 1 else f"{tb:g}TB"
+
+
 def price_search_url(src, tb, kind, q=None):
     """Suche, die man auch selbst im Browser öffnen kann (Knopf «Im Browser suchen»)."""
     from urllib.parse import quote_plus
-    t = f"{tb:g}"
+    t = tb_term(tb)
     if src["id"] == "toppreise":
-        q = q or (f"{t}TB NVMe SSD M.2" if kind == "nvme" else f"{t}TB SSD intern" if kind == "ssd" else f"{t}TB HDD intern")
+        q = q or (f"{t} NVMe SSD M.2" if kind == "nvme" else f"{t} SSD intern" if kind == "ssd" else f"{t} HDD intern")
         return f"https://www.toppreise.ch/produktsuche?q={quote_plus(q)}&o=preis_pro_einheit"
     if src["id"] == "geizhals":
-        q = q or f"{t}TB"
+        q = q or t
         cat = "hde7s" if kind == "hdd" else "hdssd"
         return f"{src['base']}/?fs={quote_plus(q)}&cat={cat}&sort=p"
     return f"https://diskprices.com/?locale={src['locale']}&condition=new"
@@ -2687,7 +2846,7 @@ def local_disks(sys_root=None):
         return []
     out = []
     for dev in devs:
-        if re.match(r"(loop|ram|zram|dm-|md|sr|nbd|fd|mmcblk)", dev):
+        if re.match(r"(loop|ram|zram|dm-|md|sr|nbd|fd|mmcblk|zd\d)", dev):
             continue
         try:
             size = int(read(os.path.join(root, dev, "size"), "0") or 0) * 512
@@ -2866,7 +3025,7 @@ def host_info(proc_dir=None, sys_dir=None, os_release=None, now=None):
     tot, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", mem.get("MemFree", 0))
     t = int(now if now is not None else time.time())
     return {
-        "hostname": read(f"{proc_dir}/sys/kernel/hostname", "") or socket.gethostname(),
+        "hostname": nas_hostname() if os.path.isfile(HOST_HOSTNAME_FILE) else (read(f"{proc_dir}/sys/kernel/hostname", "") or socket.gethostname()),
         "os": {"name": rel.get("NAME", ""), "version": rel.get("VERSION", rel.get("VERSION_ID", "")),
                "id": rel.get("ID", ""), "pretty": rel.get("PRETTY_NAME", ""), "available": bool(rel)},
         "kernel": read(f"{proc_dir}/sys/kernel/osrelease", "") or "",
@@ -2928,7 +3087,7 @@ def block_size(sys_root, device):
     return int(v) * 512 if v and v.isdigit() else None
 
 
-STATVFS_TIMEOUT = float(os.environ.get("STATVFS_TIMEOUT", "2"))
+STATVFS_TIMEOUT = env_num("STATVFS_TIMEOUT", 2, float)
 _HUNG = {}                  # Pfad → Faden, der dort noch hängt (z. B. NFS weg): nicht nochmals einen starten
 _HUNG_LOCK = threading.Lock()
 
@@ -2977,6 +3136,20 @@ def _dev_of(path):
         return None
 
 
+_LAST_DISK_TEMP = {}    # ab 1.20.2: zuletzt gelesene Plattentemperatur (nur SATA/drivetemp); host_disks liest nicht selbst nach
+
+
+def disk_temp_cached(sys_root, dev):
+    """Wie disk_temp, aber SATA-Platten (drivetemp: jeder Zugriff ist ein ATA-Befehl) nur beim ersten Mal lesen; danach der letzte Wert
+    aus disk_temps() (nur bei Platten mit Zugriffen). NVMe immer frisch."""
+    if not dev.startswith("nvme") and (sys_root, dev) in _LAST_DISK_TEMP:
+        return _LAST_DISK_TEMP[(sys_root, dev)]
+    t = disk_temp(sys_root, dev)
+    if t is not None and not dev.startswith("nvme"):
+        _LAST_DISK_TEMP[(sys_root, dev)] = t
+    return t
+
+
 def disk_temp(sys_root, dev):
     """Temperatur einer Platte in °C, falls der Kernel sie meldet (drivetemp für SATA, nvme-hwmon), sonst None."""
     pats = [f"{sys_root}/block/{dev}/device/hwmon/hwmon*/temp1_input", f"{sys_root}/block/{dev}/device/hwmon*/temp1_input"]
@@ -2998,7 +3171,7 @@ def host_disks(sys_root=None):
         return []
     out = []
     for dev in devs:
-        if re.match(r"(loop|ram|zram|dm-|md|sr|nbd|fd)", dev):
+        if re.match(r"(loop|ram|zram|dm-|md|sr|nbd|fd|zd\d)", dev):
             continue
         v = read(os.path.join(root, dev, "size"), "0") or "0"
         size = int(v) * 512 if v.isdigit() else 0
@@ -3008,7 +3181,7 @@ def host_disks(sys_root=None):
         out.append({"dev": dev, "model": disk_model(sys_root, dev), "size": size, "rotational": rot,
                     "kind": "nvme" if dev.startswith("nvme") else ("hdd" if rot else "ssd"),
                     "removable": read(os.path.join(root, dev, "removable"), "0") == "1",
-                    "temp": disk_temp(sys_root, dev)})
+                    "temp": disk_temp_cached(sys_root, dev)})
     return out
 
 
@@ -3066,7 +3239,7 @@ def filesystems(proc_dir=None, sys_dir=None, fs_root=None, docker_root=None):
             "measured": [n for n, _ in measured], "os_release": os.path.isfile(HOST_OS_RELEASE)}
 
 
-HOST_CACHE_S = float(os.environ.get("HOST_CACHE_S", "15"))
+HOST_CACHE_S = env_num("HOST_CACHE_S", 15, float)
 _HOST_CACHE = {}
 _HOST_CACHE_LOCK = threading.Lock()
 
@@ -3254,6 +3427,8 @@ def _el(block, tag, cls=None):
 
 
 def _size_ok(name, tb):
+    if tb < 1:      # ab 1.20.2: Platten unter 1 TB heissen in den Angeboten «500GB»
+        return bool(re.search(rf"(?<![\d.]){round(tb * 1000)}\s?GB\b", name, re.I))
     return bool(re.search(rf"(?<![\d.]){re.escape(f'{tb:g}')}\s?TB\b", name, re.I))
 
 
@@ -3555,7 +3730,7 @@ def _own_search(sources, t, fetch, lang, pages, robots, pause):
     m, tb = t["model"], t["tb"]
     sr = MODEL_SERIES.get(m.get("series") or "")
     keep = lambda name: own_match(name, m, tb) is not None   # noqa: E731
-    series_q = f"{sr['q']} {tb:g}TB" if sr else None
+    series_q = f"{sr['q']} {tb_term(tb)}" if sr else None
     first = m.get("part") or series_q or m.get("raw")
     res = _search(sources, t, fetch, lang, pages, robots, pause, query=first, keep=keep)
     if res[1] == "none" and sr and first != series_q:
@@ -3571,8 +3746,9 @@ def _own_search(sources, t, fetch, lang, pages, robots, pause):
     return src, status, err, offers, url
 
 
-def fetch_own_prices(country, fetch=http_get, pause=None, today=None):
-    """Einmal alle Platten für dieses Land holen und in CONFIG/prices-<Land>.json schreiben (Verlauf 400 Tage)."""
+def fetch_own_prices(country, fetch=http_get, pause=None, today=None, only_keys=None):
+    """Einmal alle Platten für dieses Land holen und in CONFIG/prices-<Land>.json schreiben (Verlauf 400 Tage).
+    only_keys (ab 1.20.2): nur diese Schlüssel holen (neu beobachtete Serie), alle anderen Einträge bleiben unverändert."""
     pause = PRICE_PAUSE if pause is None else pause
     sources = price_sources(country)
     if not source_allowed(sources[0]["id"]):
@@ -3600,6 +3776,8 @@ def fetch_own_prices(country, fetch=http_get, pause=None, today=None):
 
     pages, robots, used = {}, {}, set()
     for t in price_targets():
+        if only_keys is not None and t["key"] not in only_keys:
+            continue
         e = data["queries"].setdefault(t["key"], {"history": []})
         if not isinstance(e, dict):
             e = data["queries"][t["key"]] = {"history": []}
@@ -3643,7 +3821,7 @@ def fetch_own_prices(country, fetch=http_get, pause=None, today=None):
             e["alt_history"] = add_hist(e.get("alt_history"), alt)
         else:
             e.pop("alternative", None)
-    label = ", ".join(sorted(used)) or sources[0]["label"]
+    label = ", ".join(sorted(used)) or (data.get("source") if only_keys is not None and data.get("source") else sources[0]["label"])
     data.update(updated=int(time.time()), country=country, source=label, currency=sources[0]["currency"])
     os.makedirs(CONFIG, exist_ok=True)
     tmp = path + ".tmp"
@@ -4009,15 +4187,20 @@ def run_prices(stop, notify):
                 except (OSError, ValueError):
                     att = {}
                 due = time.time() - float(att.get(c, 0)) > 20 * 3600 and (time.localtime().tm_hour >= 6 or not att.get(c))
-                new_watch = False
+                new_watch, missing = False, []
                 try:
                     with open(own_prices_path(c)) as f:
                         have = json.load(f)
                     have = have.get("queries") if isinstance(have, dict) else None
-                    new_watch = any(w["key"] not in (have if isinstance(have, dict) else {}) for w in price_watchlist())
+                    missing = [w["key"] for w in price_watchlist() if w["key"] not in (have if isinstance(have, dict) else {})]
+                    new_watch = bool(missing)
                 except (OSError, ValueError):
                     pass
-                if due or (kicked and new_watch):
+                if not due and kicked and new_watch:
+                    # ab 1.20.2: nur die neu dazugekommenen Serien holen, kein ganzer Lauf (höchstens einmal am Tag je Quelle)
+                    print(f"Preise: hole nur neue Einträge für {c}", flush=True)
+                    fetch_own_prices(c, only_keys=set(missing))
+                elif due:
                     # Versuch vorher festhalten: scheitert der Lauf, kommt der nächste erst morgen
                     att[c] = int(time.time())
                     with open(att_path, "w") as f:
@@ -4067,10 +4250,15 @@ class Today:
         if time.time() - t < 3600:
             return path
         path = None
-        for pat in ("appdata/*sab*/admin/history1.db", "appdata/*sab*/*/admin/history1.db", "appdata/*sab*/*/*/admin/history1.db"):
-            hits = glob.glob(f"{self.root}/{pat}", recursive=False)
-            if hits:
-                path = hits[0]
+        # ab 1.20.2: auch Synology («docker») und TrueNAS («apps»), wie die Dienste-Suche (Discover.roots)
+        bases = [f"{self.root}/{b}" for b in ("appdata", "apps", "docker")] + [r for r in DISCOVER_ROOTS if os.path.isabs(r)]
+        for base in bases:
+            for pat in ("*sab*/admin/history1.db", "*sab*/*/admin/history1.db", "*sab*/*/*/admin/history1.db"):
+                hits = glob.glob(f"{base}/{pat}", recursive=False)
+                if hits:
+                    path = hits[0]
+                    break
+            if path:
                 break
         self._sab = (time.time(), path)
         return path
@@ -4136,7 +4324,7 @@ class Today:
                                 "text": "Docker hat den Container beendet, weil sein Speicher-Limit voll war."})
                 elif code not in (0, 143, 137):
                     out.append({"t": finished, "kind": "docker", "level": "err", "title": f"{name} abgestürzt",
-                                "text": f"Beendet mit Code {code}. Log: Unraid › DOCKER › {name} › Logs."})
+                                "text": f"Beendet mit Code {code}. Log: Container «{name}» (Unraid: Docker › {name} › Logs)."})
                 else:
                     out.append({"t": finished, "kind": "docker", "level": "info", "title": f"{name} gestoppt", "text": ""})
             elif st.get("Running") and started >= since:
@@ -4319,18 +4507,51 @@ def check_boot(store, proc_dir=None, now=None):
 DISK_DEV = re.compile(r"(sd[a-z]{1,3}|hd[a-z]|nvme\d+n\d+|vd[a-z]{1,2}|(?:sata|sas|usb)\d{1,3})$")
 
 
-def disk_temps(sys_root=None, smart_latest=None):
-    """{Gerät: °C} aus drivetemp (SATA) bzw. nvme-hwmon; fehlt ein Wert, der letzte SMART-Wert (falls SMART an)."""
+_DISK_IO_SEEN = {}
+
+
+def disks_with_io(proc=None):
+    """Ab 1.20.2: Geräte, deren Zähler in /proc/diskstats sich seit dem letzten Aufruf geändert haben (die Platte läuft also ohnehin).
+    Geräte ohne frühere Messung oder ohne diskstats gelten als aktiv (alter Ablauf: einmal lesen). Rückgabe: Menge der Namen, die man
+    lesen darf, oder None, wenn diskstats nicht lesbar ist (dann nicht einschränken)."""
+    txt = read(f"{proc or HOST_PROC}/diskstats", "")
+    if not txt:
+        return None
+    ok, cur = set(), {}
+    for l in txt.splitlines():
+        p = l.split()
+        if len(p) < 10:
+            continue
+        try:
+            cur[p[2]] = tuple(int(x) for x in p[3:])
+        except ValueError:
+            continue
+        if p[2] not in _DISK_IO_SEEN or _DISK_IO_SEEN[p[2]] != cur[p[2]]:
+            ok.add(p[2])
+    _DISK_IO_SEEN.clear()
+    _DISK_IO_SEEN.update(cur)
+    return ok
+
+
+def disk_temps(sys_root=None, smart_latest=None, proc=None):
+    """{Gerät: °C} aus drivetemp (SATA) bzw. nvme-hwmon; fehlt ein Wert, der letzte SMART-Wert (falls SMART an).
+    Ab 1.20.2: SATA-Platten nur lesen, wenn sie seit dem letzten Mal Zugriffe hatten (drivetemp schickt sonst einen ATA-Befehl an eine
+    schlafende Platte); NVMe immer."""
     sys_root = sys_root or HOST_SYS
+    active = disks_with_io(proc)
     try:
         devs = sorted(d for d in os.listdir(os.path.join(sys_root, "block")) if DISK_DEV.match(d))
     except OSError:
         devs = []
     out = {}
     for dev in devs:
+        if active is not None and not dev.startswith("nvme") and dev in _DISK_IO_SEEN and dev not in active:
+            continue
         t = disk_temp(sys_root, dev)
         if t is not None:
             out[dev] = t
+            if not dev.startswith("nvme"):
+                _LAST_DISK_TEMP[(sys_root, dev)] = t
     for d in (smart_latest or {}).values():
         name = (d.get("device_name") or "").rsplit("/", 1)[-1]
         if name and name not in out and isinstance(d.get("temp"), (int, float)) and not d.get("standby") and 0 < d["temp"] < 120:
@@ -4338,8 +4559,8 @@ def disk_temps(sys_root=None, smart_latest=None):
     return out
 
 
-def record_disk_temps(store, sys_root=None, smart_latest=None, now=None):
-    temps = disk_temps(sys_root, smart_latest)
+def record_disk_temps(store, sys_root=None, smart_latest=None, now=None, proc=None):
+    temps = disk_temps(sys_root, smart_latest, proc)
     if temps:
         store.add_series(int(now or time.time()), {f"disk:{k}": v for k, v in temps.items()})
     return temps
@@ -4589,7 +4810,7 @@ def parse_smart(text, dev=None):
            "device_protocol": d.get("protocol", ""), "model_name": js.get("model_name") or js.get("scsi_model_name") or "",
            "serial_number": js.get("serial_number", ""), "firmware": js.get("firmware_version", ""),
            "capacity": _num((js.get("user_capacity") or {}).get("bytes")) or _num(js.get("nvme_total_capacity")),
-           "rotational_speed": rot or 0, "smart_passed": (js.get("smart_status") or {}).get("passed"),
+           "rotational_speed": rot, "smart_passed": (js.get("smart_status") or {}).get("passed"),
            "power_on_hours": _num((js.get("power_on_time") or {}).get("hours")), "power_cycle_count": _num(js.get("power_cycle_count")),
            "temp": _num((js.get("temperature") or {}).get("current")), "reallocated": None, "pending": None, "uncorrectable": None,
            "crc": None, "media_errors": None, "percentage_used": None, "unsafe_shutdowns": None, "standby": standby, "attrs": {},
@@ -5978,12 +6199,36 @@ def startup_keys_window(had_token):
     KEYS.restart()
     if had_token and not keys_issued():
         mark_keys_issued()
-KEYS_HINT = ("Dienst-Schlüssel gibt es nur in den ersten 30 Minuten nach dem Start des Agenten. Container neu starten (dann 30 Minuten Zeit) "
-             "oder auf dem NAS die leere Datei keys-unlock im Ordner /config anlegen (dann 10 Minuten). Ein Token allein entsperrt nicht. "
-             "/ Service keys are only handed out in the first 30 minutes after the agent starts. Restart the container (30 minutes), "
-             "or create an empty file keys-unlock in /config on the NAS (10 minutes). A token alone does not unlock.")
+KEYS_HINT_FIRST = ("Dienst-Schlüssel gibt es nur in den ersten 30 Minuten nach dem Start des Agenten. Container neu starten (dann 30 Minuten Zeit) "
+                   "oder auf dem NAS die leere Datei keys-unlock im Ordner /config anlegen (dann 10 Minuten). Ein Token allein entsperrt nicht. "
+                   "/ Service keys are only handed out in the first 30 minutes after the agent starts. Restart the container (30 minutes), "
+                   "or create an empty file keys-unlock in /config on the NAS (10 minutes). A token alone does not unlock.")
+KEYS_HINT_UNLOCK = ("Dienst-Schlüssel wurden schon einmal ausgegeben. Ein Neustart öffnet das Fenster nicht mehr: auf dem NAS die leere Datei "
+                    "keys-unlock im Ordner /config anlegen (dann 10 Minuten). Ein Token allein entsperrt nicht. "
+                    "/ Service keys were already handed out once. A restart no longer opens the window: create an empty file keys-unlock "
+                    "in /config on the NAS (10 minutes). A token alone does not unlock.")
+
+
+def keys_hint():
+    """Hinweis passend zum Marker: nach der ersten Ausgabe nützt ein Neustart nichts mehr, nur die Datei keys-unlock."""
+    return KEYS_HINT_UNLOCK if keys_issued() else KEYS_HINT_FIRST
+
+
+KEYS_HINT = KEYS_HINT_FIRST     # Altname (Tests)
 KEYS_TLS_HINT = ("Dienst-Schlüssel gibt es nur über HTTPS (gleicher Port, https://…). / Service keys are only served over HTTPS "
                  "(same port, https://…).")
+
+
+INTERNAL_ERROR = "Interner Fehler, Einzelheiten im Log des Agenten. / Internal error, details are in the agent log."
+
+
+def log_internal_error(where, e):
+    """Ab 1.20.2: Ausnahmetext nie an den Client (könnte Pfade, Dateiinhalt oder Schlüssel enthalten), nur geschwärzt ins Log."""
+    try:
+        print(redact_log(f"Fehler in {where}: {type(e).__name__}: {e}")[:300], flush=True)
+    except Exception:  # noqa: BLE001
+        print(f"Fehler in {where}", flush=True)
+    return {"error": INTERNAL_ERROR}
 
 
 def keys_state():
@@ -5993,7 +6238,7 @@ def keys_state():
     if KEYS_ALWAYS:
         return {"mode": "always", "open": True, "seconds_left": 0}
     n = KEYS.seconds_left()
-    return {"mode": "window", "open": n > 0, "seconds_left": n}
+    return {"mode": "window", "open": n > 0, "seconds_left": n, "issued": keys_issued()}
 
 
 _TOKEN_LOCK = threading.Lock()
@@ -6084,13 +6329,13 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
             if KEYS_REQUIRE_TLS and not self.secure:
                 return 403, {"error": "keys_need_tls", "hint": KEYS_TLS_HINT}
             if not KEYS_ALWAYS and KEYS.seconds_left() <= 0:
-                return 403, {"error": "keys_locked", "hint": KEYS_HINT}
+                return 403, {"error": "keys_locked", "hint": keys_hint()}
             return None
 
         def rotate_window_blocked(self):
             """Ab 1.20.0 (Audit): Token erneuern nur bei offenem Schlüssel-Fenster (ein gestohlener Token sperrt sonst den Besitzer aus)."""
             if not KEYS_ALWAYS and KEYS.seconds_left() <= 0:
-                return 403, {"error": "keys_locked", "hint": KEYS_HINT}
+                return 403, {"error": "keys_locked", "hint": keys_hint()}
             return None
 
         def version_string(self):
@@ -6223,7 +6468,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 if not self.authorized(tok):
                     return self.refuse()
                 return self.reply(200, dict(keys_state(), tls=self.secure, window_s=KEYS_FIRST_S, reopen_s=KEYS_REOPEN_S,
-                                            hint=KEYS_HINT), {"Cache-Control": "no-store"})
+                                            hint=keys_hint()), {"Cache-Control": "no-store"})
             if u.path == "/api/hello":
                 # Ohne Token (die App prüft damit, ob sie im eigenen Heimnetz ist, bevor sie Schlüssel sendet). Antwort:
                 # feste Zufalls-Kennung und HMAC über die Nonce der App; der Token selbst verlässt den Agent nie.
@@ -6291,7 +6536,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                         return self.reply(409, {"enabled": True, "error": f"{log_dir or LOG_DIR} fehlt: /var/log nur lesend nach /host/log einbinden"})
                     return self.reply(200, collect_logs(log_dir, max(1, min(hours, 168)), max(1, min(int(q.get("max", "200")), 1000))))
             except Exception as e:  # noqa: BLE001
-                return self.reply(500, {"error": f"{type(e).__name__}: {e}"[:150]})
+                return self.reply(500, log_internal_error(u.path, e))
             if u.path == "/api/discover":
                 # Ab 1.16.0: Dienste und API-Keys aus appdata (nur mit Token). Nie zwischenspeichern, nie loggen, höchstens
                 # 10 Abrufe pro Minute; Fehlertext ohne Einzelheiten (könnte sonst Dateiinhalt enthalten)
@@ -6307,13 +6552,15 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 try:
                     res = discover.scan(with_keys=want_keys)
                     if want_keys and DISCOVER_KEYS:     # ab 1.20.0 (Audit): jede Ausgabe von Schlüsseln ins Log (nie die Schlüssel selbst)
-                        mark_keys_issued()              # ab 1.20.1: danach öffnet ein Neustart das Fenster nicht mehr
+                        if res.get("services"):         # ab 1.20.2: nur bei echter Ausgabe (mindestens ein Dienst), nicht bei leerer Suche
+                            mark_keys_issued()          # ab 1.20.1: danach öffnet ein Neustart das Fenster nicht mehr
                         print(f"Dienst-Schlüssel ausgegeben an {self.client_address[0]}: {len(res.get('services') or [])} Dienste.", flush=True)
                     return self.reply(200, res, nostore)
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    log_internal_error(u.path, e)
                     return self.reply(500, {"error": "Suche fehlgeschlagen"}, nostore)
             if u.path == "/api/info":
-                return self.reply(200, {"version": VERSION, "hostname": socket.gethostname(), "interval": INTERVAL,
+                return self.reply(200, {"version": VERSION, "hostname": nas_hostname(), "interval": INTERVAL,
                                         "heat_alert": HEAT_ALERT, "push": bool(NTFY_URL), "since": store.first_t() or now,
                                         # Fehlen die Host-Ordner, sagt die App, wie man sie ergänzt
                                         "host_sys": HOST_SYS == "/host/sys", "host_proc": HOST_PROC == "/host/proc",
@@ -6357,15 +6604,17 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 try:
                     return self.reply(200, cached("host", host_info) if u.path == "/api/host" else cached("fs", filesystems))
                 except Exception as e:  # noqa: BLE001
-                    return self.reply(500, {"error": f"{type(e).__name__}: {e}"[:150]})
+                    return self.reply(500, log_internal_error(u.path, e))
             if u.path == "/api/prices":
                 return self.reply(200, price_summary())
             if u.path == "/api/today":
                 return self.reply(200, (today or Today(store)).collect(max(1, min(int(q.get("hours", "24")), 24 * 7))))
             if u.path == "/api/history":
-                # bis 8 Tage: volle Auflösung; darüber Stundenwerte
-                if hours <= 192 and q.get("res") != "hour":
+                # bis 48 Std.: volle Auflösung; bis 8 Tage Mittelwerte je 10 Minuten (gleiche Felder, ab 1.20.2); darüber Stundenwerte
+                if hours <= 48 and q.get("res") != "hour":
                     return self.reply(200, {"res": "raw", "rows": store.raw(now - hours * 3600)})
+                if hours <= 192 and q.get("res") != "hour":
+                    return self.reply(200, {"res": "raw", "bucket_s": 600, "rows": store.raw_condensed(now - hours * 3600)})
                 return self.reply(200, {"res": "hour", "rows": store.hourly(now - hours * 3600)})
             if u.path == "/api/wakes":
                 return self.reply(200, {"idle_minutes": IDLE_MIN, "wakes": store.wakes(now - hours * 3600)})
@@ -6375,7 +6624,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 # Riesige Zahlen (10^20) liessen SQLite mit OverflowError abbrechen: auf 0 bis 100 Jahre begrenzen
                 return self.reply(200, {"folders": index.cleanup(max(0, min(int(q.get("days", "30")), 36500)))})
             if u.path == "/api/cache/shares":
-                return self.reply(200, CACHE_SHARES.get())
+                return self.reply(200, CACHE_SHARES.get_async())
             if u.path == "/api/appdata":
                 # Grösse pro Container-Ordner unter appdata (nur lesen, im Hintergrund gemessen)
                 return self.reply(200, APPDATA_SIZES.get())
@@ -6404,7 +6653,7 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 # Rechnen fehlgeschlagen: klarer Text für die App (zeigt ihn mit «Nochmals versuchen» und fragt nicht weiter nach)
                 return self.reply(500, {"error": str(e)[:150], "calc_failed": True, "retry_after": int(CALC_RETRY)})
             except Exception as e:  # noqa: BLE001
-                return self.reply(500, {"error": f"{type(e).__name__}: {e}"})
+                return self.reply(500, log_internal_error(u.path, e))
             return self.reply(404, {"error": "unbekannt"})
 
         def do_POST(self):
@@ -6466,6 +6715,8 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 if "price_country" in body:
                     # Land für die Preise (ab 1.10.0): «CH», «DE», «US» …, leer = zurücksetzen. «price_country_if_unset»: nur
                     # setzen, wenn noch keins gewählt ist (die App schickt beim Einrichten das Land ihrer Spracheinstellung)
+                    if not isinstance(body.get("price_country_if_unset", False), bool):
+                        return self.reply(400, {"error": "price_country_if_unset: true oder false"})
                     pc = body.get("price_country")
                     if not isinstance(pc, str) or not re.fullmatch(r"[A-Za-z]{2}|", pc.strip()):
                         return self.reply(400, {"error": "price_country: Ländercode aus 2 Buchstaben, z. B. CH"})
@@ -6479,7 +6730,11 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                 if "price_watch" in body:
                     pw = body.get("price_watch") or []
                     ids = {x["id"]: x for x in PRICE_SERIES}
-                    if not isinstance(pw, list) or len(pw) > 20 or not all(isinstance(w, dict) and w.get("series") in ids and w.get("tb") in ids[w["series"]]["sizes"] for w in pw):
+                    # ab 1.20.2: Typen streng (Serie = Text, Grösse = Zahl, kein true/false, keine Listen als Schlüssel)
+                    if not isinstance(pw, list) or len(pw) > 20 or not all(
+                            isinstance(w, dict) and isinstance(w.get("series"), str) and w["series"] in ids
+                            and isinstance(w.get("tb"), (int, float)) and not isinstance(w.get("tb"), bool)
+                            and w["tb"] in ids[w["series"]]["sizes"] for w in pw):
                         return self.reply(400, {"error": "price_watch: [{series, tb}]"})
                     save_settings({"price_watch": [{"series": w["series"], "tb": w["tb"]} for w in pw]})
                     PRICE_KICK.set()
@@ -6534,8 +6789,9 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
                     return self.reply(409, {"error": "Speedtest läuft schon, gleich nochmals versuchen", "running": True})
                 try:
                     return self.reply(200, speedtest())
-                except OSError as e:
-                    return self.reply(502, {"error": f"Speedtest fehlgeschlagen: {e}"[:200]})
+                except Exception as e:  # noqa: BLE001
+                    log_internal_error(u.path, e)
+                    return self.reply(502, {"error": "Speedtest fehlgeschlagen, Einzelheiten im Log des Agenten"})
                 finally:
                     SPEED_LOCK.release()
             if u.path == "/api/devices/scan" and lan:

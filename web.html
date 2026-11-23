@@ -375,6 +375,9 @@ main.wrap { padding-top: 24px; padding-bottom: 40px; }
 .cfgwarn b { color: var(--warn); }
 .cfgwarn code { font-size: 12px; }
 @media (max-width: 600px) { .cfgwarn { margin: 10px 14px 0; } }
+/* ab 1.20.2: schmale Handys (320/360 px): Name des NAS bleibt lesbar, Fingerabdruck und lange Texte brechen um */
+code { overflow-wrap: anywhere; }
+@media (max-width: 480px) { .topbar .wrap { gap: 6px; } .stamp { display: none; } .brand { flex: 1 1 auto; } .brand-txt b { min-width: 4ch; } }
 .safe { display: flex; gap: 8px; align-items: center; margin-top: 14px; font-size: 12.5px; color: var(--muted); }
 .safe .ic { width: 15px; height: 15px; }
 
@@ -432,7 +435,7 @@ main.wrap { padding-top: 24px; padding-bottom: 40px; }
 <!-- Hinweis: /config bleibt nicht erhalten (nur wenn /api/ping config_persistent:false meldet) -->
 <div class="cfgwarn" id="cfgWarn" role="status" hidden>
   <b>Daten bleiben nicht erhalten.</b> /config liegt nicht auf dem NAS: Nach jedem Update gibt es einen neuen Token und der Verlauf ist weg.
-  Lösung: Unraid › Docker › nzblab-agent › Bearbeiten › Pfad <code>/config</code> → <code>/mnt/user/appdata/nzblab-agent</code> (Lesen/Schreiben) › Übernehmen.
+  Lösung: Container «NASlab-Agent» bearbeiten (Unraid: Docker › NASlab-Agent › Bearbeiten) › Pfad <code>/config</code> → ein Ordner auf dem NAS, z. B. <code>/mnt/user/appdata/nzblab-agent</code> (Lesen/Schreiben) › Übernehmen.
 </div>
 
 <!-- Anmelden -->
@@ -452,7 +455,7 @@ main.wrap { padding-top: 24px; padding-bottom: 40px; }
       <b>Wo finde ich den Token?</b>
       <ol>
         <li>In der App: Einstellungen › Server-Verbindungen › NASlab-Agent</li>
-        <li>Oder in Unraid: DOCKER › <b style="display:inline;margin:0">nzblab-agent</b> › Console › <code>cat /config/token.txt</code></li>
+        <li>Oder im Container «<b style="display:inline;margin:0">NASlab-Agent</b>» (Unraid: Docker › NASlab-Agent › Console) › <code>cat /config/token.txt</code></li>
       </ol>
     </div>
     <div class="safe" id="safe"></div>
@@ -1190,7 +1193,7 @@ function renderSys() {
     ["Letzte Aktualisierung", S.last ? hms(S.last) : "–"],
     // ab Agent 1.20.0: Verschlüsselung und Schlüssel-Fenster
     ["Verschlüsselung", i.tls ? (i.secure ? "HTTPS (diese Seite)" : "HTTPS verfügbar") + (i.http ? ", Klartext noch an" : ", nur HTTPS") : "keine (HTTPS fehlt)", i.tls && i.secure ? "ok" : "warn"],
-    ["Dienst-Schlüssel", !i.keys ? "–" : i.keys.mode === "off" ? "gesperrt (DISCOVER_KEYS=0)" : i.keys.mode === "always" ? "immer offen" : i.keys.open ? "offen, noch " + Math.max(1, Math.round(i.keys.seconds_left / 60)) + " Min." : "gesperrt (Container neu starten oder Datei keys-unlock anlegen)", i.keys && i.keys.mode === "window" && !i.keys.open ? "ok" : ""],
+    ["Dienst-Schlüssel", !i.keys ? "–" : i.keys.mode === "off" ? "gesperrt (DISCOVER_KEYS=0)" : i.keys.mode === "always" ? "immer offen" : i.keys.open ? "offen, noch " + Math.max(1, Math.round(i.keys.seconds_left / 60)) + " Min." : (i.keys.issued ? "gesperrt (Datei keys-unlock im Ordner /config anlegen)" : "gesperrt (Container neu starten oder Datei keys-unlock anlegen)"), i.keys && i.keys.mode === "window" && !i.keys.open ? "ok" : ""],
   ].map(([k, v, c]) => `<div class="kv"><span>${k}</span><span class="${c || ""}">${esc(v)}</span></div>`).join("") +
     (i.tls && i.fingerprint ? `<div class="note" style="margin-top:8px">Fingerabdruck (SHA-256) des Zertifikats, in der App beim ersten Verbinden vergleichen:<br><code style="word-break:break-all;user-select:all">${esc(i.fingerprint)}</code></div>` : "") + "</div></div>";
   $("sys").innerHTML = html;
@@ -1316,6 +1319,10 @@ const eye = () => { $("eye").innerHTML = ic(shown ? "eyeOff" : "eye"); $("eye").
 $("eye").addEventListener("click", () => { shown = !shown; $("tok").type = shown ? "text" : "password"; eye(); $("tok").focus(); });
 eye();
 $("safe").innerHTML = ic("lock") + "<span>Bleibt nur in diesem Browser-Tab gespeichert, bis du ihn schliesst.</span>";
+/* Ab 1.20.2: Token über unverschlüsseltes http:// geht im Klartext durchs Netz */
+if (location.protocol === "http:" && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
+  $("safe").innerHTML = ic("lock") + `<span><b>Achtung: Diese Verbindung ist nicht verschlüsselt (http).</b> Der Token geht im Klartext durchs Netz. Öffne die Seite besser über https:// (gleicher Port) und vergleiche den Fingerabdruck aus dem Container-Log.</span>`;
+}
 /* /config bleibt? (ohne Token, nur ein Wahrheitswert) */
 fetch("/api/ping", { cache: "no-store" }).then(r => r.json()).then(p => { $("cfgWarn").hidden = p.config_persistent !== false; }).catch(() => {});
 $("logout").innerHTML = ic("logout") + "<span>Abmelden</span>";

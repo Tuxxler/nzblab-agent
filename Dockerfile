@@ -6,7 +6,7 @@
 # /config immer auf einen Ordner des NAS legen: VOLUME unten ist nur ein anonymer Volume, der beim Neuerstellen ersetzt wird
 # (neuer Token). Der Agent warnt ab 1.13.0 im Log, in /api/ping und auf der Browser-Seite, wenn das fehlt.
 # Ab 1.16.1: Basis-Image per Digest festgenagelt (gleicher Bau für alle, kein still ausgetauschtes Image). Vor jedem Release
-# den Digest erneuern (docs/Agent-Bereitstellung.md), sonst fehlen Sicherheits-Updates von Alpine/Python.
+# den Digest erneuern (aktuellen Digest des Python-Images nachschlagen), sonst fehlen Sicherheits-Updates von Alpine/Python.
 ARG PYTHON_IMAGE=python:3.12-alpine3.22@sha256:a190708a2dec1bd18b1decb539f8e8f5407abaa9bf39cacda583f7f8c11db322
 FROM ${PYTHON_IMAGE}
 
@@ -26,7 +26,7 @@ LABEL org.opencontainers.image.title="NZBLab-Agent" \
       net.unraid.docker.icon="https://raw.githubusercontent.com/Tuxxler/nzblab-agent/main/unraid/icons/nzblab-agent.png"
 
 # PUID/PGID: Der Agent legt beim Start als root /config an, gibt den Ordner diesem Benutzer und läuft dann ohne
-# root-Rechte weiter (99:100 = nobody:users wie bei Unraid-Freigaben). Standard ist also «ohne root»; kein «USER» hier, weil
+# root-Rechte weiter (8099:100, eine eigene, sonst unbenutzte Nummer: Läuft der Agent unter derselben Nummer wie andere Container, könnte er über /host/proc an deren Dateien). Standard ist also «ohne root»; kein «USER» hier, weil
 # bestehende Installationen /config noch als root besitzen (sonst neuer Token) und der SMART-Helfer root braucht.
 # PUID=0 lässt ihn als root laufen (nur nötig für Container-Namen und appdata-Grössen anderer Container mit engen Rechten).
 # Mit «user:» im Compose (Linux-Vorlage) startet er gleich ohne root; dann geht SMART nicht (siehe README).
@@ -38,7 +38,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     CONFIG_DIR=/config \
     PORT=8099 \
-    PUID=99 \
+    PUID=8099 \
     PGID=100
 
 WORKDIR /agent

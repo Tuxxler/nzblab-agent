@@ -16,10 +16,10 @@ Via the template repository:
    Keep *Data (/config)* → `/mnt/user/appdata/nzblab-agent` (read/write): the agent stores its token and history there;
    without it you get a new token after every update.
 3. **Apply.** Open the container **Logs**: the line `NZBLab-Agent Token: …` appears once, plus the certificate fingerprint.
-4. App: *Settings › Server connections › NASlab-Agent* › address `https://<unraid-ip>:8099`, paste the token, *Test connection*. The agent uses its own certificate (a browser warns once; compare the fingerprint with the container log). Set up within 30 minutes after the container starts (service keys are only handed out in that window); otherwise restart the container.
+4. App: *Settings › Server connections › NASlab-Agent* › address `https://<unraid-ip>:8099`, paste the token, *Test connection*. The agent uses its own certificate (a browser warns once; compare the fingerprint with the container log). Set up within 30 minutes after the container starts (service keys are only handed out in that window); otherwise restart the container. After keys were handed out once, a restart no longer opens the window: create an empty file `keys-unlock` in the appdata folder instead (opens it for 10 minutes).
 
 All host paths are mounted **read-only**. Only `/config` (`/mnt/user/appdata/nzblab-agent`) is writable.
-After start the agent drops root and runs as `PUID`/`PGID` (99/100). Set `PUID=0` only if you need container names
+After start the agent drops root and runs as `PUID`/`PGID` (8099/100: its own number, not the one other containers such as nobody 99 use). Set `PUID=0` only if you need container names
 in the "top load" list or appdata sizes of containers with strict permissions.
 
 Once the agent is approved in Community Applications, it can also be installed via **Apps** › search *NASlab-Agent*.

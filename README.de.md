@@ -78,7 +78,7 @@ Leerzeichen, besser leer lassen** (ab 1.16.1; kürzere Werte oder Werte mit weni
 
 **Pfad `/config` ist Pflicht:** Hier speichert der Agent Token und Verlauf. Ohne eigenen Pfad liegt beides nur im
 Container und ist nach jedem Update weg: Dann gibt es jedes Mal einen neuen Token, die App verbindet sich nicht mehr. Unraid:
-Docker › nzblab-agent › Bearbeiten › Pfad `/config` → `/mnt/user/appdata/nzblab-agent` (Lesen/Schreiben) › Übernehmen.
+Docker › NASlab-Agent › Bearbeiten › Pfad `/config` → `/mnt/user/appdata/nzblab-agent` (Lesen/Schreiben) › Übernehmen.
 Compose: `- ./nzblab-agent:/config` (bzw. der Pfad in den Vorlagen).
 
 Ab 1.13.0 sichert der Agent das ab:
@@ -95,11 +95,11 @@ Ab 1.13.0 sichert der Agent das ab:
 - Ist `settings.json` beschädigt (kein gültiges JSON), hebt er sie vor dem nächsten Speichern als
   `settings.json.broken-<Zeit>` auf und meldet das im Log, statt sie still zu überschreiben.
 
-**Ohne root:** Das Image setzt `PUID=99`, `PGID=100` (nobody:users). Der Agent startet als root, legt den Token an, liest die
+**Ohne root:** Das Image setzt `PUID=8099`, `PGID=100` (eigene, sonst unbenutzte Nummer: andere Container laufen auf Unraid als 99, auf TrueNAS als 568 oder mit deiner eigenen Nummer auf Synology; ein Prozess mit gleicher Benutzer- und Gruppennummer käme über `/host/proc` an deren Dateien). Der Agent startet als root, legt den Token an, liest die
 Container-Namen (`/host/docker/containers`, nur root lesbar), gibt `/config` diesem Benutzer und läuft dann ohne root weiter.
 Kann er `/config` nicht übergeben (z. B. NFS mit root_squash), bleibt er mit Hinweis im Log root. `PUID=0` = immer root:
-nötig nur für appdata-Grössen anderer Container mit engen Rechten. TrueNAS-Vorlage: 568:568 (Benutzer «apps»);
-Synology-Vorlage ab 1.19.0: eigene Nummer (Beispiel 1026:100, SSH `id`). **`PUID=0` (root) wird abgeraten**, nur falls DSM-ACLs den Datei-Index sonst blockieren.
+nötig nur für appdata-Grössen anderer Container mit engen Rechten. TrueNAS-Vorlage: 8099:568;
+Synology-Vorlage: 8099:100 (eigene Nummer; nur wenn DSM-Rechte den Ordnern den Zugriff verwehren, die Nummer deines DSM-Benutzers eintragen, SSH `id`). **`PUID=0` (root) wird abgeraten**, nur falls DSM-ACLs den Datei-Index sonst blockieren.
 
 **Härtung in allen Vorlagen:** `--read-only` (Root-Dateisystem), `/tmp` als tmpfs, `no-new-privileges`, 512 MB RAM, 1 CPU,
 kein `privileged`, `cap_drop: ALL` und nur fünf Capabilities für den Start (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`; danach läuft der Agent ohne root). HEALTHCHECK im Image: `--healthcheck` des Agenten, der `/api/health` prüft.
@@ -108,7 +108,7 @@ Weitere Variablen für andere Systeme: `FILES_EXCLUDE` (oberste Ordner, auch Mus
 Standard `@eaDir,#recycle,#snapshot`), `CACHE_ROOTS` (leer = kein Cache).
 
 Optional: Push-Meldung bei Hitze auch unterwegs: Variable `NTFY_URL` = `https://ntfy.sh/<langes-geheimes-wort>` und in der
-App «ntfy» dasselbe Thema abonnieren. Schwelle: `HEAT_ALERT_C` (Standard 95 °C, nach 5 Minuten). Ab 1.18.0 schickt ntfy
+App «ntfy» dasselbe Thema abonnieren. Schwelle: `HEAT_ALERT_C` (Standard 95 °C) und `HEAT_ALERT_MINUTES` (Standard 5 Minuten). Ab 1.18.0 schickt ntfy
 standardmässig nur noch Kritisches (siehe Abschnitt 1.18.0, `NZBLAB_NTFY_ALL`).
 
 ## Linux (Debian, Ubuntu …) (ab 1.14.0)
@@ -164,14 +164,14 @@ Hängt ein Netzwerk-Mount unter `/host/fs` (NFS/SMB weg), wartet der Agent höch
 und markiert ihn mit `timeout: true`. `/api/host` und `/api/filesystems` rechnet er höchstens alle `HOST_CACHE_S`
 Sekunden neu (Standard 15).
 
-Die Vorlagen für Unraid (99:100), TrueNAS (568:568) und Synology (eigene Nummer, ab 1.19.0 nicht mehr root) sind davon unverändert.
+Die Vorlagen für Unraid, TrueNAS und Synology nehmen ab 1.20.2 die eigene Nummer 8099 (bestehende Installationen behalten ihre gespeicherte Nummer; wer wechselt, dem übergibt der Agent seinen `/config`-Ordner beim nächsten Start selbst).
 
 Unraid, TrueNAS und Synology ändern sich dadurch nicht: Die neuen Pfade sind nur zusätzlich.
 
 ## Übersicht im Browser (ab 1.4.0)
 
 `https://<NAS-IP>:8099` (z. B. `https://192.168.1.10:8099`) im Browser öffnen (PC, Tablet, Handy im WLAN oder über
-WireGuard). Der Browser warnt einmal, weil der Agent ein eigenes Zertifikat benutzt: Vergleiche den Fingerabdruck mit der Zeile im Container-Log. Die Einrichtung (Dienste suchen) geht nur innert 30 Minuten nach dem Start; sonst Container neu starten. Beim ersten Mal den Token einfügen (siehe «Token» oben); er bleibt nur in diesem Browser gespeichert, «Abmelden» löscht ihn.
+WireGuard). Der Browser warnt einmal, weil der Agent ein eigenes Zertifikat benutzt: Vergleiche den Fingerabdruck mit der Zeile im Container-Log. Die Einrichtung (Dienste suchen) geht nur innert 30 Minuten nach dem ersten Start; sonst Container neu starten. Wurden schon einmal Schlüssel ausgegeben, öffnet ein Neustart das Fenster nicht mehr: dann die leere Datei `keys-unlock` in `/config` anlegen. Beim ersten Mal den Token einfügen (siehe «Token» oben); er bleibt nur in diesem Browser gespeichert, «Abmelden» löscht ihn.
 
 Zu sehen, live alle 5 Sekunden: CPU und CPU-Temperatur mit Verlauf (12 Std.), Arbeitsspeicher, Netzwerk, Array mit
 Platten, Internet-Tempo (Knopf «Jetzt messen»), alle Temperaturen, meiste Last, Festplatten-Zugriffe, Grafikchip,
@@ -422,6 +422,23 @@ license. Full text: [`LICENSE`](LICENSE).
 
 Funktionen und Korrekturen nach Agent-Version.
 
+### Ab 1.20.2: Korrekturen und Härtung
+- **Eigene Benutzernummer 8099** im Image, in der Unraid-Vorlage und in allen Compose-Dateien (statt 99, 568 oder deiner DSM-Nummer), damit der Agent nicht unter derselben Nummer wie deine anderen Container läuft. Bestehende Installationen behalten ihre gespeicherte Nummer; wer wechselt, dem übergibt der Agent seinen `/config`-Ordner selbst.
+- **Schlüssel-Fenster.** Der Marker «Schlüssel ausgegeben» wird nur gesetzt, wenn wirklich mindestens ein Dienst ausgegeben wurde (nicht bei leerer Suche). Der Hinweis in der App, auf der Browser-Seite und in der API nennt nach der ersten Ausgabe nur noch die Datei `keys-unlock`; `GET /api/info` zeigt `keys.issued`.
+- **Feste Fehlertexte.** Ein interner Fehler antwortet mit `500` und einem festen Text; die Einzelheiten stehen (geschwärzt) nur im Container-Log.
+- **ntfy** folgt keinen Weiterleitungen mehr.
+- **Leere Felder** in der Unraid-Vorlage (z. B. `PORT`, `INTERVAL`) stoppen den Agenten nicht mehr: Eine leere oder ungültige Zahl gilt als nicht gesetzt.
+- **`POST /api/config`** prüft Typen streng (Preisserien, Grössen, `price_country_if_unset`).
+- **Browser-Seite:** Warnung, wenn der Token über unverschlüsseltes `http://` eingegeben wird; NAS-Name und Fingerabdruck brechen auf schmalen Handys um.
+- **Platten bleiben im Schlaf.** Die `drivetemp`-Sensoren werden nicht mehr alle 30 Sekunden gelesen; die Plattentemperatur kommt alle 5 Minuten und nur von Platten, die seit dem letzten Mal Zugriffe hatten (NVMe immer).
+- **`/api/history`:** Rohwerte bis 48 Stunden, bis 8 Tage Mittelwerte je 10 Minuten (gleiche Felder, `bucket_s: 600`), darüber Stundenwerte.
+- **Heimnetz-Suche:** alle echten Netzwerkschnittstellen (auch `enp…`, `eno…`, `ovs_eth0`), aber nur private Netze (10.x, 172.16–31.x, 192.168.x).
+- **Platten:** ZFS-Volumes (`zd0` …) erscheinen nicht als Platten; «Platte angelaufen» nur für drehende, fest eingebaute Platten (auch Synology `sata1` …); `rotational_speed` wird als `null` weitergegeben, wenn die Platte nichts meldet.
+- **Plattenpreise:** Platten unter 1 TB werden als `500GB` gesucht; eine neu beobachtete Serie holt nur die neue Serie; der SABnzbd-Verlauf wird auch unter `apps/` (TrueNAS) und `docker/` (Synology) gefunden.
+- **Datei-Index:** Ein Lauf, der (fast) keine Dateien fand, behält den alten Index. **Cache-Freigaben** werden im Hintergrund gemessen (die Anfrage liefert den letzten Stand und `measuring`).
+- **NAS-Name** statt Container-Kennung, wenn `/etc/hostname` nur lesend nach `/host/etc/hostname` eingebunden ist.
+- Texte nennen den Container «NASlab-Agent»; `HEAT_ALERT_MINUTES` ist dokumentiert.
+
 ### Ab 1.20.0: HTTPS, Schlüssel-Fenster, Token erneuern
 Grund (Gesamtprüfung 14.11.2026): Der Agent sprach nur HTTP. Wer im selben WLAN mithörte, las den Token und holte über `/api/discover?keys=1` alle Dienst-Schlüssel.
 
@@ -430,12 +447,12 @@ Grund (Gesamtprüfung 14.11.2026): Der Agent sprach nur HTTP. Wer im selben WLAN
 - **Eigenes Zertifikat verwenden:** `cert.pem` und `key.pem` (PEM, Schlüssel ohne Passwort) nach `/config/tls/` legen; der Agent nimmt sie und fasst sie nie an.
 - **Fingerabdruck (SHA-256)** steht beim Start im Log («NZBLab-Agent Fingerabdruck: AB:CD:…»), im Browser-Dashboard (Karte «Agent»), in `GET /api/tls` (ohne Token) und in `/api/health`, `/api/info`.
 - **`NZBLAB_HTTP`** (Standard `1` in 1.20: Klartext bleibt für alte Apps in der Übergangszeit). `0` = nur noch HTTPS; Klartext-Verbindungen bekommen eine kurze 403-Antwort. Ohne Zertifikat (z. B. `openssl` fehlt) startet der Agent dann nicht.
-- **Schlüssel-Ausgabe im Log.** Das Fenster öffnet sich nach jedem Neustart wieder; jede Ausgabe von Schlüsseln steht mit Absender-Adresse und Anzahl Dienste im Log (nie die Schlüssel).
+- **Schlüssel-Ausgabe im Log.** Das Fenster öffnet sich beim ersten Start, bis einmal Schlüssel ausgegeben wurden (danach nur über `keys-unlock`); jede Ausgabe von Schlüsseln steht mit Absender-Adresse und Anzahl Dienste im Log (nie die Schlüssel).
 - **Hinter einem TLS-Proxy.** Meldet der Proxy `X-Forwarded-Proto: http` (Gross-/Kleinschreibung egal), gilt die Anfrage für Schlüssel und Token erneuern als unsicher (403). Der Kopf dient nur zum Verbieten, nie zum Erlauben.
 - **Zertifikat-Fallen.** `NZBLAB_TLS_SAN`-Einträge mit `%` (Zonen-Kennung) oder Link-lokale Adressen werden mit Warnung übersprungen. Lässt sich ein eigenes `cert.pem`/`key.pem` nicht laden, steht eine laute Warnung im Log und der Agent nimmt das selbst erzeugte Zertifikat. Ist TLS aus, steht eine Warnzeile im Log (`tls: false`).
 - **Empfehlung:** `NZBLAB_HTTP=0` (nur HTTPS), sobald alle Apps auf 2.77 oder neuer sind; Standard bleibt vorerst `1`. / Recommended: set `NZBLAB_HTTP=0` once all apps are on 2.77+; the default stays `1` for now.
 - **Schlüssel nie über HTTP.** `GET /api/discover` mit Schlüsseln (`keys=1`, auch ohne Angabe) antwortet über Klartext mit `403 {"error": "keys_need_tls"}`. `keys=0` (nur zählen) bleibt über beide Wege offen.
-- **Schlüssel-Fenster.** Schlüssel gibt es nur 30 Minuten nach dem Start des Agenten, danach `403 {"error": "keys_locked", "hint": "…"}`. Wieder öffnen (10 Minuten): Container neu starten (dann wieder 30 Minuten) **oder** auf dem NAS die leere Datei `keys-unlock` in `/config` anlegen (der Agent löscht sie beim nächsten Abruf). Ein Token allein entsperrt bewusst nie: sonst nützte die Sperre gegen einen gestohlenen Token nichts. `DISCOVER_KEYS=0` bleibt «nie», neu `DISCOVER_KEYS=always` = ohne Fenster (altes Verhalten, für Fortgeschrittene, weiterhin nur über HTTPS).
+- **Schlüssel-Fenster.** Schlüssel gibt es nur 30 Minuten nach dem Start des Agenten, danach `403 {"error": "keys_locked", "hint": "…"}`. Wieder öffnen (10 Minuten): solange noch nie Schlüssel ausgegeben wurden, Container neu starten (dann wieder 30 Minuten); danach (ab 1.20.1, Marker `/config/keys-issued`) nur noch auf dem NAS die leere Datei `keys-unlock` in `/config` anlegen (der Agent löscht sie beim nächsten Abruf). Ein Token allein entsperrt bewusst nie: sonst nützte die Sperre gegen einen gestohlenen Token nichts. `DISCOVER_KEYS=0` bleibt «nie», neu `DISCOVER_KEYS=always` = ohne Fenster (altes Verhalten, für Fortgeschrittene, weiterhin nur über HTTPS).
 - **Token erneuern:** `POST /api/token/rotate` (Token nötig, nur über HTTPS) erzeugt einen neuen Zufalls-Token (`secrets.token_urlsafe(32)`), schreibt ihn atomar nach `/config/token.txt` (Rechte 600) und antwortet damit; der alte Token ist sofort ungültig. Über HTTP `403 tls_required`. Zusätzlich nur bei offenem Schlüssel-Fenster (30 Min. nach dem Start oder 10 Min. nach der Datei `keys-unlock`), sonst `403 keys_locked` mit Hinweis: ein gestohlener Token kann den Besitzer so nicht aussperren. Jede Erneuerung (auch abgelehnte) steht mit der Absender-Adresse im Log, nie der Token. Ist der Token per `NZBLAB_AGENT_TOKEN` fest gesetzt: `409 token_fixed` («Token ist in der Vorlage fest eingetragen»). Höchstens 5 Aufrufe pro Minute und Absender; falsche Tokens zählen in der gewohnten Bremse.
 - Neu: `GET /api/keys/status` (mit Token), `features`: `tls`, `token_rotate`, `keys_window`; `api_level` 17; `/api/info` mit `tls`, `fingerprint`, `http`, `secure`, `keys`.
 - Gesundheitsprüfung des Images: `python3 nzblab_agent.py --healthcheck` (HTTPS, sonst HTTP).
@@ -549,7 +566,7 @@ Lidarr, Readarr, Whisparr und andere Dienste werden nicht gemeldet.
   Token-Bremse
 - Schlüssel stehen nie im Log, auch nicht im Fehlerfall (`500 {"error": "Suche fehlgeschlagen"}` ohne Einzelheiten), nicht
   in «Heute», im Verlauf oder in der Weboberfläche
-- liest der Agent als PUID 99 einen Ordner oder eine Datei nicht: `code: "unreadable"` (ab 1.16.1 auch für nicht lesbare
+- liest der Agent als PUID 8099 einen Ordner oder eine Datei nicht: `code: "unreadable"` (ab 1.16.1 auch für nicht lesbare
   Ordner, wenn der Ordnername nach Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Seerr, Plex, Jellyfin oder Emby aussieht), Abhilfe PUID=0
 - Tautulli wird nur erkannt mit Abschnitt `[PMS]` in `config.ini` oder «tautulli» im Ordnernamen (ab 1.16.1; Headphones,
   LazyLibrarian, Mylar & Co. haben auch `[General] http_root`, sind aber keine); Emby und Jellyfin vor 10.9 lesen den Port aus
@@ -624,7 +641,7 @@ Gleiche Schnittstelle (`api_level` 16), neue Felder nur ergänzend (alte Apps le
   Container-Ordner enthalten die Umgebungsvariablen aller Container, der Agent behält nur die Namen). Neue Variable `NZBLAB_LAN`.
 
 - **ntfy nur noch für Kritisches (Standard).** Der Agent schickt per ntfy nur noch: Platte ausgefallen oder neue Lese-/Schreibfehler,
-  Array gestoppt, CPU über der kritischen Grenze (`HEAT_ALERT_C`, Standard 95 °C, nach 5 Minuten). Ntfy ist der Notfall-Weg, wenn
+  Array gestoppt, CPU über der kritischen Grenze (`HEAT_ALERT_C`, Standard 95 °C, während `HEAT_ALERT_MINUTES`, Standard 5 Minuten). Ntfy ist der Notfall-Weg, wenn
   das Handy schläft; die App meldet den Rest. **Info-Meldungen** (günstige Platten, neue Geräte im Heimnetz, «wieder normal») kommen
   per ntfy nur noch mit **`NZBLAB_NTFY_ALL=1`** (Standard `0`). In «Heute» in der App erscheinen sie unverändert. Dieselbe Sache
   höchstens 1× in 24 Stunden, ausser sie wird schlimmer (mehr Fehler, heisser); eine Entwarnung hebt die Sperre auf (Entwarnung selbst:
