@@ -121,9 +121,9 @@ jobs:
           csp=$(grep -i '^content-security-policy:' <<<"${page_headers}")
           grep -q "script-src 'sha256-" <<<"${csp}"
           if grep -q "script-src[^;]*unsafe-inline" <<<"${csp}"; then echo "::error::CSP erlaubt Inline-Skripte"; exit 1; fi
-          # Agent läuft nach dem Start als PUID 99, nicht als root
+          # Agent läuft nach dem Start als PUID 8099 (eigene Nummer, ab 1.20.2), nicht als root
           uid_line=$(docker exec agent-smoke sh -c 'grep "^Uid:" /proc/1/status')
-          grep -qE '^Uid:\s+99\s' <<<"${uid_line}"
+          grep -qE '^Uid:\s+8099\s' <<<"${uid_line}"
           # ab 1.20.0: HTTPS auf demselben Port; Fingerabdruck aus /api/tls = Zertifikat, das der Port wirklich ausliefert
           tls=$(curl -fsSk https://127.0.0.1:18099/api/tls)
           grep -q '"tls": true' <<<"${tls}"
