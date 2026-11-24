@@ -3,7 +3,7 @@
   <Name>NASlab-Agent</Name>
   <Repository>ghcr.io/tuxxler/nzblab-agent:latest</Repository>
   <Registry>https://github.com/Tuxxler/nzblab-agent/pkgs/container/nzblab-agent</Registry>
-  <Beta>true</Beta>
+  <Beta>false</Beta>
   <MinVer>6.12.0</MinVer>
   <Network>bridge</Network>
   <MyIP/>
@@ -16,7 +16,7 @@
   <Overview>Getting the app: NASlab is coming to the Google Play Store in the next few days. Until then it is in a closed test, see https://tuxxler.github.io/nzblab/en/#play&#xD;
 Read-only monitoring agent for the NASlab Android app. It measures your server every 30 seconds (temperature sensors, CPU load, GPU usage, RAM, network, disk spin-ups and which programs caused them, top processes, cache usage per share) and keeps a file index for searching all shares. History: 8 days at full resolution, 2 years of hourly values, stored in /config.&#xD;
 &#xD;
-Beta: tested on Unraid 7 (amd64); arm64 untested.&#xD;
+Tested on Unraid 7 (amd64); arm64 is not tested yet.&#xD;
 &#xD;
 It never changes anything on your server: every host path is mounted read-only, only /config is writable, root is dropped after start (PUID/PGID), and the container runs read-only with almost all capabilities removed. Optional and off by default: SMART values (NZBLAB_SMART), backup discovery for extra paths (NZBLAB_BACKUP_PATHS), redacted log excerpts (NZBLAB_LOGS), home network device list (NZBLAB_LAN). Service discovery (Sonarr, Radarr, Prowlarr, SABnzbd, Tautulli, Overseerr/Jellyseerr) reads API keys from appdata read-only and hands them to the app over the token-protected API; Plex tokens are never read; turn it off with DISCOVER_KEYS=0. The agent never updates itself.&#xD;
 &#xD;
