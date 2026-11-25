@@ -20,10 +20,12 @@ import glob
 import hashlib
 import hmac
 import ipaddress
+import io
 import json
 import os
 import re
 import secrets
+import signal
 import socket
 import sqlite3
 import ssl
@@ -33,12 +35,13 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+import urllib.parse
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.20.2"
+VERSION = "1.20.4"
 
 
 def env_num(name, default, kind=int):
@@ -59,7 +62,7 @@ CONFIG = os.environ.get("CONFIG_DIR", "/config")
 PORT = env_num("PORT", 8099, int)
 INTERVAL = env_num("INTERVAL", 30, int)
 WEB_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web.html")
-PRICES_FILE = os.environ.get("PRICES_FILE", "")  # leer = erste <Freigabe>/nzblab-prices/prices.json unter FILES_ROOT (optional)
+PRICES_FILE = os.environ.get("PRICES_FILE", "")  # leer = <CONFIG>/prices.json (Freigaben-Suche nur mit Einstellung prices_scan_shares=1)
 NOTIFY_DIR = os.environ.get("NOTIFY_DIR", "/host/notifications")   # Unraid: /tmp/notifications
 LOG_DIR = os.environ.get("LOG_DIR", "/host/log")                    # Unraid: /var/log
 HEAT_ALERT = env_num("HEAT_ALERT_C", 95, float)
@@ -78,6 +81,7 @@ def top_excluded(name, exclude):
 
 # In jeder Ebene auslassen: Vorschaubilder und Papierkörbe von Synology (unter Unraid gibt es sie nicht)
 FILES_SKIP = {x.strip() for x in os.environ.get("FILES_SKIP", "@eaDir,#recycle,#snapshot").split(",") if x.strip()}
+SMALL_RUNS_ACCEPT = 3        # ab 1.20.3: so viele gleichartig kleine Index-Läufe in Folge, bis der kleine Index gilt
 # Was liegt auf dem Cache, pro Freigabe (ab 1.8.1): Pool nur lesend eingebunden (Vorlage: /mnt/cache → /host/mnt/cache).
 # Mehrere Pools mit Komma, z. B. «/host/mnt/cache,/host/mnt/cache2».
 CACHE_ROOTS = [x.strip() for x in os.environ.get("CACHE_ROOTS", "/host/mnt/cache").split(",") if x.strip()]
@@ -92,13 +96,14 @@ class CacheShares:
         self.roots, self.ttl, self.budget = roots if roots is not None else CACHE_ROOTS, ttl, budget
         self.lock = threading.Lock()
         self.cached = None
+        self.cached_m = 0.0
 
     def available(self):
         return [r for r in self.roots if os.path.isdir(r)]
 
     def compute(self):
         roots = self.available()
-        out, partial, started = {}, False, time.time()
+        out, partial, started = {}, False, time.monotonic()
         for root in roots:
             pool = os.path.basename(root.rstrip("/")) or root
             try:
@@ -108,7 +113,7 @@ class CacheShares:
             for top in tops:
                 size, files, stack = 0, 0, [top.path]
                 while stack:
-                    if time.time() - started > self.budget:
+                    if time.monotonic() - started > self.budget:
                         partial = True
                         break
                     d = stack.pop()
@@ -136,16 +141,17 @@ class CacheShares:
 
     def get(self):
         with self.lock:
-            if self.cached and time.time() - self.cached["at"] < self.ttl:
+            if self.cached and time.monotonic() - self.cached_m < self.ttl:
                 return self.cached
             self.cached = self.compute()
+            self.cached_m = time.monotonic()
             return self.cached
 
     def get_async(self, wait=2.0):
         """Ab 1.20.2: wie AppdataSizes: nie länger als [wait] Sekunden auf das Messen warten. Liefert den letzten Stand (auch einen
         älteren) plus «measuring»; ohne Stand eine leere Liste mit measuring=true. Die Messung läuft im Hintergrund."""
         with self.lock:
-            fresh = self.cached and time.time() - self.cached["at"] < self.ttl
+            fresh = self.cached and time.monotonic() - self.cached_m < self.ttl
             if not fresh and (getattr(self, "thread", None) is None or not self.thread.is_alive()):
                 self.thread = threading.Thread(target=self._bg, daemon=True, name="cacheshares")
                 self.thread.start()
@@ -169,6 +175,7 @@ class CacheShares:
             return
         with self.lock:
             self.cached = res
+            self.cached_m = time.monotonic()
 
 class AppdataSizes:
     """Grösse jedes Container-Ordners unter appdata (ab 1.8.2, für die App-Seite «appdata pro Container»).
@@ -180,6 +187,7 @@ class AppdataSizes:
         self.ttl, self.budget = ttl, budget
         self.lock = threading.Lock()
         self.result = None
+        self.result_m = 0.0
         self.thread = None
 
     def measure(self):
@@ -194,13 +202,14 @@ class AppdataSizes:
             res = {"available": True, "root": self.root, "partial": True, "at": int(time.time()), "containers": [], "error": str(e)}
         with self.lock:
             self.result = res
+            self.result_m = time.monotonic()
 
     def get(self, wait=0.0):
         """[wait]: so viele Sekunden auf eine frisch gestartete Messung warten (Tests, kleine Ordner)."""
         if not os.path.isdir(self.root):
             return {"available": False, "root": self.root, "measuring": False, "at": 0, "containers": []}
         with self.lock:
-            stale = self.result is None or time.time() - self.result["at"] >= self.ttl
+            stale = self.result is None or time.monotonic() - self.result_m >= self.ttl
             if stale and (self.thread is None or not self.thread.is_alive()):
                 self.thread = threading.Thread(target=self._run, daemon=True, name="appdata")
                 self.thread.start()
@@ -477,12 +486,13 @@ class Sampler:
         return [[k, round(v, 1)] for k, v in sorted(res.items(), key=lambda x: -x[1])[:n]]
 
     def sample(self):
-        now = time.time()
+        now = time.time()                  # nur für den Zeitstempel; Raten rechnen mit der Monotonuhr (Gesamtprüfung G2)
+        mono = time.monotonic()
         total, cores = self.cpu()
         return {
             "t": int(now), "cpu": total, "cores": cores, "temps": self.temps(), "fans": self.fans(),
-            "gpu": self.gpu(now), "mem": self.memory(), "disks": self.disks(now), "top": self.top(now),
-            "net": self.net(now), "mover": getattr(self, "mover", False), "disk_rw": getattr(self, "disk_rw", {}),
+            "gpu": self.gpu(mono), "mem": self.memory(), "disks": self.disks(mono), "top": self.top(mono),
+            "net": self.net(mono), "mover": getattr(self, "mover", False), "disk_rw": getattr(self, "disk_rw", {}),
             "limits": self.limits(),
         }
 
@@ -594,11 +604,20 @@ class Store:
             self.db.execute("CREATE TABLE IF NOT EXISTS smart_daily (day TEXT, disk TEXT, t INTEGER, j TEXT, PRIMARY KEY (disk, day))")
             self.db.commit()
 
+    PRUNE_SLACK_S = 86400
+
+    def _ref(self, table, col, t):
+        """Gesamtprüfung G7: Bezugszeit zum Aufräumen. Ein Messwert mit falscher Zukunftszeit darf nichts löschen, was nur im
+        Vergleich zu ihm alt ist: höchstens ein Tag über dem neuesten gespeicherten Wert (nur mit Sperre aufrufen)."""
+        mx = self.db.execute(f"SELECT MAX({col}) FROM {table}").fetchone()[0]
+        return t if mx is None else min(t, mx + self.PRUNE_SLACK_S)
+
     def add_event(self, kind, level, title, text, t=None):
         t = int(t or time.time())
         with self.lock:
+            ref = self._ref("events", "t", t)
             self.db.execute("INSERT INTO events VALUES (?,?,?,?,?)", (t, kind, level, title, text))
-            self.db.execute("DELETE FROM events WHERE t < ?", (t - 90 * 86400,))
+            self.db.execute("DELETE FROM events WHERE t < ?", (ref - 90 * 86400,))
             self.db.commit()
 
     def events(self, since):
@@ -608,8 +627,9 @@ class Store:
 
     def add(self, s):
         with self.lock:
+            ref = self._ref("raw", "t", s["t"])
             self.db.execute("INSERT OR REPLACE INTO raw VALUES (?, ?)", (s["t"], json.dumps(s, separators=(",", ":"))))
-            self.db.execute("DELETE FROM raw WHERE t < ?", (s["t"] - 8 * 86400,))
+            self.db.execute("DELETE FROM raw WHERE t < ?", (ref - 8 * 86400,))
             self.db.commit()
 
     def first_t(self):
@@ -656,8 +676,9 @@ class Store:
                 agg["top"][name] = agg["top"].get(name, 0) + pct / len(rows)
         agg["top"] = [[k, round(v, 1)] for k, v in sorted(agg["top"].items(), key=lambda x: -x[1])[:5]]
         with self.lock:
+            ref = self._ref("hourly", "h", hour)
             self.db.execute("INSERT OR REPLACE INTO hourly VALUES (?, ?)", (hour, json.dumps(agg, separators=(",", ":"))))
-            self.db.execute("DELETE FROM hourly WHERE h < ?", (hour - 730 * 86400,))
+            self.db.execute("DELETE FROM hourly WHERE h < ?", (ref - 730 * 86400,))
             self.db.commit()
 
     def hourly(self, since):
@@ -666,8 +687,9 @@ class Store:
 
     def add_wake(self, t, disk, info):
         with self.lock:
+            ref = self._ref("wakes", "t", t)
             self.db.execute("INSERT INTO wakes VALUES (?, ?, ?)", (t, disk, json.dumps(info)))
-            self.db.execute("DELETE FROM wakes WHERE t < ?", (t - 365 * 86400,))
+            self.db.execute("DELETE FROM wakes WHERE t < ?", (ref - 365 * 86400,))
             self.db.commit()
 
     def wakes(self, since):
@@ -706,6 +728,8 @@ class Store:
         t = int(t)
         h = t // 3600 * 3600
         with self.lock:
+            ref_r = self._ref("series", "t", t)
+            ref_h = ref_r                      # gleiche Zeitachse (series.t ist indexiert): keine MAX(h)-Abfrage unter der Sperre
             for k, v in vals.items():
                 if v is None:
                     continue
@@ -713,8 +737,8 @@ class Store:
                 self.db.execute("INSERT OR REPLACE INTO series VALUES (?,?,?)", (t, k, v))
                 self.db.execute("INSERT INTO series_h VALUES (?,?,?,?,?,1) ON CONFLICT(k, h) DO UPDATE SET mx=max(mx, excluded.mx), "
                                 "mn=min(mn, excluded.mn), sm=sm+excluded.sm, n=n+1", (h, k, v, v, v))
-            self.db.execute("DELETE FROM series WHERE t < ?", (t - self.SERIES_RAW_S,))
-            self.db.execute("DELETE FROM series_h WHERE h < ?", (t - self.SERIES_KEEP_S,))
+            self.db.execute("DELETE FROM series WHERE t < ?", (ref_r - self.SERIES_RAW_S,))
+            self.db.execute("DELETE FROM series_h WHERE h < ?", (ref_h - self.SERIES_KEEP_S,))
             self.db.commit()
 
     def series(self, prefix, since, res="raw"):
@@ -1001,14 +1025,48 @@ def alerter(kind, level, critical=False):
     return send
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Ab 1.20.2: ntfy folgt keiner Weiterleitung (ein fremder Server könnte die Meldung sonst an einen anderen Ort schicken lassen)."""
+class _NtfyRedirect(urllib.request.HTTPRedirectHandler):
+    """Ab 1.20.3: ntfy folgt höchstens einer Weiterleitung, und nur auf denselben Host (gleiches Schema oder http → https, z. B.
+    ein Proxy, der auf https umleitet). Alles andere schlägt fehl (ein fremder Server könnte die Meldung sonst an einen anderen Ort
+    schicken lassen). Die Meldung geht unverändert (POST mit Inhalt) an die neue Adresse; im Log steht nur der Grund, nie eine Adresse."""
+    max_redirections = 1
+
+    @staticmethod
+    def _reason(old, new, hops):
+        if hops >= 1:
+            return "zweite Weiterleitung"
+        o, n = urllib.parse.urlsplit(old), urllib.parse.urlsplit(new)
+        if n.scheme not in ("http", "https") or not n.hostname or n.username or n.password:
+            return "ungültiges Ziel"
+        if (o.hostname or "").lower() != n.hostname.lower():
+            return "anderer Host"
+        def eff(u):   # tatsächlicher Port: ohne Angabe 80 (http) bzw. 443 (https)
+            try:
+                return u.port or (443 if u.scheme == "https" else 80)
+            except ValueError:
+                return -1
+        if o.scheme == n.scheme:
+            return "" if eff(o) == eff(n) else "anderer Port"
+        if o.scheme == "http" and n.scheme == "https":
+            return "" if eff(n) in (443, eff(o)) else "anderer Port"
+        return "Rückstufung auf http"
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        newurl = urllib.parse.urljoin(req.full_url, newurl)
+        hops = getattr(req, "_ntfy_hops", 0)
+        # 303 heisst «mit GET neu holen»: die Meldung würde nicht erneut gesendet, also gilt es als Fehler
+        why = "303 ohne erneutes Senden" if code == 303 else self._reason(req.full_url, newurl, hops) if code in (301, 302, 307, 308) else "Weiterleitungsart"
+        if why:
+            print(f"ntfy: Weiterleitung abgelehnt ({why})", flush=True)
+            return None
+        new = urllib.request.Request(newurl, data=req.data, headers=dict(req.header_items()), method=req.get_method())
+        new._ntfy_hops = hops + 1
+        return new
 
 
-NTFY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect())
+_NoRedirect = _NtfyRedirect   # Altname (Tests)
+
+NTFY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(), _NtfyRedirect())
 
 
 def ntfy(title, text, tags="warning", priority="high"):
@@ -1359,9 +1417,29 @@ def load_container_names():
                 pass
 
 
+class LiveNow:
+    """Live-Werte für /api/now: höchstens alle [max_age] Sekunden neu messen (eigener Sampler, damit die Differenzen stimmen).
+    Gesamtprüfung G4: mit Sperre, damit zwei gleichzeitige Anfragen nicht beide messen (Differenzen über Millisekunden, Spitzen)."""
+
+    def __init__(self, sampler, max_age=2.0):
+        self.sampler, self.max_age = sampler, max_age
+        self.lock = threading.Lock()
+        self.v, self.m = None, 0.0
+
+    def get(self):
+        with self.lock:
+            if self.v is None or time.monotonic() - self.m > self.max_age:
+                self.v = self.sampler.sample()
+                self.m = time.monotonic()
+            return self.v
+
+
 def run_sampler(store, sampler, watcher, stop):
     SAMPLER_STATE["last"] = time.time()
-    sampler.sample()                       # erste Messung nur für die Differenzen
+    try:
+        sampler.sample()                   # erste Messung nur für die Differenzen
+    except Exception as e:                 # Gesamtprüfung: auch die erste Messung darf den Messfaden nicht beenden
+        print("Erste Messung fehlgeschlagen:", e, flush=True)
     last_hour = int(time.time()) // 3600 * 3600
     while not stop.wait(INTERVAL):
         try:
@@ -1484,12 +1562,30 @@ class FileIndex:
                 # Ab 1.20.2: fast nichts gefunden (Pool nicht eingehängt, Freigabe nicht lesbar): alten Index behalten, sonst findet
                 # die Suche bis zum nächsten Lauf nichts und der Medien-Bestand meldet danach alles als «neu»
                 old_files = int((self.db.execute("SELECT v FROM meta WHERE k='files'").fetchone() or ["0"])[0] or 0)
-                if (old_files > 0 and self.state["files"] == 0) or (old_files >= 100 and self.state["files"] < old_files * 0.1):
+                # Ab 1.20.3: wirklich geschrumpfter Bestand (Platten ausgebaut) soll nicht ewig ausgesperrt bleiben: beim 3. gleichartig
+                # kleinen Lauf in Folge (Dateizahl höchstens 10 % neben dem vorigen kleinen Lauf) gilt der neue Index.
+                def _meta_int(k):
+                    return int((self.db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone() or ["0"])[0] or 0)
+                new_files = self.state["files"]
+                if old_files > 0 and new_files == 0:
+                    # Ein Lauf ohne jede Datei ersetzt nie einen vorhandenen Index und zählt nicht für die Folge kleiner Läufe
                     self.db.execute("DROP TABLE IF EXISTS files_new")
                     self.db.commit()
-                    self.state["error"] = ("Der Durchlauf fand fast keine Dateien (Freigaben nicht eingehängt oder nicht lesbar?). "
+                    self.state["error"] = ("Der Durchlauf fand keine Dateien (Freigaben nicht eingehängt oder nicht lesbar?). "
                                            "Der bisherige Index bleibt.")
                     return
+                if old_files >= 100 and new_files < old_files * 0.1:
+                    streak, last_small = _meta_int("small_streak"), _meta_int("small_last")
+                    streak = streak + 1 if streak > 0 and abs(new_files - last_small) <= 0.1 * max(new_files, last_small) else 1
+                    if streak < SMALL_RUNS_ACCEPT:
+                        self.db.execute("DROP TABLE IF EXISTS files_new")
+                        for k, v in (("small_streak", streak), ("small_last", new_files)):
+                            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, str(v)))
+                        self.db.commit()
+                        self.state["error"] = ("Der Durchlauf fand fast keine Dateien (Freigaben nicht eingehängt oder nicht lesbar?). "
+                                               f"Der bisherige Index bleibt (kleiner Lauf {streak} von {SMALL_RUNS_ACCEPT}; "
+                                               "bleibt es gleich klein, gilt er danach als echt).")
+                        return
                 # Medien-Bestand: Videodateien des bisherigen Index aufheben, bevor er ersetzt wird («neu» = seit dem vorletzten Lauf)
                 prev = self.db.execute("SELECT v FROM meta WHERE k='last'").fetchone()
                 self.db.execute("DROP TABLE IF EXISTS inv_prev")
@@ -1508,7 +1604,7 @@ class FileIndex:
                 self.db.execute("CREATE INDEX IF NOT EXISTS dirsize_parent ON dirsize (parent)")
                 self.has_sizes = True
                 for k, v in (("last", int(time.time())), ("duration", int(time.time() - started)),
-                             ("dirs", self.state["dirs"]), ("files", self.state["files"])):
+                             ("dirs", self.state["dirs"]), ("files", self.state["files"]), ("small_streak", 0), ("small_last", 0)):
                     self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, str(v)))
                 self.db.commit()
         except Exception as e:  # noqa: BLE001 (Fehler melden statt den Agenten zu stoppen)
@@ -2422,14 +2518,26 @@ def drop_privileges():
 _PRICES_FOUND = {"path": "", "checked": None}
 
 
+def prices_scan_shares():
+    """Ab 1.20.4: Preisdatei auch in den Freigaben suchen? Nur mit Einstellung prices_scan_shares=1 (oder NZBLAB_PRICES_SCAN_SHARES=1); Standard aus."""
+    v = settings().get("prices_scan_shares")
+    if v is None:
+        return _env_on("NZBLAB_PRICES_SCAN_SHARES", False)
+    return v is True or str(v).strip().lower() in ("1", "true", "yes", "on", "ja")
+
+
 def prices_path(now=None):
     """
     Optionale externe prices.json (gleiches Format wie /config/prices-CH.json, z. B. von einem eigenen Preis-Sammler).
-    PRICES_FILE gesetzt: genau diese Datei. Sonst die erste Freigabe unter FILES_ROOT (alphabetisch), die
-    «nzblab-prices/prices.json» enthält. Gesucht wird höchstens alle 6 Stunden (nur Verzeichnis-Einträge, nur lesen).
+    Ab 1.20.4 nur noch fester Ort: PRICES_FILE, sonst <CONFIG>/prices.json (/config/prices.json). Die Freigaben unter FILES_ROOT
+    werden nur mit der Einstellung prices_scan_shares=1 durchsucht (erste Freigabe, alphabetisch, mit «nzblab-prices/prices.json»;
+    höchstens alle 6 Stunden, nur Verzeichnis-Einträge, nur lesen).
     """
     if PRICES_FILE:
         return PRICES_FILE
+    fixed = os.path.join(CONFIG, "prices.json")
+    if not prices_scan_shares():
+        return fixed
     now = time.time() if now is None else now
     if _PRICES_FOUND["path"] and os.path.isfile(_PRICES_FOUND["path"]):
         return _PRICES_FOUND["path"]
@@ -2444,7 +2552,7 @@ def prices_path(now=None):
         except OSError:
             pass
         _PRICES_FOUND["path"] = found
-    return _PRICES_FOUND["path"] or os.path.join(FILES_ROOT, "nzblab-prices", "prices.json")
+    return _PRICES_FOUND["path"] or fixed
 
 
 # Plattenserien für NAS, die man in der App zusätzlich beobachten kann (Grösse per Regler). must/not: Wörter im Produktnamen.
@@ -2570,8 +2678,8 @@ def price_search_url(src, tb, kind, q=None):
 # angefragt oder noch offen (Plan Plattenpreise weltweit, Paket 0). «amazon»: Amazon-Preise bekommen nie einen Werbelink
 # und keine «günstig»-Meldung (Regeln des Partnerprogramms: keine Preisverfolgung/-alarme).
 PRICE_SOURCES = {
-    "toppreise": {"label": "Toppreise.ch", "url": "https://www.toppreise.ch", "allowed": True, "terms": "pending", "amazon": False},
-    "geizhals": {"label": "Geizhals", "url": "https://geizhals.de", "allowed": True, "terms": "pending", "amazon": False},
+    "toppreise": {"label": "Toppreise.ch", "url": "https://www.toppreise.ch", "allowed": False, "terms": "pending", "amazon": False},
+    "geizhals": {"label": "Geizhals", "url": "https://geizhals.de", "allowed": False, "terms": "pending", "amazon": False},
     "diskprices": {"label": "diskprices.com (Amazon-Preise)", "url": "https://diskprices.com", "allowed": True, "terms": "pending",
                    "amazon": True},
 }
@@ -3136,17 +3244,21 @@ def _dev_of(path):
         return None
 
 
-_LAST_DISK_TEMP = {}    # ab 1.20.2: zuletzt gelesene Plattentemperatur (nur SATA/drivetemp); host_disks liest nicht selbst nach
+_LAST_DISK_TEMP = {}    # ab 1.20.2: (Plattenpfad, Gerät) -> (°C, Lesezeit); nur SATA/drivetemp; host_disks liest nicht selbst nach
+DISK_TEMP_MAX_AGE = 30 * 60   # ab 1.20.3: ein älterer Wert gilt nicht mehr (Platte schläft evtl. seit Stunden): lieber keine Zahl als eine alte
 
 
-def disk_temp_cached(sys_root, dev):
+def disk_temp_cached(sys_root, dev, now=None):
     """Wie disk_temp, aber SATA-Platten (drivetemp: jeder Zugriff ist ein ATA-Befehl) nur beim ersten Mal lesen; danach der letzte Wert
-    aus disk_temps() (nur bei Platten mit Zugriffen). NVMe immer frisch."""
+    aus disk_temps() (nur bei Platten mit Zugriffen), aber nur wenn er jünger als 30 Minuten ist, sonst None. NVMe immer frisch.
+    Der erste Aufruf liest die Platte (kein Standby-Zustand ohne SMART verfügbar; die API hat kein Feld für das Alter)."""
+    now = time.time() if now is None else now
     if not dev.startswith("nvme") and (sys_root, dev) in _LAST_DISK_TEMP:
-        return _LAST_DISK_TEMP[(sys_root, dev)]
+        t, at = _LAST_DISK_TEMP[(sys_root, dev)]
+        return t if now - at < DISK_TEMP_MAX_AGE else None
     t = disk_temp(sys_root, dev)
     if t is not None and not dev.startswith("nvme"):
-        _LAST_DISK_TEMP[(sys_root, dev)] = t
+        _LAST_DISK_TEMP[(sys_root, dev)] = (t, now)
     return t
 
 
@@ -3255,10 +3367,10 @@ def cached(name, fn, ttl=None):
     with _HOST_CACHE_LOCK:
         entry = _HOST_CACHE.setdefault(key, {"t": 0.0, "v": None, "lock": threading.Lock()})
     with entry["lock"]:
-        if entry["v"] is not None and time.time() - entry["t"] < ttl:
+        if entry["v"] is not None and time.monotonic() - entry["t"] < ttl:
             return entry["v"]
         v = fn()
-        entry["v"], entry["t"] = v, time.time()
+        entry["v"], entry["t"] = v, time.monotonic()
         return v
 
 
@@ -3831,14 +3943,89 @@ def fetch_own_prices(country, fetch=http_get, pause=None, today=None, only_keys=
     return data
 
 
-def tool_prices_fresh(max_age_h=36):
-    """Externe prices.json (optionaler Preis-Sammler, siehe prices_path) vorhanden und frisch? Dann gilt sie für CH."""
+def _num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) < 1e12
+
+
+def _clean_history(h):
+    return [x for x in h if isinstance(x, dict) and isinstance(x.get("d"), str) and _num(x.get("chf"))] if isinstance(h, list) else []
+
+
+_DROP = object()
+_LINK_KEYS = ("link", "search_url", "alt_search_url", "browser_url")   # ab 1.20.4: auch Suchadressen aus einer fremden Preisdatei nur über safe_link
+
+
+def _clean_links(x, depth=0):
+    """Ab 1.20.3 (Audit run-3 A2): jede Verknüpfung in einer fremden Preisdatei nur als https:// (safe_link), sonst leer.
+    Zu tief verschachtelte Teile (ab Tiefe 9) werden samt Schlüssel bzw. Listeneintrag aus dem Eltern-Objekt entfernt."""
+    if depth > 8:
+        return _DROP   # zu tief verschachtelt: verwerfen, nicht ungeprüft durchlassen (Links könnten darin stecken)
+    if isinstance(x, dict):
+        out = {}
+        for k, v in x.items():
+            c = (safe_link(v, "") if isinstance(v, str) else "") if k in _LINK_KEYS else _clean_links(v, depth + 1)
+            if c is not _DROP:
+                out[k] = c
+        return out
+    if isinstance(x, list):
+        return [c for c in (_clean_links(v, depth + 1) for v in x) if c is not _DROP]
+    return x
+
+
+def sanitize_tool_prices(d, now=None):
+    """
+    Externe prices.json prüfen (Ab 1.20.3, Audit run-3 A2): Links nur über safe_link, «updated» nie in der Zukunft (mehr als
+    1 Stunde voraus: ungültig, sonst auf jetzt begrenzt), Typen geprüft, Fehlerhaftes wird ignoriert statt zu werfen.
+    Liefert ein bereinigtes dict oder None.
+    """
+    if not isinstance(d, dict) or not isinstance(d.get("queries"), dict):
+        return None
+    now = time.time() if now is None else now
+    upd = d.get("updated")
+    if not _num(upd) or upd > now + 3600:
+        upd = 0
+    out = dict(d, updated=min(float(upd), now))
+    for k in ("source",):
+        if not isinstance(out.get(k, ""), str):
+            out[k] = ""
+    qs = {}
+    for key, v in d["queries"].items():
+        if not isinstance(key, str) or not isinstance(v, dict):
+            continue
+        v = dict(v)
+        for hk in ("history", "alt_history"):
+            if hk in v:
+                v[hk] = _clean_history(v[hk])
+        if isinstance(v.get("model_history"), dict):
+            v["model_history"] = {mk: _clean_history(mh) for mk, mh in v["model_history"].items() if isinstance(mk, str)}
+        elif "model_history" in v:
+            v["model_history"] = {}
+        for ok in ("best", "alternative"):
+            if ok in v and not (isinstance(v[ok], dict) and (v[ok].get("chf") is None or _num(v[ok].get("chf")))):
+                del v[ok]
+        if "models_now" in v:
+            mn = v["models_now"]
+            v["models_now"] = [m for m in mn if isinstance(m, dict) and (m.get("chf") is None or _num(m.get("chf")))] if isinstance(mn, list) else []
+        qs[key] = _clean_links(v)
+    out["queries"] = qs
+    return out
+
+
+def load_tool_prices(now=None):
+    """Bereinigte externe prices.json oder None (fehlt, kaputt, falsche Form)."""
     try:
         with open(prices_path()) as f:
-            d = json.load(f)
-        return d if time.time() - float(d.get("updated") or 0) < max_age_h * 3600 else None
-    except (OSError, ValueError, TypeError):
+            return sanitize_tool_prices(json.load(f), now)
+    except (OSError, ValueError, TypeError, RecursionError):
         return None
+
+
+def tool_prices_fresh(max_age_h=36):
+    """Externe prices.json (optionaler Preis-Sammler, siehe prices_path) vorhanden und frisch? Dann gilt sie für CH."""
+    d = load_tool_prices()
+    if d is None:
+        return None
+    return d if time.time() - d["updated"] < max_age_h * 3600 else None
 
 
 def _model_fields(g):
@@ -3936,13 +4123,7 @@ def price_summary(today=None):
     country = price_country()
     tool = None
     if country in ("", "CH"):
-        try:
-            with open(prices_path()) as f:
-                tool = json.load(f)
-        except (OSError, ValueError):
-            tool = None
-        if tool is not None and country == "CH" and tool_prices_fresh() is None:
-            tool = None   # alt: der Agent holt selbst
+        tool = tool_prices_fresh()   # nur für die Schweiz genutzt; älter als 36 Std. = der Agent holt selbst
     countries = [{"code": c, "label": l, "source": s} for c, l, s in PRICE_COUNTRIES]
     search_only = bool(country) and not source_allowed(price_source(country)["id"])
     base = {"country": country, "country_set": bool(country), "countries": countries, "catalog": PRICE_SERIES,
@@ -4098,10 +4279,12 @@ def from_private_net(ip):
         a = ipaddress.ip_address(ip)
     except ValueError:
         return False
+    if getattr(a, "ipv4_mapped", None) is not None:
+        a = a.ipv4_mapped                  # Gesamtprüfung G10: bei NZBLAB_BIND="::" kommen IPv4-Geräte als ::ffff:a.b.c.d an
     if a.is_loopback:
         return True
     if a in ipaddress.ip_network("172.16.0.0/12"):
-        return ip.endswith(".1")
+        return str(a).endswith(".1")
     return a in ipaddress.ip_network("192.168.0.0/16") or a in ipaddress.ip_network("10.0.0.0/8")
 
 
@@ -4357,9 +4540,9 @@ class Today:
             if not self.SYSLOG_BAD.search(line) or self.SYSLOG_SKIP.search(line):
                 continue
             try:
-                t = int(time.mktime(time.strptime(f"{year} {line[:15]}", "%Y %b %d %H:%M:%S")))
+                t = _wall_epoch(f"{year} {line[:15]}", "%Y %b %d %H:%M:%S")
                 if t > time.time() + 86400:   # Dezember-Zeilen nach Neujahr
-                    t = int(time.mktime(time.strptime(f"{year - 1} {line[:15]}", "%Y %b %d %H:%M:%S")))
+                    t = _wall_epoch(f"{year - 1} {line[:15]}", "%Y %b %d %H:%M:%S")
             except ValueError:
                 continue
             if t < since:
@@ -4442,7 +4625,9 @@ BACKUP_PATHS = [x.strip() for x in os.environ.get("NZBLAB_BACKUP_PATHS", "").spl
 BACKUP_AUTO = _env_on("NZBLAB_BACKUP_AUTO", True)
 BIND = os.environ.get("NZBLAB_BIND", "0.0.0.0").strip() or "0.0.0.0"
 MAX_CONN = _env_int("NZBLAB_MAX_CONN", 256, 16, 4096)              # ab 1.16.1: offene Verbindungen insgesamt
-MAX_CONN_PER_IP = _env_int("NZBLAB_MAX_CONN_PER_IP", 32, 4, 1024)   # ab 1.16.1: je Absender-Adresse
+MAX_CONN_PER_IP = _env_int("NZBLAB_MAX_CONN_PER_IP", 32, 4, 1024)   # ab 1.16.1: je Absender (ab 1.20.4 nach rate_key: IPv6 je /64)
+LOOPBACK_RESERVE = 8        # ab 1.20.4: so viele Plätze nur für 127.0.0.1/::1 (Docker-Healthcheck); andere Absender stoppen früher
+HEADER_DEADLINE = 15.0      # ab 1.20.4: Gesamtfrist (Sekunden ab Annahme) für Anfragezeile und alle Kopfzeilen
 MAX_BODY = 64 * 1024        # grösste Anfrage (Bytes); Absturzberichte behalten ihr eigenes Limit (CRASH_MAX_BYTES * 2)
 AUTH_FAILS = _env_int("NZBLAB_AUTH_FAILS", 10, 3, 1000)
 DISKTEMP_EVERY = 300        # Plattentemperaturen alle 5 Minuten speichern
@@ -4551,7 +4736,7 @@ def disk_temps(sys_root=None, smart_latest=None, proc=None):
         if t is not None:
             out[dev] = t
             if not dev.startswith("nvme"):
-                _LAST_DISK_TEMP[(sys_root, dev)] = t
+                _LAST_DISK_TEMP[(sys_root, dev)] = (t, time.time())
     for d in (smart_latest or {}).values():
         name = (d.get("device_name") or "").rsplit("/", 1)[-1]
         if name and name not in out and isinstance(d.get("temp"), (int, float)) and not d.get("standby") and 0 < d["temp"] < 120:
@@ -4684,7 +4869,20 @@ def run_net(store, stop):
 
 # ab 1.17.0 auch /dev/sata1, /dev/sas1, /dev/usb1 (Synology DSM 7)
 SMART_DEV = re.compile(r"/dev/(sd[a-z]{1,3}|hd[a-z]|nvme\d{1,3}(n\d{1,3})?|sg\d{1,3}|bus/\d{1,3}|(?:sata|sas|usb)\d{1,3})")
-SMART_TYPE = re.compile(r"[a-z0-9][a-z0-9,+_-]{0,31}")
+# Ab 1.20.3 (Audit run-3 A1): nur lesende -d-Typen, wie «smartctl --scan» sie liefert. Nie jmb39x*/jms56x*/intelliprop* (schreiben
+# einen Sektor bzw. schalten das Laufwerk um) und nie etwas mit «force».
+_SMART_RAID = (r"(megaraid|cciss|3ware|sssraid)(,[0-9]{1,4}){1,2}"
+               r"|areca,[0-9]{1,3}(/[0-9]{1,2})?"
+               r"|aacraid(,[0-9]{1,3}){3}"
+               r"|hpt,[0-9]{1,2}/[0-9]{1,2}(/[0-9]{1,2})?"
+               r"|marvell")
+SMART_TYPE = re.compile(
+    r"(auto|ata|scsi|nvme|sat(,12|,16|,auto)?"
+    r"|nvme,0x[0-9a-f]{1,8}"
+    r"|usb[a-z0-9]{3,16}(,[a-z0-9]{1,4}){0,3}"
+    r"|snt[a-z]{3,12}(,[a-z0-9]{1,4}){0,2}"
+    r"|" + _SMART_RAID + r"|sat(,12|,16|,auto)?\+(" + _SMART_RAID + r"))")   # «sat+megaraid,3»: SAT-Übersetzung hinter einem RAID-Controller
+SMART_TYPE_DENY = re.compile(r"jmb39x|jms56x|intelliprop|force")
 SMART_TIMEOUT = 60
 
 
@@ -4692,7 +4890,7 @@ def smartctl_args(op, dev=None, dtype=None):
     """Die einzigen Befehle, die der Agent kennt. «-n standby»: schlafende Platten nicht aufwecken (Unraid)."""
     if op == "scan":
         return ["smartctl", "--scan", "--json=c"]
-    if op == "read" and isinstance(dev, str) and SMART_DEV.fullmatch(dev) and (dtype is None or (isinstance(dtype, str) and SMART_TYPE.fullmatch(dtype))):
+    if op == "read" and isinstance(dev, str) and SMART_DEV.fullmatch(dev) and (dtype is None or (isinstance(dtype, str) and SMART_TYPE.fullmatch(dtype) and not SMART_TYPE_DENY.search(dtype))):
         return ["smartctl", "--json=c", "-a", "-n", "standby"] + (["-d", dtype] if dtype else []) + [dev]
     return None
 
@@ -4728,6 +4926,8 @@ class SmartHelper:
 
     def __init__(self):
         self.sock, self.pid, self.lock = None, None, threading.Lock()
+        self.rbuf, self.pending, self.lost = b"", 0, False
+        self.timed_out = False
 
     def start(self):
         if not (hasattr(os, "fork") and hasattr(os, "geteuid") and os.geteuid() == 0):
@@ -4744,33 +4944,70 @@ class SmartHelper:
         self.sock, self.pid = parent, pid
         return True
 
+    def _readline(self, timeout):
+        """Eine Antwortzeile des Helfers; angefangene Zeilen bleiben bei einem Timeout im Puffer (Gesamtprüfung G5)."""
+        self.sock.settimeout(timeout)
+        while b"\n" not in self.rbuf:
+            c = self.sock.recv(65536)
+            if not c:
+                raise OSError("SMART-Helfer beendet")
+            self.rbuf += c
+            if len(self.rbuf) > 20_000_000:
+                raise OSError("Antwort zu gross")
+        line, _, self.rbuf = self.rbuf.partition(b"\n")
+        return line
+
+    def _lose(self):
+        """Helfer ist wirklich weg: Socket schliessen, Kindprozess abholen (kein Zombie), Zustand merken."""
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.sock, self.lost = None, True
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGTERM)       # Helfer lebt evtl. noch (z. B. «Antwort zu gross»)
+            except (ProcessLookupError, OSError):
+                pass
+            for _ in range(20):
+                try:
+                    done, _st = os.waitpid(self.pid, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    break
+                if done:
+                    break
+                time.sleep(0.1)
+
     def call(self, op, dev=None, dtype=None):
         args = smartctl_args(op, dev, dtype)
         if args is None:
             return 2, ""
         if self.sock is None:
+            if self.lost:
+                return 126, ""              # Helfer beendet: kein smartctl ohne Rechte starten, der Monitor meldet den Grund
             return run_smartctl(args)
         with self.lock:
             try:
-                self.sock.settimeout(SMART_TIMEOUT + 10)
+                while self.pending:         # verspätete Antworten früherer Anfragen (Timeout) zuerst verwerfen
+                    self._readline(SMART_TIMEOUT + 10)
+                    self.pending -= 1
                 self.sock.sendall(json.dumps({"op": op, "dev": dev, "type": dtype}).encode() + b"\n")
-                buf = b""
-                while not buf.endswith(b"\n"):
-                    c = self.sock.recv(65536)
-                    if not c:
-                        raise OSError("SMART-Helfer beendet")
-                    buf += c
-                    if len(buf) > 20_000_000:
-                        raise OSError("Antwort zu gross")
-                r = json.loads(buf)
+                self.pending += 1
+                line = self._readline(SMART_TIMEOUT + 10)
+                self.pending -= 1
+                r = json.loads(line)
+                self.timed_out = False
                 return int(r.get("rc", 2)), str(r.get("out", ""))
-            except (OSError, ValueError) as e:
+            except socket.timeout:          # Platte hängt: der Helfer bleibt, die späte Antwort wird beim nächsten Aufruf verworfen
+                print("SMART-Helfer: Zeitüberschreitung", flush=True)
+                self.timed_out = True
+                return 126, ""
+            except ValueError as e:         # kaputte Antwort: Anfrage ist verbraucht, Helfer bleibt
                 print("SMART-Helfer:", e, flush=True)
-                try:
-                    self.sock.close()
-                except OSError:
-                    pass
-                self.sock = None
+                return 126, ""
+            except OSError as e:
+                print("SMART-Helfer:", e, flush=True)
+                self._lose()
                 return 126, ""
 
 
@@ -4870,6 +5107,10 @@ class SmartMonitor:
         err = ""
         if rc == 127:
             err = "smartctl fehlt im Image"
+        elif getattr(self.helper, "lost", False):
+            err = "SMART-Helfer beendet: Container neu starten (Rechte lassen sich im Betrieb nicht erneuern)"
+        elif not devs and getattr(self.helper, "timed_out", False):
+            err = "smartctl antwortet nicht (Platte hängt?), nächster Versuch beim nächsten Durchlauf"
         elif not devs:
             err = "Keine Platten gefunden: im Compose-Block «devices» die Platten freigeben (siehe README, SMART)"
         latest = {}
@@ -4978,16 +5219,74 @@ def repo_info(kind, path, now=None):
     return {"last_success": _newest_mtime(files), "source": "kopia: Dateizeit der Index-/Metadaten-Blobs"}
 
 
+LOG_TIME_ISO_ZONE = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:[.,]\d+)?(Z|[+-]\d{2}:?\d{2})")
+HOST_LOCALTIME_FILE = os.environ.get("HOST_LOCALTIME_FILE", "/host/etc/localtime")
+LOG_FUTURE_SLACK = 300             # Uhrabweichung, die als «jetzt» gilt
+LOG_FUTURE_MAX = 15 * 3600         # darüber hinaus (grösster Zeitzonenversatz plus Reserve) ist die Zeile unbrauchbar
+_HOST_TZ = {"loaded": False, "tz": None}
+
+
+def _host_tz():
+    """Gesamtprüfung G1: Zeitzone des NAS aus dem eingebundenen /etc/localtime des Hosts (nur wenn im Container kein TZ gesetzt ist).
+    Syslog-Zeilen ohne Zone stehen in Ortszeit des NAS; ein Container in UTC würde sie sonst um Stunden verschoben lesen."""
+    if not _HOST_TZ["loaded"]:
+        _HOST_TZ["loaded"] = True
+        if not os.environ.get("TZ"):
+            try:
+                import zoneinfo
+                with open(HOST_LOCALTIME_FILE, "rb") as f:
+                    _HOST_TZ["tz"] = zoneinfo.ZoneInfo.from_file(f)
+            except Exception:                  # keine Datei, kein zoneinfo, kaputte Datei: Containerzeit
+                _HOST_TZ["tz"] = None
+    return _HOST_TZ["tz"]
+
+
+def _wall_epoch(text, fmt):
+    """Ortszeit-Text (ohne Zone) → Epoche: Zeitzone des Hosts, sonst die des Containers."""
+    st = time.strptime(text, fmt)
+    tz = _host_tz()
+    if tz is not None:
+        import datetime
+        return int(datetime.datetime(*st[:6], tzinfo=tz).timestamp())
+    return int(time.mktime(st))
+
+
+def _zone_known():
+    """True, wenn die Zeitzone des NAS bekannt ist (TZ gesetzt oder Host-localtime lesbar)."""
+    return bool(os.environ.get("TZ")) or _host_tz() is not None
+
+
+def _log_future_ok(t, now, clip=True):
+    """Zeit einer Logzeile prüfen. None = unbrauchbar (zu weit in der Zukunft). Bei bekannter Zone gilt nur die Uhr-Reserve
+    (Vorjahreszeile ohne Jahr fällt so heraus); bei unbekannter Zone darf eine frische Zeile bis 15 Stunden vorgehen.
+    clip=True kappt solche Zeilen auf «jetzt» (Anzeige); clip=False lässt die echte Zeit (Reihenfolge, z. B. Mover)."""
+    if t is None:
+        return None
+    limit = now + (LOG_FUTURE_SLACK if _zone_known() else LOG_FUTURE_MAX)
+    if t > limit:
+        return None
+    return min(t, now) if clip and t > now + LOG_FUTURE_SLACK else t
+
+
 def _log_time(line, fallback):
-    m = LOG_TIME_ISO.search(line[:40])
     try:
+        z = LOG_TIME_ISO_ZONE.search(line[:48])
+        if z:
+            base = calendar.timegm(time.strptime(f"{z.group(1)} {z.group(2)}", "%Y-%m-%d %H:%M:%S"))
+            if z.group(3) == "Z":
+                return base
+            sign = -1 if z.group(3)[0] == "-" else 1
+            digits = z.group(3)[1:].replace(":", "")
+            return base - sign * (int(digits[:2]) * 3600 + int(digits[2:]) * 60)
+        m = LOG_TIME_ISO.search(line[:40])
         if m:
-            return int(time.mktime(time.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")))
+            return _wall_epoch(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
         m = LOG_TIME_BSD.match(line)
         if m:
             year = time.localtime().tm_year
-            t = int(time.mktime(time.strptime(f"{year} {' '.join(m.group(1).split())}", "%Y %b %d %H:%M:%S")))
-            return t if t <= time.time() + 86400 else int(time.mktime(time.strptime(f"{year - 1} {' '.join(m.group(1).split())}", "%Y %b %d %H:%M:%S")))
+            md = ' '.join(m.group(1).split())
+            t = _wall_epoch(f"{year} {md}", "%Y %b %d %H:%M:%S")
+            return t if t <= time.time() + 86400 else _wall_epoch(f"{year - 1} {md}", "%Y %b %d %H:%M:%S")
     except (ValueError, OverflowError):
         pass
     return fallback
@@ -5326,8 +5625,8 @@ def collect_logs(log_dir=None, hours=24, limit=200, now=None):
                 continue
             if Today.SYSLOG_SKIP.search(line):
                 continue
-            t = _log_time(line, None)
-            if t is None or t < since or t > now + 300:
+            t = _log_future_ok(_log_time(line, None), now)
+            if t is None or t < since:
                 continue
             m = LOG_TIME_ISO.match(line)
             rest = re.sub(r"^\S*", "", line[m.end():]) if m else ""        # Sekundenbruchteile und Zeitzone weg
@@ -5382,8 +5681,8 @@ def mover_log(log_dir=None, now=None, max_age=12 * 3600):
             m = MOVER_LINE.search(line)
             if not m:
                 continue
-            t = _log_time(line, None)
-            if t is None or t > now + 300:
+            t = _log_future_ok(_log_time(line, None), now, clip=False)
+            if t is None:
                 continue
             if m.group(1).lower() == "started":
                 if started is None or t > started:      # gleiche Sekunde (doppelte Zeile in syslog und messages) setzt das Ende nicht zurück
@@ -6315,6 +6614,23 @@ def make_handler(store, sampler_now, tok, index=None, array=None, lan=None, toda
         def log_message(self, *a):
             pass
 
+        def setup(self):
+            """Ab 1.20.4: Gesamtfrist HEADER_DEADLINE für Anfragezeile und Kopfzeilen (Slowloris: der Lese-Timeout gilt sonst je Byte)."""
+            super().setup()
+            t0 = getattr(_REQ_T0, "t", None)
+            self._deadline = (t0 if t0 is not None else time.monotonic()) + HEADER_DEADLINE
+            try:
+                self.rfile.close()
+            except OSError:
+                pass
+            self.rfile = io.BufferedReader(_DeadlineRaw(self.connection, lambda: self._deadline, self.timeout))
+
+        def parse_request(self):
+            try:
+                return super().parse_request()
+            finally:
+                self._deadline = None       # Körper und Antwort: nur noch der Lese-Timeout je Vorgang
+
         @property
         def secure(self):
             """Ab 1.20.0: kam die Anfrage über TLS? (Schlüssel und Token erneuern gibt es nur dann)"""
@@ -6889,15 +7205,12 @@ def main():
     threading.Thread(target=run_backups, args=(backups, stop), daemon=True).start()
     print(f"Ab 1.15.0: SMART {'an' if SMART_ON else 'aus'}, Netz-Messung {'an' if NET_ON else 'aus'}, Log-Auszüge {'an' if LOGS_ON else 'aus'}, "
           f"Backup-Pfade {len(BACKUP_PATHS)}, Backup-Suche {'an' if BACKUP_AUTO else 'aus'}.", flush=True)
-    latest = {"v": None, "t": 0}
-
-    def now_values():
-        # Für die Live-Anzeige höchstens alle 2 Sekunden neu messen (eigener Sampler, damit die Differenzen stimmen)
-        if time.time() - latest["t"] > 2:
-            latest["v"], latest["t"] = live.sample(), time.time()
-        return latest["v"]
     live = Sampler()
-    live.sample()
+    try:
+        live.sample()
+    except Exception as e:
+        print("Erste Live-Messung fehlgeschlagen:", e, flush=True)
+    now_values = LiveNow(live).get
     print(f"NZBLab-Agent {VERSION} auf Port {PORT}. Token steht in {CONFIG}/token.txt (oder NZBLAB_AGENT_TOKEN).", flush=True)
     if not tok:
         print("Token nicht geladen: alle Abfragen mit Token antworten 503 mit dem Grund (siehe FEHLER oben).", flush=True)
@@ -6914,6 +7227,63 @@ def main():
 _PLAIN_BODY = "NZBLab-Agent: nur HTTPS (NZBLAB_HTTP=0). Bitte https://... verwenden.\n".encode("utf-8")
 PLAIN_REFUSED = (b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " + str(len(_PLAIN_BODY)).encode()
                  + b"\r\nConnection: close\r\n\r\n" + _PLAIN_BODY)
+
+
+_REQ_T0 = threading.local()
+
+
+class _DeadlineRaw(io.RawIOBase):
+    """Ab 1.20.4: Lese-Wrapper um den Socket mit Gesamtfrist: jeder Lesevorgang wartet höchstens bis zur Frist (nicht je Byte neu)."""
+
+    def __init__(self, sock, get_deadline, base_timeout):
+        self.sock, self.get_deadline, self.base = sock, get_deadline, base_timeout
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        dl = self.get_deadline()
+        t = self.base
+        if dl is not None:
+            rem = dl - time.monotonic()
+            if rem <= 0:
+                raise socket.timeout("header deadline")
+            t = min(t, rem)
+        self.sock.settimeout(t)
+        return self.sock.recv_into(b)
+
+
+def _close_quietly(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def conn_keys(ip):
+    """Zähl-Schlüssel einer Verbindung (1.20.4): Adresse, bei IPv6 dazu das /64 (Loopback ::1 nur als Adresse)."""
+    key = rate_key(ip)
+    if "/" not in key:
+        return [key]
+    if loopback_ip(ip):
+        return [str(ipaddress.ip_address(ip))]
+    try:
+        return [str(ipaddress.ip_address(ip)), key]
+    except ValueError:
+        return [key]
+
+
+def conn_limit(key):
+    """Grenze je Zähl-Schlüssel: MAX_CONN_PER_IP je Adresse, das Vierfache je IPv6-/64."""
+    return MAX_CONN_PER_IP * 4 if "/" in key else MAX_CONN_PER_IP
+
+
+def loopback_ip(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return a.is_loopback or bool(getattr(a, "ipv4_mapped", None) and a.ipv4_mapped.is_loopback)
 
 
 def make_server(bind, port, handler, tls=None, http=True):
@@ -6933,23 +7303,37 @@ def make_server(bind, port, handler, tls=None, http=True):
         daemon_threads = True
 
         def __init__(self, *a, **kw):
-            self._conns, self._conns_lock = {}, threading.Lock()
+            self._conns, self._conns_lock, self._total = {}, threading.Lock(), 0
             super().__init__(*a, **kw)
 
         def process_request(self, request, client_address):
             # Ab 1.16.1: höchstens MAX_CONN_PER_IP offene Verbindungen je Absender und MAX_CONN insgesamt (Slowloris:
             # der Lese-Timeout gilt je Lesevorgang, ein tröpfelnder Absender hielte sonst beliebig viele Fäden fest)
             ip = client_address[0]
-            with self._conns_lock:
-                if self._conns.get(ip, 0) >= MAX_CONN_PER_IP or sum(self._conns.values()) >= MAX_CONN:
-                    self.shutdown_request(request)
-                    return
-                self._conns[ip] = self._conns.get(ip, 0) + 1
+            if not self._admit(ip):
+                self.shutdown_request(request)
+                return
             try:
                 super().process_request(request, client_address)
             except BaseException:
                 self._release(ip)
                 raise
+
+        def _admit(self, ip):
+            """
+            Ab 1.20.4: höchstens MAX_CONN_PER_IP je Adresse und bei IPv6 zusätzlich 4 × MAX_CONN_PER_IP je /64 (ein Absender hat dort
+            Milliarden Adressen; ein Heimnetz teilt sich aber ein /64). Loopback (Healthcheck) gehören zusätzlich allein die letzten
+            LOOPBACK_RESERVE Plätze.
+            """
+            keys = conn_keys(ip)
+            limit = MAX_CONN if loopback_ip(ip) else MAX_CONN - LOOPBACK_RESERVE
+            with self._conns_lock:
+                if self._total >= limit or any(self._conns.get(k, 0) >= conn_limit(k) for k in keys):
+                    return False
+                for k in keys:
+                    self._conns[k] = self._conns.get(k, 0) + 1
+                self._total += 1
+                return True
 
         def _sniff(self, request):
             """Erstes Byte ansehen (ohne es zu lesen): 0x16 → TLS-Handshake, sonst Klartext (wenn erlaubt). None = Verbindung beendet."""
@@ -6985,22 +7369,43 @@ def make_server(bind, port, handler, tls=None, http=True):
         def process_request_thread(self, request, client_address):
             try:
                 if tls is not None:
-                    got = self._sniff(request)
+                    # Ab 1.20.4: auch erstes Byte und TLS-Handshake mit Gesamtfrist (der Timeout gilt sonst je Lesevorgang):
+                    # ein Wächter schliesst die Verbindung nach HEADER_DEADLINE; danach beginnt die Frist für die Kopfzeilen neu
+                    # Eigene Kopie des Sockets: wrap_socket löst das Original ab, ein shutdown darauf liefe ins Leere
+                    try:
+                        dup = request.dup()
+                    except OSError:                # Gesamtprüfung G11: keine Deskriptoren mehr, angenommenen Socket nicht offen lassen
+                        self.shutdown_request(request)
+                        return
+                    guard = threading.Timer(HEADER_DEADLINE, lambda: _close_quietly(dup))
+                    guard.daemon = True
+                    guard.start()
+                    try:
+                        got = self._sniff(request)
+                    finally:
+                        guard.cancel()
+                        dup.close()
                     if got is None:
                         self.shutdown_request(request)
                         return
                     request = got
+                _REQ_T0.t = time.monotonic()
                 super().process_request_thread(request, client_address)
             finally:
                 self._release(client_address[0])
 
         def _release(self, ip):
             with self._conns_lock:
-                n = self._conns.get(ip, 0) - 1
-                if n > 0:
-                    self._conns[ip] = n
-                else:
-                    self._conns.pop(ip, None)
+                self._total = max(0, self._total - 1)
+                for k in conn_keys(ip):
+                    self._release_key(k)
+
+        def _release_key(self, key):
+            n = self._conns.get(key, 0) - 1
+            if n > 0:
+                self._conns[key] = n
+            else:
+                self._conns.pop(key, None)
     return Server((bind, port), handler)
 
 

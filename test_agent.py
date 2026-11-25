@@ -1,8 +1,11 @@
 """Tests für den NZBLab-Agenten mit nachgebautem /sys und /proc (kein echtes NAS nötig)."""
+import calendar
 import contextlib
 import io
 import json
 import os
+import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -16,6 +19,22 @@ import unittest.mock
 from unittest.mock import patch
 
 a.KEYS_REQUIRE_TLS = False      # die alten Tests sprechen Klartext; die TLS-Tests von 1.20.0 schalten es mit patch.object wieder an
+SHIPPED_PRICE_ALLOWED = {k: v["allowed"] for k, v in a.PRICE_SOURCES.items()}   # Auslieferungs-Stand, vor dem Umschalten für die Tests
+for _src in ("toppreise", "geizhals"):   # die Preis-Tests prüfen die Abfrage-Logik mit erlaubten Quellen (keine Netz-Anfragen)
+    a.PRICE_SOURCES[_src]["allowed"] = True
+
+
+class PriceSourcesShippedTest(unittest.TestCase):
+    def test_toppreise_und_geizhals_sind_ohne_erlaubnis_aus(self):
+        """Ohne schriftliche Erlaubnis keine Abfrage: erst mit Zusage wieder einschalten (dann «terms» anpassen)."""
+        self.assertFalse(SHIPPED_PRICE_ALLOWED["toppreise"])
+        self.assertFalse(SHIPPED_PRICE_ALLOWED["geizhals"])
+
+
+def wfile(path, mode, data):
+    """Datei schreiben und sofort schliessen (keine ResourceWarning in den Tests)."""
+    with open(path, mode) as f:
+        f.write(data)
 
 
 def write(path, text):
@@ -106,6 +125,8 @@ class AgentTest(unittest.TestCase):
         store.add({"t": int(time.time()), "cpu": 5.0})
         srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(store, lambda: {"cpu": 1.0}, "geheim"))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         self.assertTrue(json.load(urllib.request.urlopen(base + "/api/ping"))["ok"])
         with self.assertRaises(urllib.error.HTTPError) as e:
@@ -133,7 +154,7 @@ class AgentTest(unittest.TestCase):
                 urllib.request.urlopen(urllib.request.Request(base + path, headers={"Authorization": "Bearer falsch"}))
             self.assertEqual(e.exception.code, 401, path)
         info = json.load(urllib.request.urlopen(urllib.request.Request(base + "/api/info", headers={"Authorization": "Bearer geheim"})))
-        self.assertEqual(info["version"], "1.20.2")
+        self.assertEqual(info["version"], "1.20.4")
         srv.shutdown()
 
 
@@ -164,6 +185,8 @@ class HelloTest(unittest.TestCase):
     def test_hello_endpunkt(self):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(a.Store(":memory:"), lambda: {}, "geheim"))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
             nonce = "0123456789abcdef0123456789abcdef"
@@ -221,9 +244,9 @@ class FileIndexTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cfg:
             for d in ["Media/Serien/One Piece (1999)", "Media/Filme/Tenzing (2026)", "appdata/plex"]:
                 os.makedirs(os.path.join(root, d))
-            open(os.path.join(root, "Media/Serien/One Piece (1999)/One Piece - S01E1023.mkv"), "wb").write(b"x" * 10)
-            open(os.path.join(root, "Media/Filme/Tenzing (2026)/Tenzing.mkv"), "wb").write(b"x")
-            open(os.path.join(root, "appdata/plex/geheim.db"), "wb").write(b"x")
+            wfile(os.path.join(root, "Media/Serien/One Piece (1999)/One Piece - S01E1023.mkv"), "wb", b"x" * 10)
+            wfile(os.path.join(root, "Media/Filme/Tenzing (2026)/Tenzing.mkv"), "wb", b"x")
+            wfile(os.path.join(root, "appdata/plex/geheim.db"), "wb", b"x")
             ix = a.FileIndex(os.path.join(cfg, "files.db"), root=root, exclude={"appdata"})
             ix.build()
             st = ix.status()
@@ -241,10 +264,10 @@ class FileIndexTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cfg:
             os.makedirs(os.path.join(root, "Media/Downloads/alt_film"))
             os.makedirs(os.path.join(root, "Media/_Papierkorb"))
-            old = os.path.join(root, "Media/Downloads/alt_film/a.mkv"); open(old, "wb").write(b"x" * 100)
+            old = os.path.join(root, "Media/Downloads/alt_film/a.mkv"); wfile(old, "wb", b"x" * 100)
             os.utime(old, (time.time() - 40 * 86400, time.time() - 40 * 86400))
-            open(os.path.join(root, "Media/Downloads/neu.mkv"), "wb").write(b"x" * 5)
-            open(os.path.join(root, "Media/_Papierkorb/weg.mkv"), "wb").write(b"x" * 7)
+            wfile(os.path.join(root, "Media/Downloads/neu.mkv"), "wb", b"x" * 5)
+            wfile(os.path.join(root, "Media/_Papierkorb/weg.mkv"), "wb", b"x" * 7)
             ix = a.FileIndex(os.path.join(cfg, "files.db"), root=root, exclude=set())
             ix.build()
             c = {x["path"]: x for x in ix.cleanup(30)}
@@ -256,7 +279,7 @@ class FileIndexTest(unittest.TestCase):
 class ArrayNetTest(unittest.TestCase):
     def md(self, d, state="STARTED", status="DISK_OK", errors=0):
         os.makedirs(d, exist_ok=True)
-        open(os.path.join(d, "mdstat"), "w").write(
+        wfile(os.path.join(d, "mdstat"), "w", 
             f"mdState={state}\nmdResync=0\ndiskName.1=md1p1\nrdevName.1=sdc\nrdevStatus.1={status}\nrdevNumErrors.1={errors}\n"
             "diskName.0=\nrdevName.0=\nrdevStatus.0=DISK_NP_DSBL\nrdevNumErrors.0=0\n")
 
@@ -281,7 +304,7 @@ class ArrayNetTest(unittest.TestCase):
             proc, sysd = os.path.join(root, "proc"), os.path.join(root, "sys")
             os.makedirs(os.path.join(proc, "1/net")); os.makedirs(sysd)
             def dev(rx, tx):
-                open(os.path.join(proc, "1/net/dev"), "w").write("h1\nh2\n    lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n"
+                wfile(os.path.join(proc, "1/net/dev"), "w", "h1\nh2\n    lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n"
                     f"  eth0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n docker0: 9 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0\n")
             smp = a.Sampler(sysd, proc)
             dev(1000, 500); smp.net(100.0)
@@ -299,7 +322,7 @@ class ArrayNetTest(unittest.TestCase):
             os.symlink(os.path.join(sysd, "class/net/bond0"), os.path.join(sysd, "class/net/eth0/master"))
             os.symlink(os.path.join(sysd, "class/net/br0"), os.path.join(sysd, "class/net/bond0/master"))
             def dev(rx, tx):
-                open(os.path.join(proc, "1/net/dev"), "w").write("h1\nh2\n    lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n"
+                wfile(os.path.join(proc, "1/net/dev"), "w", "h1\nh2\n    lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n"
                     f"  eth0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n bond0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n"
                     f"   br0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n  eth1: {rx * 2} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n")
             smp = a.Sampler(sysd, proc)
@@ -492,6 +515,8 @@ class MoverUndAbstuerzeTest(unittest.TestCase):
         crashes = a.CrashStore(tempfile.mkdtemp())
         srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(a.Store(":memory:"), lambda: {}, "geheim", crashes=crashes))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         body = json.dumps({"version": "2.18.14", "screen": "dashboard", "kind": "crash", "trace": "java.lang.IllegalStateException"}).encode()
         # Ohne Token: abgelehnt
@@ -532,22 +557,24 @@ class MoverUndAbstuerzeTest(unittest.TestCase):
         d = tempfile.mkdtemp()
         os.makedirs(f"{d}/Medien"); os.makedirs(f"{d}/daten/nzblab-prices")
         write(f"{d}/daten/nzblab-prices/prices.json", "{}")
-        old = (a.PRICES_FILE, a.FILES_ROOT, dict(a._PRICES_FOUND))
+        old = (a.PRICES_FILE, a.FILES_ROOT, dict(a._PRICES_FOUND), a.CONFIG)
+        os.environ["NZBLAB_PRICES_SCAN_SHARES"] = "1"      # ab 1.20.4 sucht der Agent nur mit dieser Einstellung in Freigaben
         try:
-            a.PRICES_FILE, a.FILES_ROOT = "", d
+            a.PRICES_FILE, a.FILES_ROOT, a.CONFIG = "", d, tempfile.mkdtemp()
             a._PRICES_FOUND.update(path="", checked=None)
             self.assertEqual(a.prices_path(now=1000), f"{d}/daten/nzblab-prices/prices.json")
             a.PRICES_FILE = "/x/prices.json"
             self.assertEqual(a.prices_path(), "/x/prices.json")
-            # nichts da: Rückfall auf <FILES_ROOT>/nzblab-prices/prices.json, neue Suche erst nach 6 Stunden
+            # nichts da: Rückfall auf <CONFIG>/prices.json, neue Suche erst nach 6 Stunden
             a.PRICES_FILE, a.FILES_ROOT = "", tempfile.mkdtemp()
             a._PRICES_FOUND.update(path="", checked=None)
-            self.assertEqual(a.prices_path(now=1000), f"{a.FILES_ROOT}/nzblab-prices/prices.json")
+            self.assertEqual(a.prices_path(now=1000), f"{a.CONFIG}/prices.json")
             os.makedirs(f"{a.FILES_ROOT}/s/nzblab-prices"); write(f"{a.FILES_ROOT}/s/nzblab-prices/prices.json", "{}")
-            self.assertEqual(a.prices_path(now=2000), f"{a.FILES_ROOT}/nzblab-prices/prices.json")
+            self.assertEqual(a.prices_path(now=2000), f"{a.CONFIG}/prices.json")
             self.assertEqual(a.prices_path(now=1000 + 6 * 3600), f"{a.FILES_ROOT}/s/nzblab-prices/prices.json")
         finally:
-            a.PRICES_FILE, a.FILES_ROOT = old[0], old[1]
+            os.environ.pop("NZBLAB_PRICES_SCAN_SHARES", None)
+            a.PRICES_FILE, a.FILES_ROOT, a.CONFIG = old[0], old[1], old[3]
             a._PRICES_FOUND.clear(); a._PRICES_FOUND.update(old[2])
 
 
@@ -761,6 +788,8 @@ class AppdataSizesTest(unittest.TestCase):
                 store = a.Store(os.path.join(d, "s.db"))
                 srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(store, lambda: {}, "tok"))
                 threading.Thread(target=srv.serve_forever, daemon=True).start()
+                self.addCleanup(srv.server_close)
+                self.addCleanup(srv.shutdown)
                 req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/appdata", headers={"Authorization": "Bearer tok"})
                 body = json.loads(urllib.request.urlopen(req, timeout=5).read())
                 srv.shutdown()
@@ -939,10 +968,12 @@ class PriceFetchTest(unittest.TestCase):
         # Datei ohne source_id (vor P1): Amazon.de als Ersatz bei DE erkennt man am Shop
         self.assertTrue(a.AMAZON_HOST.search("www.amazon.de"))
         calls, s = self.run_country("DE", {"geizhals.de/robots.txt": (200, "robots_geizhals.txt"), "diskprices.com/?locale=de": (200, "diskprices_us.html")})
-        path = a.own_prices_path("DE"); d = json.load(open(path))
+        path = a.own_prices_path("DE"); d = None
+        with open(path) as f:
+            d = json.load(f)
         for q in d["queries"].values():
             if q.get("best"): q["best"].pop("source_id", None); q["best"].pop("source", None)
-        json.dump(d, open(path, "w"))
+        wfile(path, "w", json.dumps(d))
         a.save_settings({"price_alerts": {"hdd28": 1000}})
         x = {y["key"]: y for y in a.price_summary()["sizes"]}["hdd28"]
         self.assertTrue(x["no_alert"]); self.assertFalse(x["cheap"])
@@ -986,6 +1017,8 @@ class PriceFetchTest(unittest.TestCase):
         store = a.Store(f"{self.d}/h.db")
         srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(store, lambda: {}, "geheim"))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         base = f"http://127.0.0.1:{srv.server_address[1]}"
 
         def post(body):
@@ -1924,6 +1957,8 @@ class LinuxHostTest(unittest.TestCase):
         store = a.Store(":memory:")
         srv = ThreadingHTTPServer(("127.0.0.1", 0), a.make_handler(store, lambda: {"cpu": 1.0}, "geheim"))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
             for path in ("/api/host", "/api/filesystems"):
@@ -3622,7 +3657,7 @@ class Agent118Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as proc:
             w = a.ArrayWatch(lambda t, x, calm=False: sent.append(("ruhig " if calm else "") + t), proc=proc)
             def md(state="STARTED", status="DISK_OK", errors=0):
-                open(os.path.join(proc, "mdstat"), "w").write(
+                wfile(os.path.join(proc, "mdstat"), "w", 
                     f"mdState={state}\nmdResync=0\ndiskName.1=md1p1\nrdevName.1=sdc\nrdevStatus.1={status}\nrdevNumErrors.1={errors}\n")
             md(); w.check()
             md(errors=2); w.check()
@@ -4379,6 +4414,27 @@ class Agent120Test(unittest.TestCase):
             self.assertEqual(a.healthcheck(), 1)
 
 
+    def test_tls_handshake_mit_gesamtfrist(self):
+        """1.20.4: ein tröpfelnder TLS-Handshake hält keinen Platz länger als HEADER_DEADLINE."""
+        import socket as sk
+        port = self.start()
+        old = a.HEADER_DEADLINE
+        a.HEADER_DEADLINE = 1.0
+        try:
+            c = sk.create_connection(("127.0.0.1", port), timeout=8)
+            t0 = time.monotonic()
+            dropped = False
+            c.sendall(b"\x16\x03")                # Handshake begonnen, dann nichts mehr (Server wartet auf den Rest)
+            try:
+                dropped = c.recv(100) == b""
+            except OSError:
+                dropped = True
+            self.assertTrue(dropped)
+            self.assertLess(time.monotonic() - t0, 5)
+            c.close()
+        finally:
+            a.HEADER_DEADLINE = old
+
 class Agent1202Test(unittest.TestCase):
     """1.20.2: Schlüssel-Marker und Hinweis, feste 500-Texte, Zahlenfelder, drivetemp, Verlauf, Heimnetz, zvols, Preise, Index, Hostname."""
 
@@ -4454,17 +4510,19 @@ class Agent1202Test(unittest.TestCase):
         self.assertEqual(self.post_json(port, "/api/config", {"price_watch": [{"series": ids["id"], "tb": True}]})[0], 400)
         self.assertEqual(self.post_json(port, "/api/config", {"price_country": "CH", "price_country_if_unset": "ja"})[0], 400)
 
-    # --- ntfy ohne Weiterleitung (G14)
-    def test_ntfy_folgt_keiner_weiterleitung(self):
+    # --- ntfy: höchstens eine Weiterleitung auf denselben Host (G14, ab 1.20.3)
+    def test_ntfy_weiterleitung_nur_gleicher_host_und_einmal(self):
         import http.server
         hits = []
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
-                hits.append(self.path)
-                if self.path == "/a":
+                n = int(self.headers.get("Content-Length") or 0)
+                hits.append((self.path, self.rfile.read(n), self.headers.get("Title")))
+                target = {"/a": "/b", "/c": "/d", "/d": "/e", "/h": "http://localhost:%d/x" % srv.server_port}.get(self.path)
+                if target:
                     self.send_response(307)
-                    self.send_header("Location", "/b")
+                    self.send_header("Location", target)
                     self.end_headers()
                 else:
                     self.send_response(200)
@@ -4476,12 +4534,53 @@ class Agent1202Test(unittest.TestCase):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
-        self.assertTrue(any(isinstance(h, a._NoRedirect) for h in a.NTFY_OPENER.handlers))
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), a._NoRedirect())
-        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/a", data=b"x", method="POST")
-        with self.assertRaises(urllib.error.HTTPError):
-            opener.open(req, timeout=5)
-        self.assertEqual(hits, ["/a"])
+        self.assertTrue(any(isinstance(h, a._NtfyRedirect) for h in a.NTFY_OPENER.handlers))
+        base = f"http://127.0.0.1:{srv.server_port}"
+        import io, contextlib
+        for path, ok in (("/a", True), ("/c", False), ("/h", False)):
+            hits.clear()
+            buf = io.StringIO()
+            with patch.object(a, "ntfy_url", lambda path=path: base + path), contextlib.redirect_stdout(buf):
+                self.assertEqual(a.ntfy("T", "text"), ok, path)
+            if ok:
+                self.assertEqual([h[0] for h in hits], ["/a", "/b"])
+                self.assertEqual(hits[1][1:], (b"text", "T"))        # Inhalt und Titel kommen an
+            else:
+                self.assertEqual(len(hits), 2 if path == "/c" else 1)   # /c: eine Weiterleitung gefolgt, die zweite abgelehnt
+            self.assertNotIn(path.strip("/") + "/", buf.getvalue())
+            self.assertNotIn(str(srv.server_port), buf.getvalue())     # nie eine Adresse im Log
+            if not ok:
+                self.assertIn("Weiterleitung abgelehnt", buf.getvalue())
+
+    def test_ntfy_weiterleitung_regeln(self):
+        r = a._NtfyRedirect._reason
+        self.assertEqual(r("http://nas:8080/t", "https://nas/t", 0), "")             # http -> https, gleicher Host
+        self.assertEqual(r("https://nas/t", "https://nas/t2", 0), "")                # gleiches Schema, gleicher Host
+        self.assertEqual(r("http://nas/t", "http://nas/t2", 0), "")
+        self.assertEqual(r("http://nas/t", "https://nas:8443/t", 0), "anderer Port")
+        self.assertEqual(r("http://nas:80/t", "http://nas/t2", 0), "")               # Standardport gleich
+        self.assertEqual(r("https://nas:443/t", "https://nas/t2", 0), "")
+        self.assertEqual(r("http://nas/t", "http://nas:80/t2", 0), "")
+        self.assertEqual(r("https://nas/t", "https://nas:8443/t", 0), "anderer Port")
+        self.assertEqual(r("http://nas/t", "http://nas:8080/t", 0), "anderer Port")
+        self.assertEqual(r("http://nas:8080/t", "https://nas:443/t", 0), "")          # Proxy-Umleitung auf https
+        self.assertEqual(r("https://nas/t", "http://nas/t", 0), "Rückstufung auf http")
+        self.assertEqual(r("https://nas/t", "https://evil.example/t", 0), "anderer Host")
+        self.assertEqual(r("https://nas/t", "https://nas.evil.example/t", 0), "anderer Host")
+        self.assertEqual(r("https://nas/t", "https://u:p@nas/t", 0), "ungültiges Ziel")
+        self.assertEqual(r("https://nas/t", "file:///etc/passwd", 0), "ungültiges Ziel")
+        self.assertEqual(r("https://nas/t", "https://nas/t2", 1), "zweite Weiterleitung")
+
+    def test_ntfy_303_wird_nicht_erneut_gesendet(self):
+        h = a._NtfyRedirect()
+        req = urllib.request.Request("http://nas/t", data=b"x", method="POST")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertIsNone(h.redirect_request(req, None, 303, "See Other", {}, "http://nas/t2"))
+            self.assertIsNotNone(h.redirect_request(req, None, 307, "Temporary", {}, "http://nas/t2"))
+        self.assertIn("Weiterleitung abgelehnt (303", buf.getvalue())
+        self.assertNotIn("nas", buf.getvalue())
 
     # --- drivetemp (A27)
     def test_drivetemp_nicht_in_temps_und_limits(self):
@@ -4510,6 +4609,20 @@ class Agent1202Test(unittest.TestCase):
             write(f"{proc}/diskstats", line("sda", 11) + line("nvme0n1", 10))
             self.assertEqual(a.disk_temps(sysd, proc=proc), {"sda": 35, "nvme0n1": 41})
             self.assertEqual(a.disk_temp_cached(sysd, "sda"), 35)
+            now = time.time()
+            self.assertEqual(a.disk_temp_cached(sysd, "sda", now + 29 * 60), 35)         # jünger als 30 Minuten: gilt
+            self.assertIsNone(a.disk_temp_cached(sysd, "sda", now + 31 * 60))            # älter: keine Zahl, kein Lesen
+            self.assertEqual(a.disk_temp_cached(sysd, "nvme0n1", now + 99 * 3600), 41)   # NVMe immer frisch
+
+    def test_plattentemperatur_erster_aufruf_liest_und_merkt_sich_die_zeit(self):
+        sysd = f"{self.cfg}/sys3"
+        write(f"{sysd}/block/sdb/device/hwmon/hwmon3/temp1_input", "40000")
+        with patch.dict(a._LAST_DISK_TEMP, clear=True):
+            self.assertEqual(a.disk_temp_cached(sysd, "sdb", 1000.0), 40)
+            self.assertEqual(a._LAST_DISK_TEMP[(sysd, "sdb")], (40, 1000.0))
+            os.unlink(f"{sysd}/block/sdb/device/hwmon/hwmon3/temp1_input")
+            self.assertEqual(a.disk_temp_cached(sysd, "sdb", 1000.0 + 600), 40)          # aus dem Merker
+            self.assertIsNone(a.disk_temp_cached(sysd, "sdb", 1000.0 + 1801))
 
     # --- Verlauf (A11)
     def test_verlauf_ueber_48h_verdichtet(self):
@@ -4623,6 +4736,52 @@ class Agent1202Test(unittest.TestCase):
         self.assertEqual(len(ix.search("f1")), len(ix.search("f1")))
         self.assertTrue(ix.search("f10"))                  # alter Index bleibt durchsuchbar
 
+    def _index_mit(self, n_old):
+        root = tempfile.mkdtemp()
+        os.makedirs(f"{root}/Media")
+        for i in range(n_old):
+            write(f"{root}/Media/f{i}.mkv", "x")
+        ix = a.FileIndex(os.path.join(tempfile.mkdtemp(), "idx.db"), root=root, exclude=set())
+        ix.build()
+        return root, ix
+
+    def _schrumpfe(self, root, n):
+        for f in os.listdir(f"{root}/Media"):
+            os.unlink(f"{root}/Media/{f}")
+        for i in range(n):
+            write(f"{root}/Media/g{i}.mkv", "x")
+
+    def test_index_kleiner_lauf_gilt_erst_beim_dritten_gleichen(self):
+        root, ix = self._index_mit(200)
+        self._schrumpfe(root, 10)
+        ix.build()
+        self.assertTrue(ix.status()["error"]); self.assertEqual(ix.status()["files"], 200)
+        ix.build()                                          # 2. gleichartig kleiner Lauf: alter Index bleibt
+        self.assertTrue(ix.status()["error"]); self.assertTrue(ix.search("f10"))
+        ix.build()                                          # 3.: gilt
+        self.assertFalse(ix.status()["error"]); self.assertEqual(ix.status()["files"], 10)
+        self.assertTrue(ix.search("g1")); self.assertFalse(ix.search("f10"))
+
+    def test_index_kleiner_lauf_zaehler_faengt_neu_an_bei_abweichung_oder_normalem_lauf(self):
+        root, ix = self._index_mit(200)
+        self._schrumpfe(root, 10); ix.build(); ix.build()   # Zaehler 2
+        self._schrumpfe(root, 15); ix.build()               # weicht um mehr als 10 % ab: Zaehler wieder 1
+        self.assertTrue(ix.status()["error"]); self.assertEqual(ix.status()["files"], 200)
+        self._schrumpfe(root, 150); ix.build()              # normaler Lauf (nicht unter 10 %): gilt sofort, Zaehler weg
+        self.assertFalse(ix.status()["error"]); self.assertEqual(ix.status()["files"], 150)
+        self._schrumpfe(root, 5); ix.build()                # wieder 1. kleiner Lauf nach neuem Index
+        self.assertTrue(ix.status()["error"]); self.assertEqual(ix.status()["files"], 150)
+
+    def test_index_lauf_mit_null_dateien_ersetzt_nie_und_zaehlt_nicht(self):
+        root, ix = self._index_mit(200)
+        self._schrumpfe(root, 0)
+        for _ in range(3):                                  # drei leere Läufe in Folge: alter Index bleibt
+            ix.build()
+            self.assertTrue(ix.status()["error"]); self.assertEqual(ix.status()["files"], 200)
+            self.assertTrue(ix.search("f10"))
+        self._schrumpfe(root, 10); ix.build()               # erster kleiner Lauf mit Dateien: Folge fängt bei 1 an
+        self.assertTrue(ix.status()["error"]); self.assertEqual(ix.status()["files"], 200)
+
     def test_cache_freigaben_im_hintergrund(self):
         root = tempfile.mkdtemp()
         write(f"{root}/share1/a.bin", "x" * 10)
@@ -4661,6 +4820,499 @@ class Agent1202Test(unittest.TestCase):
             write(f"{root}/{sub}/sabnzbd/admin/history1.db", "x")
             t = a.Today(a.Store(":memory:"), files_root=root)
             self.assertTrue((t.sab_db() or "").endswith("history1.db"), sub)
+
+
+class Agent1203Test(unittest.TestCase):
+    """1.20.3 (Audit run-3): SMART-Typen nur lesend, Preisdatei bereinigt."""
+
+    def test_smart_typen_nur_lesend(self):
+        for ok in ("auto", "ata", "scsi", "nvme", "sat", "sat,12", "sat,16", "sat,auto", "usbjmicron", "usbjmicron,x,0", "usbcypress",
+                   "usbprolific", "usbsunplus", "usbasm1352r,1", "megaraid,3", "cciss,1", "areca,2", "areca,2/3", "3ware,0",
+                   "aacraid,0,0,1", "hpt,1/2", "hpt,1/2/3", "sssraid,0,1", "sntjmicron", "sntrealtek", "nvme,0x1",
+                   "sat+megaraid,3", "sat,12+megaraid,3,1", "sat+cciss,1", "sat+areca,2", "sat+3ware,0", "marvell", "sat+marvell"):
+            self.assertIsNotNone(a.smartctl_args("read", "/dev/sda", ok), ok)
+        for bad in ("jmb39x", "jmb39x,0", "jmb39x,0,force", "jms56x,0,force", "jms56x", "intelliprop,0", "sat,force", "scsi,force",
+                    "megaraid,3,force", "usbjmicron,force", "test", "", "-d", "sat+jmb39x", "sat+jms56x,0", "sat+intelliprop,0", "sat+megaraid,3,force",
+                    "sat+force", "sat+", "sat+sat", "sat+test", "marvell,force", "marvell;x", "sat+megaraid", "sat;x", "SAT", "usbjmb39x", "x" * 40):
+            self.assertIsNone(a.smartctl_args("read", "/dev/sda", bad), bad)
+
+    def _prices(self, obj, country=""):
+        d = tempfile.mkdtemp()
+        write(f"{d}/prices.json", json.dumps(obj))
+        old = a.PRICES_FILE, a.CONFIG
+        a.PRICES_FILE, a.CONFIG = f"{d}/prices.json", d
+        try:
+            if country:
+                a.save_settings({"price_country": country})
+            return a.price_summary()
+        finally:
+            a.PRICES_FILE, a.CONFIG = old
+
+    def test_preisdatei_links_nur_https(self):
+        q = {"hdd8": {"label": "8 TB", "tb": 8, "history": [], "best": {"name": "X", "chf": 100.0, "link": "javascript:alert(1)"},
+                      "models_now": [{"model": "m", "chf": 90.0, "link": "http://evil.example/x"}]}}
+        d = a.sanitize_tool_prices({"updated": time.time(), "queries": q})
+        self.assertEqual(d["queries"]["hdd8"]["best"]["link"], "")
+        self.assertEqual(d["queries"]["hdd8"]["models_now"][0]["link"], "")
+        q["hdd8"]["best"]["link"] = "https://shop.example/ok"
+        d = a.sanitize_tool_prices({"updated": time.time(), "queries": q})
+        self.assertEqual(d["queries"]["hdd8"]["best"]["link"], "https://shop.example/ok")
+
+    def test_preisdatei_updated_nie_in_der_zukunft(self):
+        now = time.time()
+        self.assertEqual(a.sanitize_tool_prices({"updated": now + 10 * 86400, "queries": {}}, now)["updated"], 0)
+        self.assertLessEqual(a.sanitize_tool_prices({"updated": now + 60, "queries": {}}, now)["updated"], now)
+        self.assertEqual(a.sanitize_tool_prices({"updated": "x", "queries": {}}, now)["updated"], 0)
+
+    def test_preisdatei_frische_fuer_jedes_land_und_kaputtes_wird_ignoriert(self):
+        d = tempfile.mkdtemp()
+        write(f"{d}/prices.json", json.dumps({"updated": 9999999999, "queries": {"hdd8": {"label": "8", "tb": 8, "history": [], "best": {"name": "X", "chf": 1.0}}}}))
+        old = a.PRICES_FILE
+        a.PRICES_FILE = f"{d}/prices.json"
+        try:
+            self.assertIsNone(a.tool_prices_fresh())          # weit in der Zukunft: ungültig
+            write(f"{d}/prices.json", json.dumps({"updated": 1, "queries": {}}))
+            self.assertIsNone(a.tool_prices_fresh())          # alt
+            for bad in ([1, 2], {"queries": []}, {"updated": time.time(), "queries": {"a": 5, "b": {"history": "x", "best": 7, "models_now": 3}}}):
+                write(f"{d}/prices.json", json.dumps(bad))
+                a.tool_prices_fresh()                         # wirft nicht
+            write(f"{d}/prices.json", json.dumps({"updated": time.time(), "queries": {"b": {"history": [{"d": 1, "chf": "x"}, {"d": "2026-01-01", "chf": 5}], "best": {"chf": "x"}}}}))
+            q = a.tool_prices_fresh()["queries"]["b"]
+            self.assertEqual(q["history"], [{"d": "2026-01-01", "chf": 5}]); self.assertNotIn("best", q)
+        finally:
+            a.PRICES_FILE = old
+
+    def test_preisdatei_alter_36_stunden(self):
+        d = tempfile.mkdtemp()
+        old = a.PRICES_FILE
+        a.PRICES_FILE = f"{d}/prices.json"
+        try:
+            write(f"{d}/prices.json", json.dumps({"updated": time.time() - 3 * 86400, "queries": {}}))
+            self.assertIsNone(a.tool_prices_fresh())          # 3 Tage: zu alt
+            write(f"{d}/prices.json", json.dumps({"updated": time.time() - 3600, "queries": {}}))
+            self.assertIsNotNone(a.tool_prices_fresh())
+            write(f"{d}/prices.json", json.dumps({"updated": time.time() - 40 * 3600, "queries": {}}))
+            self.assertIsNone(a.tool_prices_fresh())          # 40 Std.: zu alt
+        finally:
+            a.PRICES_FILE = old
+
+    def test_clean_links_verwirft_zu_tiefe_verschachtelung(self):
+        deep = cur = {}
+        for _ in range(12):
+            cur["x"] = {}
+            cur = cur["x"]
+        cur["link"] = "http://evil.example/x"
+        out = a._clean_links({"best": deep, "ok": 1, "l": [1, deep, {"link": "http://e.example"}]})
+        n, depth = out["best"], 0
+        while isinstance(n, dict) and "x" in n:
+            n, depth = n["x"], depth + 1
+        self.assertEqual(n, {})                                # tiefster Schlüssel «x» fehlt im Eltern-Objekt, kein None
+        self.assertNotIn("null", json.dumps(out))
+        self.assertLess(depth, 12)
+        self.assertEqual(out["ok"], 1)
+        self.assertEqual(out["l"][0], 1); self.assertEqual(out["l"][2], {"link": ""})
+        self.assertNotIn("evil.example", json.dumps(out))
+
+
+class Agent1204Test(unittest.TestCase):
+    """1.20.4 (Audit run-4 N4): Verbindungsplätze je Absender, Kopfzeilen-Frist, Preisdatei nur aus festem Ort."""
+
+    def _srv(self):
+        s = a.make_server("127.0.0.1", 0, a.make_handler(a.Store(":memory:"), lambda: {}, "geheim"))
+        self.addCleanup(s.server_close)
+        return s
+
+    def test_kopfzeilen_frist_gesamt_nicht_je_byte(self):
+        import socket as sk
+        s = self._srv()
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        self.addCleanup(s.shutdown)
+        old = a.HEADER_DEADLINE
+        a.HEADER_DEADLINE = 1.0
+        try:
+            c = sk.create_connection(("127.0.0.1", s.server_address[1]), timeout=8)
+            t0 = time.monotonic()
+            dropped = False
+            try:
+                for ch in b"GET /health HTTP/1.1\r\nX-A: ":
+                    c.sendall(bytes([ch]))
+                    time.sleep(0.2)          # jedes Byte schneller als der Lese-Timeout, zusammen länger als die Frist
+                for _ in range(40):
+                    c.sendall(b"a"); time.sleep(0.2)
+            except OSError:
+                dropped = True
+            if not dropped:
+                dropped = c.recv(100) == b""
+            self.assertTrue(dropped)
+            self.assertLess(time.monotonic() - t0, 5)
+            c.close()
+            # normale Anfrage geht weiter durch
+            code = urllib.request.urlopen(f"http://127.0.0.1:{s.server_address[1]}/api/ping", timeout=5).status
+            self.assertEqual(code, 200)
+        finally:
+            a.HEADER_DEADLINE = old
+
+    def test_plaetze_je_ipv6_64_gezaehlt(self):
+        s = self._srv()
+        old = a.MAX_CONN_PER_IP
+        a.MAX_CONN_PER_IP = 4
+        try:
+            # je Adresse höchstens 4, je /64 höchstens 16 (Heimnetz teilt sich ein /64)
+            for i in range(4):
+                self.assertTrue(s._admit("2001:db8:1:2::1"))
+            self.assertFalse(s._admit("2001:db8:1:2::1"))
+            for i in range(12):
+                self.assertTrue(s._admit(f"2001:db8:1:2::{i + 2}"))      # andere Geräte im selben /64
+            self.assertFalse(s._admit("2001:db8:1:2:ffff::9"))          # /64 voll
+            self.assertTrue(s._admit("2001:db8:1:3::1"))               # anderes /64
+            self.assertEqual(s._conns["2001:db8:1:2::/64"], 16)
+            s._release("2001:db8:1:2::1")
+            self.assertEqual(s._conns["2001:db8:1:2::/64"], 15)
+            self.assertEqual(s._conns["2001:db8:1:2::1"], 3)
+            self.assertTrue(s._admit("2001:db8:1:2::77"))
+            # IPv4: nur je Adresse
+            self.assertEqual(a.conn_keys("192.168.1.5"), ["192.168.1.5"]); self.assertEqual(a.conn_keys("::ffff:192.168.1.5"), ["192.168.1.5"])
+        finally:
+            a.MAX_CONN_PER_IP = old
+
+    def test_acht_plaetze_fuer_loopback(self):
+        s = self._srv()
+        old = a.MAX_CONN, a.MAX_CONN_PER_IP
+        a.MAX_CONN, a.MAX_CONN_PER_IP = 16, 1000
+        try:
+            n = 0
+            while s._admit(f"10.{n // 250}.{n % 250}.1"):
+                n += 1
+            self.assertEqual(n, 16 - a.LOOPBACK_RESERVE)
+            self.assertFalse(s._admit("10.9.9.9"))
+            for _ in range(8):
+                self.assertTrue(s._admit("127.0.0.1"))
+            self.assertFalse(s._admit("127.0.0.1"))            # alles voll
+            self.assertEqual(a.conn_keys("127.0.0.1"), ["127.0.0.1"]); self.assertEqual(a.conn_keys("::1"), ["::1"])
+            s._release("127.0.0.1")
+            self.assertTrue(s._admit("::1"))
+            self.assertTrue(a.loopback_ip("::ffff:127.0.0.1")); self.assertFalse(a.loopback_ip("192.168.1.2"))
+        finally:
+            a.MAX_CONN, a.MAX_CONN_PER_IP = old
+
+    def test_preisdatei_fester_ort_ohne_freigaben_suche(self):
+        d, cfg = tempfile.mkdtemp(), tempfile.mkdtemp()
+        os.makedirs(f"{d}/s/nzblab-prices"); write(f"{d}/s/nzblab-prices/prices.json", "{}")
+        old = (a.PRICES_FILE, a.FILES_ROOT, a.CONFIG, dict(a._PRICES_FOUND), os.environ.pop("NZBLAB_PRICES_SCAN_SHARES", None))
+        try:
+            a.PRICES_FILE, a.FILES_ROOT, a.CONFIG = "", d, cfg
+            a._PRICES_FOUND.update(path="", checked=None)
+            self.assertEqual(a.prices_path(now=1000), f"{cfg}/prices.json")        # Standard: keine Suche in Freigaben
+            a.save_settings({"prices_scan_shares": 1})
+            self.assertEqual(a.prices_path(now=1000), f"{d}/s/nzblab-prices/prices.json")
+            a.save_settings({"prices_scan_shares": 0})
+            a._PRICES_FOUND.update(path="", checked=None)
+            self.assertEqual(a.prices_path(now=1000), f"{cfg}/prices.json")
+            a.PRICES_FILE = "/x/prices.json"
+            self.assertEqual(a.prices_path(), "/x/prices.json")
+        finally:
+            a.PRICES_FILE, a.FILES_ROOT, a.CONFIG = old[:3]
+            a._PRICES_FOUND.clear(); a._PRICES_FOUND.update(old[3])
+            if old[4] is not None:
+                os.environ["NZBLAB_PRICES_SCAN_SHARES"] = old[4]
+
+    def test_preisdatei_suchadressen_nur_https(self):
+        q = {"hdd8": {"label": "8 TB", "tb": 8, "history": [], "search_url": "javascript:alert(1)", "alt_search_url": "http://evil.example/x",
+                      "browser_url": "intent://x", "best": {"name": "X", "chf": 1.0, "link": "https://ok.example/a"}},
+             "hdd4": {"label": "4", "tb": 4, "history": [], "search_url": "https://shop.example/s?q=1", "alt_search_url": 5}}
+        d = a.sanitize_tool_prices({"updated": time.time(), "queries": q})["queries"]
+        self.assertEqual((d["hdd8"]["search_url"], d["hdd8"]["alt_search_url"], d["hdd8"]["browser_url"]), ("", "", ""))
+        self.assertEqual(d["hdd8"]["best"]["link"], "https://ok.example/a")
+        self.assertEqual((d["hdd4"]["search_url"], d["hdd4"]["alt_search_url"]), ("https://shop.example/s?q=1", ""))
+
+
+class Gesamtpruefung1aTest(unittest.TestCase):
+    """Agent-Fehler aus der Gesamtprüfung (G1–G11)."""
+
+    # G3: Messfaden stirbt nicht, auch wenn die erste Messung wirft
+    def test_g3_erste_messung_wirft_faden_laeuft_weiter(self):
+        added = threading.Event()
+
+        class Smp:
+            n = 0
+
+            def sample(self):
+                Smp.n += 1
+                if Smp.n == 1:
+                    raise OSError("hwmon verschwunden")
+                return {"t": int(time.time()), "cpu": 1.0}
+
+        class St:
+            def add(self, s):
+                added.set()
+
+            def roll_hour(self, h):
+                pass
+
+        class Wa:
+            def feed(self, s):
+                pass
+
+        stop = threading.Event()
+        with patch.object(a, "INTERVAL", 0.01), patch.object(a, "load_container_names"), contextlib.redirect_stdout(io.StringIO()):
+            th = threading.Thread(target=a.run_sampler, args=(St(), Smp(), Wa(), stop), daemon=True)
+            th.start()
+            self.assertTrue(added.wait(5))
+            stop.set()
+            th.join(5)
+        self.assertFalse(th.is_alive())
+
+    # G4: /api/now misst nie zweimal gleichzeitig
+    def test_g4_live_now_mit_sperre(self):
+        state = {"in": 0, "max": 0, "calls": 0}
+
+        class Smp:
+            def sample(self):
+                state["in"] += 1
+                state["max"] = max(state["max"], state["in"])
+                state["calls"] += 1
+                time.sleep(0.15)
+                state["in"] -= 1
+                return {"n": state["calls"]}
+
+        live = a.LiveNow(Smp())
+        res = []
+        ts = [threading.Thread(target=lambda: res.append(live.get())) for _ in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(state["max"], 1)
+        self.assertEqual(state["calls"], 1)
+        self.assertTrue(all(r == {"n": 1} for r in res))
+
+    # G2: Uhr springt zurück: Raten und Zwischenspeicher bleiben richtig
+    def test_g2_netzrate_ohne_wanduhr(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc, sysd = os.path.join(d, "proc"), os.path.join(d, "sys")
+            os.makedirs(os.path.join(proc, "1/net")); os.makedirs(sysd)
+
+            def dev(rx, tx):
+                wfile(os.path.join(proc, "1/net/dev"), "w", "h1\nh2\n    lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n"
+                      f"  eth0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n")
+            smp = a.Sampler(sysd, proc)
+            dev(1000, 500)
+            with patch.object(a.time, "time", return_value=1_800_000_000.0), patch.object(a.time, "monotonic", return_value=100.0):
+                smp.sample()
+            dev(3000, 1500)
+            with patch.object(a.time, "time", return_value=1_700_000_000.0), patch.object(a.time, "monotonic", return_value=102.0):
+                s = smp.sample()
+            self.assertEqual(s["net"]["eth0"], {"rx": 1000, "tx": 500})      # 2000 Bytes in 2 s, nicht in 0,001 s
+            self.assertEqual(s["t"], 1_700_000_000)                           # Zeitstempel bleibt Wanduhr
+
+    def test_g2_zwischenspeicher_ohne_wanduhr(self):
+        a._HOST_CACHE.clear()
+        calls = []
+
+        def fn():
+            calls.append(1)
+            return {"n": len(calls)}
+        with patch.object(a.time, "time", return_value=2_000_000_000.0):
+            a.cached("g2", fn, ttl=30)
+        with patch.object(a.time, "time", return_value=1_000_000_000.0):      # Uhr eine Weile zurück
+            a.cached("g2", fn, ttl=30)
+        self.assertEqual(len(calls), 1)
+        a._HOST_CACHE.clear()
+
+    # G1: Logzeiten ohne/mit falscher Zeitzone
+    def test_g1_iso_mit_zone(self):
+        self.assertEqual(a._log_time("2026-11-24T10:30:00.123+01:00 nas kernel: x", None), calendar_ts(2026, 11, 24, 9, 30, 0))
+        self.assertEqual(a._log_time("2026-11-24T10:30:00Z nas x", None), calendar_ts(2026, 11, 24, 10, 30, 0))
+        self.assertEqual(a._log_time("2026-11-24T10:30:00-0530 nas x", None), calendar_ts(2026, 11, 24, 16, 0, 0))
+
+    def _g1_logs(self, shift_h):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        now = int(time.time())
+        ts = time.strftime("%b %e %H:%M:%S", time.gmtime(now - 600 + shift_h * 3600))
+        ts2 = time.strftime("%b %e %H:%M:%S", time.gmtime(now - 700 + shift_h * 3600))
+        write(f"{d}/log/syslog", f"{ts2} nas move: mover: started\n{ts} nas kernel: blk_update_request: I/O error, dev sda, sector 1\n")
+        return d, now
+
+    def test_g1_hostzeitzone_wird_benutzt(self):
+        import datetime
+        d, now = self._g1_logs(2)
+        with patch.object(a, "_host_tz", return_value=datetime.timezone(datetime.timedelta(hours=2))):
+            r = a.collect_logs(f"{d}/log", hours=24, limit=50, now=now)
+            m = a.mover_log(f"{d}/log", now)
+        self.assertTrue(any("I/O error" in l["text"] for l in r["lines"]))
+        self.assertEqual(m["state"], "running")
+        self.assertEqual(m["started"], now - 700)
+
+    def test_g1_ohne_zone_frische_zeilen_gehen_nicht_verloren(self):
+        d, now = self._g1_logs(1)                      # NAS in UTC+1, Container in UTC ohne Hostzone: Zeilen liegen «in der Zukunft»
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        try:
+            with patch.object(a, "_zone_known", return_value=False):
+                r = a.collect_logs(f"{d}/log", hours=24, limit=50, now=now)
+                m = a.mover_log(f"{d}/log", now)
+                self.assertIsNone(a._log_future_ok(now + 20 * 3600, now))   # wirklich unbrauchbare Zukunft bleibt draussen
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+        self.assertTrue(any("I/O error" in l["text"] for l in r["lines"]))
+        self.assertEqual(m["state"], "running")
+
+    def test_g1_zweiter_mover_lauf_ist_running(self):
+        # Zone unbekannt, NAS UTC+1: Lauf 1 09:40-09:50, Lauf 2 seit 10:10, jetzt 10:30 (Container-Uhr), Zeilen stehen 1 h vor
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        now = calendar.timegm((2026, 6, 10, 10, 30, 0))
+        def ts(h, m):
+            return time.strftime("%b %e %H:%M:%S", (2026, 6, 10, h + 1, m, 0, 0, 0, -1))
+        write(f"{d}/log/syslog", f"{ts(9,40)} nas move: mover: started\n{ts(9,50)} nas move: mover: finished\n{ts(10,10)} nas move: mover: started\n")
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        try:
+            with patch.object(a, "_zone_known", return_value=False):
+                m = a.mover_log(f"{d}/log", now)
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+        self.assertEqual(m["state"], "running")
+        self.assertIsNone(m["ended"])
+
+    def test_g1_bekannte_zone_vorjahreszeile_ist_kein_frischer_fehler(self):
+        now = 1_800_000_000
+        with patch.object(a, "_zone_known", return_value=True):
+            self.assertIsNone(a._log_future_ok(now + 10 * 3600, now))       # Vorjahreszeile «10 h in der Zukunft»
+            self.assertEqual(a._log_future_ok(now - 5, now), now - 5)
+        with patch.object(a, "_zone_known", return_value=False):
+            self.assertEqual(a._log_future_ok(now + 10 * 3600, now, clip=False), now + 10 * 3600)
+
+    # G5: SMART-Helfer übersteht Zeitüberschreitung; beendeter Helfer wird abgeholt
+    def test_g5_timeout_behaelt_helfer_und_verwirft_spaete_antwort(self):
+        parent, child = socket.socketpair()
+        self.addCleanup(parent.close)
+        self.addCleanup(child.close)
+        ev = threading.Event()
+
+        def peer():
+            f = child.makefile("rwb")
+            f.readline()
+            ev.wait(5)
+            f.write(json.dumps({"rc": 0, "out": "alt"}).encode() + b"\n"); f.flush()
+            f.readline()
+            f.write(json.dumps({"rc": 0, "out": "neu"}).encode() + b"\n"); f.flush()
+        th = threading.Thread(target=peer, daemon=True)
+        th.start()
+        h = a.SmartHelper()
+        h.sock = parent
+        with patch.object(a, "SMART_TIMEOUT", -9.9), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(h.call("scan"), (126, ""))
+        self.assertIsNotNone(h.sock)
+        self.assertFalse(h.lost)
+        ev.set()
+        with patch.object(a, "SMART_TIMEOUT", 5), patch.object(a, "run_smartctl", side_effect=AssertionError("kein eigenes smartctl")):
+            self.assertEqual(h.call("scan"), (0, "neu"))
+        th.join(5)
+
+    def test_g5_scan_timeout_eigener_text(self):
+        h = a.SmartHelper()
+        h.call = lambda op, dev=None, dtype=None: (126, "")
+        h.timed_out = True
+        mon = a.SmartMonitor(a.Store(":memory:"), h, enabled=True)
+        mon.poll()
+        self.assertIn("antwortet nicht", mon.error)
+        self.assertNotIn("devices", mon.error)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "nur mit fork prüfbar")
+    def test_g5_lose_beendet_lebenden_helfer(self):
+        parent, child = socket.socketpair()
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(30)
+            os._exit(0)
+        child.close()
+        h = a.SmartHelper()
+        h.sock, h.pid = parent, pid
+        t0 = time.monotonic()
+        h._lose()
+        self.assertLess(time.monotonic() - t0, 1.5)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "nur mit fork prüfbar")
+    def test_g5_beendeter_helfer_wird_abgeholt(self):
+        parent, child = socket.socketpair()
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        child.close()
+        h = a.SmartHelper()
+        h.sock, h.pid = parent, pid
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(h.call("scan"), (126, ""))
+        self.assertTrue(h.lost)
+        self.assertIsNone(h.sock)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)                # schon abgeholt: kein Zombie
+        with patch.object(a, "run_smartctl", side_effect=AssertionError("ohne Rechte nicht starten")):
+            self.assertEqual(h.call("scan"), (126, ""))
+        mon = a.SmartMonitor(a.Store(":memory:"), h, enabled=True)
+        mon.poll()
+        self.assertIn("SMART-Helfer beendet", mon.current()["error"])
+
+    # G7: Zukunftszeit löscht keinen Verlauf
+    def test_g7_zukunftszeit_loescht_nichts(self):
+        st = a.Store(":memory:")
+        now = int(time.time())
+        for i in range(3):
+            st.add({"t": now - i * 86400, "cpu": 1.0})
+            st.add_series(now - i * 86400, {"disk:sda": 30 + i})
+        st.add_event("heat", "warn", "t", "x", t=now - 80 * 86400)
+        far = now + 400 * 86400
+        st.add({"t": far, "cpu": 2.0})
+        st.add_series(far, {"disk:sda": 99})
+        st.add_event("heat", "warn", "t2", "y", t=far)
+        self.assertEqual(len(st.raw(0)), 4)
+        self.assertEqual(st.db.execute("SELECT COUNT(*) FROM series").fetchone()[0], 3)       # Roh: 2 Tage Aufbewahrung gegen das letzte echte Datum
+        self.assertEqual(st.db.execute("SELECT COUNT(*) FROM series_h").fetchone()[0], 4)
+        self.assertEqual(len(st.events(0)), 2)
+        # normales Aufräumen funktioniert weiter
+        st2 = a.Store(":memory:")
+        st2.add({"t": now - 20 * 86400, "cpu": 1.0})
+        st2.add({"t": now, "cpu": 1.0})
+        st2.add({"t": now + 10, "cpu": 1.0})            # nach einer langen Lücke räumt schon die nächste Messung auf
+        self.assertEqual(len(st2.raw(0)), 2)
+
+    # G10
+    def test_g10_ipv4_gemappt(self):
+        self.assertTrue(a.from_private_net("::ffff:192.168.1.2"))
+        self.assertTrue(a.from_private_net("::ffff:10.0.0.7"))
+        self.assertTrue(a.from_private_net("::ffff:172.17.0.1"))
+        self.assertFalse(a.from_private_net("::ffff:172.17.0.2"))
+        self.assertFalse(a.from_private_net("::ffff:8.8.8.8"))
+        self.assertFalse(a.from_private_net("2001:db8::1"))
+
+    # G11
+    def test_g11_dup_fehler_schliesst_socket(self):
+        srv = a.make_server("127.0.0.1", 0, a.make_handler(a.Store(":memory:"), lambda: {}, "geheim"), tls=object())
+        self.addCleanup(srv.server_close)
+        req = unittest.mock.MagicMock()
+        req.dup.side_effect = OSError(24, "Too many open files")
+        with patch.object(srv, "shutdown_request") as sd:
+            srv.process_request_thread(req, ("127.0.0.1", 5555))
+        sd.assert_called_once_with(req)
+
+
+def calendar_ts(y, mo, d, h, mi, s):
+    import calendar
+    return calendar.timegm((y, mo, d, h, mi, s))
 
 
 if __name__ == "__main__":

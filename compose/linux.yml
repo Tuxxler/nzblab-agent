@@ -37,6 +37,7 @@ services:
       - /sys:/host/sys:ro                               # Temperaturen, Platten, Netzwerkkarten
       - /proc:/host/proc:ro                             # CPU, RAM, Last, Einhängepunkte, Plattenzugriffe
       - /etc/hostname:/host/etc/hostname:ro                # Name des NAS (sonst zeigt die App die Container-Kennung)
+      - /etc/localtime:/host/etc/localtime:ro            # richtige Uhrzeit in den Logs (Zeitzone des NAS)
       - /etc/os-release:/host/os-release:ro             # nur diese eine Datei: Name und Version des Systems
       - /srv:/host/fs/data:ro                           # Beispiel: Belegung und Datei-Index für /srv (Name «data» frei wählbar)
       # - /home:/host/fs/home:ro                        # weitere Ordner je mit eigenem Namen unter /host/fs

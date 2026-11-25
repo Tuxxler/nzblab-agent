@@ -338,8 +338,12 @@ If you prefer to collect prices yourself (e.g. with your own script), put a `pri
 `/config/prices-CH.json`. The agent only reads it, never writes to it:
 
 - Variable `PRICES_FILE` = path in the container (e.g. `/host/mnt/user/daten/nzblab-prices/prices.json`), or
-- without the variable: the first share under `/host/mnt/user` (alphabetically) that contains `nzblab-prices/prices.json`
-  (searched at most every 6 hours).
+- without the variable (from 1.20.4): `/config/prices.json`.
+- Only with the setting `prices_scan_shares=1` (or `NZBLAB_PRICES_SCAN_SHARES=1`; default off) the agent also searches the first share under
+  `/host/mnt/user` (alphabetically) that contains `nzblab-prices/prices.json` (at most every 6 hours).
+
+Note: with the share search on, a share that contains `nzblab-prices/prices.json` is trusted for prices. Whoever can write to
+that share decides which prices the app shows. Set `PRICES_FILE` to pin exactly one file.
 
 Which series the app additionally watches is returned by `GET /api/prices/watch` (without token, private networks only).
 "Cheap" means: below your own limit, or the lowest price in 90 days and at least 3% below the 30-day mean
@@ -412,9 +416,20 @@ Full text: [`LICENSE`](LICENSE).
 
 Features and fixes by agent version.
 
+### From 1.20.4: hardening
+- **Connections:** open connections are counted per sender as the rate limits do (IPv6 per /64, not per address); 8 slots are kept for 127.0.0.1/::1 (Docker health check), other senders are refused earlier.
+- **Slow requests:** the request line and all headers must arrive within 15 seconds in total (not per read), otherwise the connection is closed.
+- **Price file:** only `PRICES_FILE` or `/config/prices.json`; the share search needs the setting `prices_scan_shares=1`. Search links in an external price file are accepted only as `https://`.
+
+### From 1.20.3: hardening
+- **ntfy** follows at most one redirect, and only to the same host (same scheme, or http to https); anything else fails (other port, 303 is not re-sent) and the reason is logged without any address.
+- **File index guard:** a run with 0 files never replaces a non-empty index (and does not count towards the streak); a run that finds under 10 % of the previous file count keeps the old index; if the 3rd run in a row is equally small (within 10 % of the previous small run), the new index is accepted (disks really removed).
+- **SMART helper** only accepts read-only `-d` device types (the ones `smartctl --scan` reports, plus `marvell` and combinations such as `sat+megaraid,3`); bridge types that write (`jmb39x`, `jms56x`, `intelliprop`) and anything with `force` are always rejected.
+- **Price file** (`prices.json` from a share): links only as `https://`, an `updated` time in the future makes the file invalid, the age check is 36 hours, malformed entries are ignored.
+
 ### From 1.20.2: fixes and hardening
 - **Own user number 8099** in the image, the Unraid template and all compose files (instead of 99, 568 or your own DSM number), so the agent does not run under the same number as your other containers. Existing installations keep their saved number; the agent takes over its `/config` folder itself when you switch.
-- **Key window.** The "keys handed out" marker is only set when at least one service was really handed out (not on an empty search). The hint in the app, the browser page and the API names only the file `keys-unlock` once keys were handed out; `GET /api/info` shows `keys.issued`.
+- **Key window.** For the discovery, the "keys handed out" marker is only set when at least one service was really handed out (not on an empty search); an existing installation still gets it at the first start after the update. The hint in the app, the browser page and the API names only the file `keys-unlock` once keys were handed out; `GET /api/info` shows `keys.issued`.
 - **Fixed texts on errors.** An internal error answers `500` with a fixed text; the details go (redacted) to the container log only.
 - **ntfy** does not follow redirects any more.
 - **Empty fields** in the Unraid template (e.g. `PORT`, `INTERVAL`) no longer stop the agent: an empty or invalid number counts as not set.
@@ -427,6 +442,7 @@ Features and fixes by agent version.
 - **Disk prices:** disks under 1 TB are searched as `500GB`; adding a watched series only fetches the new series; SABnzbd history is also found under `apps/` (TrueNAS) and `docker/` (Synology).
 - **File index:** a run that found (almost) no files keeps the old index. **Cache shares** are measured in the background (the request returns the last state and `measuring`).
 - **NAS name** instead of the container ID, if `/etc/hostname` is mounted read-only to `/host/etc/hostname`.
+- **NAS time zone** for log times, if `/etc/localtime` is mounted read-only to `/host/etc/localtime` (correct times in the logs, no `TZ` needed).
 - Texts name the container "NASlab-Agent"; `HEAT_ALERT_MINUTES` is documented.
 
 ### From 1.20.0: HTTPS, key window, token rotation

@@ -346,8 +346,12 @@ Wer Preise lieber selbst sammelt (z. B. mit einem eigenen Skript), legt eine `pr
 `/config/prices-CH.json` ab. Der Agent liest sie nur, schreibt nie hinein:
 
 - Variable `PRICES_FILE` = Pfad im Container (z. B. `/host/mnt/user/daten/nzblab-prices/prices.json`), oder
-- ohne Variable: die erste Freigabe unter `/host/mnt/user` (alphabetisch), die `nzblab-prices/prices.json` enthält
-  (gesucht höchstens alle 6 Stunden).
+- ohne Variable (ab 1.20.4): `/config/prices.json`.
+- Nur mit der Einstellung `prices_scan_shares=1` (oder `NZBLAB_PRICES_SCAN_SHARES=1`; Standard aus) sucht der Agent zusätzlich in der ersten Freigabe
+  unter `/host/mnt/user` (alphabetisch), die `nzblab-prices/prices.json` enthält (höchstens alle 6 Stunden).
+
+Hinweis: Bei eingeschalteter Freigaben-Suche gilt eine Freigabe mit `nzblab-prices/prices.json` für Preise als vertrauenswürdig. Wer in diese
+Freigabe schreiben darf, bestimmt die Preise in der App. Mit `PRICES_FILE` legst du genau eine Datei fest.
 
 Welche Serien die App zusätzlich beobachtet, liefert `GET /api/prices/watch` (ohne Token, nur aus privaten Netzen).
 «Günstig» heisst: unter der eigenen Grenze, oder tiefster Preis seit 90 Tagen und mindestens 3 % unter dem 30-Tage-Mittel
@@ -422,9 +426,20 @@ license. Full text: [`LICENSE`](LICENSE).
 
 Funktionen und Korrekturen nach Agent-Version.
 
+### Ab 1.20.4: Härtung
+- **Verbindungen:** offene Verbindungen werden je Absender gezählt wie bei den Bremsen (IPv6 je /64, nicht je Adresse); 8 Plätze bleiben für 127.0.0.1/::1 (Docker-Gesundheitsprüfung) frei, andere Absender werden früher abgewiesen.
+- **Langsame Anfragen:** Anfragezeile und alle Kopfzeilen müssen insgesamt innerhalb von 15 Sekunden eintreffen (nicht je Lesevorgang), sonst wird die Verbindung geschlossen.
+- **Preisdatei:** nur `PRICES_FILE` oder `/config/prices.json`; die Freigaben-Suche braucht die Einstellung `prices_scan_shares=1`. Suchadressen in einer externen Preisdatei gelten nur als `https://`.
+
+### Ab 1.20.3: Härtung
+- **ntfy** folgt höchstens einer Weiterleitung, und nur auf denselben Host (gleiches Schema oder http auf https); alles andere schlägt fehl (anderer Port, 303 wird nicht erneut gesendet), der Grund steht ohne Adresse im Log.
+- **Datei-Index-Schutz:** Ein Lauf mit 0 Dateien ersetzt nie einen vorhandenen Index (und zählt nicht für die Folge); ein Lauf mit unter 10 % der bisherigen Dateizahl behält den alten Index; ist auch der 3. Lauf in Folge gleich klein (höchstens 10 % neben dem vorigen kleinen Lauf), gilt der neue Index (Platten wirklich ausgebaut).
+- **SMART-Helfer** nimmt nur lesende `-d`-Gerätetypen an (die, die `smartctl --scan` meldet, dazu `marvell` und Kombinationen wie `sat+megaraid,3`); schreibende Brückentypen (`jmb39x`, `jms56x`, `intelliprop`) und alles mit `force` werden immer abgelehnt.
+- **Preisdatei** (`prices.json` aus einer Freigabe): Links nur als `https://`, eine Zeit `updated` in der Zukunft macht die Datei ungültig, die Altersprüfung gilt 36 Stunden, fehlerhafte Einträge werden ignoriert.
+
 ### Ab 1.20.2: Korrekturen und Härtung
 - **Eigene Benutzernummer 8099** im Image, in der Unraid-Vorlage und in allen Compose-Dateien (statt 99, 568 oder deiner DSM-Nummer), damit der Agent nicht unter derselben Nummer wie deine anderen Container läuft. Bestehende Installationen behalten ihre gespeicherte Nummer; wer wechselt, dem übergibt der Agent seinen `/config`-Ordner selbst.
-- **Schlüssel-Fenster.** Der Marker «Schlüssel ausgegeben» wird nur gesetzt, wenn wirklich mindestens ein Dienst ausgegeben wurde (nicht bei leerer Suche). Der Hinweis in der App, auf der Browser-Seite und in der API nennt nach der ersten Ausgabe nur noch die Datei `keys-unlock`; `GET /api/info` zeigt `keys.issued`.
+- **Schlüssel-Fenster.** Bei der Suche wird der Marker «Schlüssel ausgegeben» nur gesetzt, wenn wirklich mindestens ein Dienst ausgegeben wurde (nicht bei leerer Suche); eine bestehende Installation bekommt ihn weiterhin beim ersten Start nach dem Update. Der Hinweis in der App, auf der Browser-Seite und in der API nennt nach der ersten Ausgabe nur noch die Datei `keys-unlock`; `GET /api/info` zeigt `keys.issued`.
 - **Feste Fehlertexte.** Ein interner Fehler antwortet mit `500` und einem festen Text; die Einzelheiten stehen (geschwärzt) nur im Container-Log.
 - **ntfy** folgt keinen Weiterleitungen mehr.
 - **Leere Felder** in der Unraid-Vorlage (z. B. `PORT`, `INTERVAL`) stoppen den Agenten nicht mehr: Eine leere oder ungültige Zahl gilt als nicht gesetzt.
@@ -437,6 +452,7 @@ Funktionen und Korrekturen nach Agent-Version.
 - **Plattenpreise:** Platten unter 1 TB werden als `500GB` gesucht; eine neu beobachtete Serie holt nur die neue Serie; der SABnzbd-Verlauf wird auch unter `apps/` (TrueNAS) und `docker/` (Synology) gefunden.
 - **Datei-Index:** Ein Lauf, der (fast) keine Dateien fand, behält den alten Index. **Cache-Freigaben** werden im Hintergrund gemessen (die Anfrage liefert den letzten Stand und `measuring`).
 - **NAS-Name** statt Container-Kennung, wenn `/etc/hostname` nur lesend nach `/host/etc/hostname` eingebunden ist.
+- **Zeitzone des NAS** für Logzeiten, wenn `/etc/localtime` nur lesend nach `/host/etc/localtime` eingebunden ist (richtige Uhrzeit in den Logs, ohne `TZ`).
 - Texte nennen den Container «NASlab-Agent»; `HEAT_ALERT_MINUTES` ist dokumentiert.
 
 ### Ab 1.20.0: HTTPS, Schlüssel-Fenster, Token erneuern

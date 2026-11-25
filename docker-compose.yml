@@ -56,6 +56,7 @@ services:
       - /sys:/host/sys:ro                               # Temperaturen, Grafikchip, Btrfs-Zustand
       - /proc:/host/proc:ro                             # CPU-Last, Programme, Plattenzugriffe, Neustarts, mdadm/ZFS-Zustand
       - /etc/hostname:/host/etc/hostname:ro                # Name des NAS (sonst zeigt die App die Container-Kennung)
+      - /etc/localtime:/host/etc/localtime:ro            # richtige Uhrzeit in den Logs (Zeitzone des NAS)
       # --- Unraid (Standard):
       - /mnt/user:/host/mnt/user:ro                     # Freigaben: Datei-Index, Suche, Backup-Suche (optional)
       # - /mnt/cache:/host/mnt/cache:ro                 # Cache-Pool: was auf den Mover wartet (optional, Unraid)
